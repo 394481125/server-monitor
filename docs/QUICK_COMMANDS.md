@@ -68,7 +68,7 @@ sudo journalctl -u server-monitor -n 100 -f
 
 ```bash
 cd dist/server-monitor-github-v1.0.0
-bash scripts/publish_github.sh git@github.com:394481125/server-monitor.git
+bash scripts/publish_github.sh git@github.com:394481125/server-monitor.git "发布 v1.3.5"
 ```
 
 日常更新：
@@ -81,7 +81,7 @@ bash scripts/update_github.sh "说明本次修改"
 
 ```bash
 cd /home/qq394481125/app/server_monitor
-bash scripts/build_release.sh v1.3.3
+bash scripts/build_release.sh v1.3.5
 (cd dist && sha256sum -c SHA256SUMS)
 ```
 

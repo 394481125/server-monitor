@@ -2,7 +2,7 @@
 
 Server Monitor 是面向可信内网的 Linux 多机 GPU、主机和受控运维平台。平台服务器通过 SSH 采集，不要求被管主机安装常驻 Agent；数据保存在 SQLite，页面由 Flask/Gunicorn 提供。
 
-当前交付版本：`v1.3.3`，数据库 schema：`6`。
+当前交付版本：`v1.3.5`，数据库 schema：`6`。
 
 ## 快速启动
 
@@ -108,14 +108,14 @@ bash scripts/update_github.sh "说明本次修改"
 
 ```bash
 cd /home/qq394481125/app/server_monitor
-bash scripts/build_release.sh v1.3.3
+bash scripts/build_release.sh v1.3.5
 (cd dist && sha256sum -c SHA256SUMS)
 ```
 
 输出：
 
-- `dist/server-monitor-github-v1.3.3/`：源码、测试、CI 和文档。
-- `dist/server-monitor-deploy-v1.3.3/`：不含测试的轻量部署包。
+- `dist/server-monitor-github-v1.3.5/`：源码、测试、CI 和文档。
+- `dist/server-monitor-deploy-v1.3.5/`：不含测试的轻量部署包。
 - 两个 `.tar.gz` 和 `dist/SHA256SUMS`。
 
 脚本不会覆盖已有版本目录；请选择新版本号。`.env`、`data/`、`.venv/`、数据库、主密钥和真实凭据不会进入发布包。
