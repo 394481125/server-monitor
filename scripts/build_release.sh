@@ -19,9 +19,12 @@ deploy_archive="${output_root}/${deploy_name}.tar.gz"
 checksums="${output_root}/SHA256SUMS"
 
 if [[ "$force" == "--force" ]]; then
-    rm -rf -- "$source_dir" "$deploy_dir" "$source_archive" "$deploy_archive" "$checksums"
-elif [[ -e "$source_dir" || -e "$deploy_dir" || -e "$source_archive" || -e "$deploy_archive" ]]; then
-    echo "Release output already exists for ${version}; use --force to replace it." >&2
+    echo "Refusing --force: release directories are never overwritten." >&2
+    echo "Use a new version name, or update the Git repository with scripts/update_github.sh." >&2
+    exit 1
+fi
+if [[ -e "$source_dir" || -e "$deploy_dir" || -e "$source_archive" || -e "$deploy_archive" ]]; then
+    echo "Release output already exists for ${version}; choose a new version number." >&2
     exit 1
 fi
 

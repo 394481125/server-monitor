@@ -2,7 +2,7 @@
 
 Server Monitor 是一个面向可信内网的 Linux 多机监控与运维控制台。平台通过 SSH 采集主机指标，不要求被管主机安装常驻 Agent；服务端使用 Flask、SQLite、Paramiko 和 Gunicorn，前端使用原生 HTML/CSS/JavaScript，内置 xterm.js。
 
-完整功能范围和安全边界见 [需求规格](docs/REQUIREMENTS.md)，生产部署、备份和恢复见 [部署文档](docs/DEPLOYMENT.md)。
+完整功能范围和安全边界见 [需求规格](docs/REQUIREMENTS.md)，生产部署、备份和恢复见 [部署文档](docs/DEPLOYMENT.md)，代码上传与日常更新见 [GitHub 教程](docs/GITHUB_GUIDE.md)。
 
 当前控制台包含：
 
@@ -193,7 +193,7 @@ git push origin v1.0.0
 bash scripts/build_release.sh v1.0.0
 ```
 
-输出位于 `dist/server-monitor-github-v1.0.0/`（完整源码，可上传 GitHub）和 `dist/server-monitor-deploy-v1.0.0/`（快速部署），两者都有 `.tar.gz` 压缩包，并生成 `dist/SHA256SUMS`。重复生成时执行 `bash scripts/build_release.sh v1.0.0 --force`；`dist/` 已被 Git 忽略。推送 `v1.0.0` tag 时，GitHub Actions 会自动创建 GitHub Release并发布 GHCR 容器镜像。
+输出位于 `dist/server-monitor-github-v1.0.0/`（完整源码，可上传 GitHub）和 `dist/server-monitor-deploy-v1.0.0/`（快速部署），两者都有 `.tar.gz` 压缩包，并生成 `dist/SHA256SUMS`。生成新包时请使用新的版本号；脚本不会覆盖已有发布目录。推送 `v1.0.0` tag 时，GitHub Actions 会自动创建 GitHub Release 并发布 GHCR 容器镜像。
 
 在 GitHub 创建空仓库后，也可以从源码上传目录一条命令完成初始化和推送（需要先配置 Git 用户信息及 GitHub SSH/HTTPS 凭据）：
 
@@ -201,6 +201,14 @@ bash scripts/build_release.sh v1.0.0
 cd dist/server-monitor-github-v1.0.0
 bash scripts/publish_github.sh git@github.com:<你的用户名>/<仓库名>.git
 ```
+
+以后就在这个源码目录里修改代码，然后运行更新脚本：
+
+```bash
+bash scripts/update_github.sh "修复主机告警显示"
+```
+
+脚本会自动运行可用的测试、提交并推送到当前分支。没有开发依赖时可使用 `--skip-tests`，但发布前仍建议在完整虚拟环境中运行 CI 命令。
 
 ## 文件清理边界
 
