@@ -18,14 +18,35 @@ fi
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_root"
+export GIT_CEILING_DIRECTORIES="$(dirname "$project_root")"
 
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
-    echo "Run this script inside the GitHub source repository." >&2
+[[ -e "$project_root/.git" ]] || {
+    echo "This release directory has not been published yet." >&2
+    echo "Run scripts/publish_github.sh first; update_github.sh will not use a parent directory's repository." >&2
+    exit 1
+}
+actual_root="$(git rev-parse --show-toplevel)"
+[[ "$actual_root" == "$project_root" ]] || {
+    echo "Git repository root mismatch: $actual_root" >&2
     exit 1
 }
 branch="$(git branch --show-current)"
 [[ -n "$branch" ]] || { echo "Detached HEAD; checkout a branch first." >&2; exit 1; }
 git remote get-url origin >/dev/null 2>&1 || { echo "No origin remote is configured." >&2; exit 1; }
+
+sync_remote() {
+    git fetch origin "$branch"
+    if git show-ref --verify --quiet "refs/remotes/origin/${branch}" && ! git merge-base --is-ancestor "origin/${branch}" HEAD; then
+        echo "Remote ${branch} contains commits not in this checkout; rebasing local work..."
+        if ! git rebase --autostash "origin/${branch}"; then
+            echo "Rebase stopped because of conflicts. Resolve them, run tests, then rerun this script." >&2
+            echo "Do not use git push --force." >&2
+            exit 1
+        fi
+    fi
+}
+
+sync_remote
 
 if [[ "$skip_tests" -eq 0 ]]; then
     if [[ -x .venv/bin/python ]]; then
@@ -47,5 +68,6 @@ if git diff --cached --quiet; then
 fi
 git diff --cached --check
 git commit -m "$message"
+sync_remote
 git push origin "$branch"
 echo "Updated origin/$branch."

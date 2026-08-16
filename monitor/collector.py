@@ -6,7 +6,14 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .ssh_client import SSHClient, SSHError
+from .ssh_client import (
+    SSHAuthenticationError,
+    SSHClient,
+    SSHConnectionError,
+    SSHError,
+    SSHFingerprintError,
+    SSHTimeout,
+)
 from .utils import utc_iso
 
 
@@ -15,6 +22,14 @@ CORE_COMMAND = r"""LC_ALL=C sh -s <<'SERVER_MONITOR_EOF'
 set +e
 section() { printf '\n__SERVER_MONITOR_SECTION__:%s\n' "$1"; }
 section identity; hostname; cat /etc/machine-id 2>/dev/null || true
+section hardware
+cpu_model=$(awk -F: '/model name|Hardware|Processor/{gsub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+memory_kib=$(awk '/MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+board_vendor=$(cat /sys/class/dmi/id/board_vendor 2>/dev/null)
+board_name=$(cat /sys/class/dmi/id/board_name 2>/dev/null)
+board_version=$(cat /sys/class/dmi/id/board_version 2>/dev/null)
+printf 'cpu_model\t%s\nmemory_total_kib\t%s\nboard_vendor\t%s\nboard_name\t%s\nboard_version\t%s\n' "$cpu_model" "$memory_kib" "$board_vendor" "$board_name" "$board_version"
+if command -v lspci >/dev/null 2>&1; then lspci -Dnn 2>/dev/null | sed 's/^/pci\t/' | head -n 256; fi
 section proc_stat; cat /proc/stat
 section meminfo; cat /proc/meminfo
 section loadavg; cat /proc/loadavg
@@ -26,7 +41,7 @@ section diskstats; cat /proc/diskstats
 section block_devices
 if command -v lsblk >/dev/null 2>&1; then lsblk -bdn -o NAME,TYPE,SIZE 2>/dev/null; fi
 section tools
-for tool in tmux smartctl sensors stress-ng nvidia-smi docker ss; do
+for tool in tmux smartctl sensors stress-ng nvidia-smi docker ss ping nc systemctl journalctl lsof iostat mpstat ethtool jq nvidia-modprobe; do
   if command -v "$tool" >/dev/null 2>&1; then echo "$tool:available"; else echo "$tool:missing"; fi
 done
 section gpu
@@ -34,7 +49,31 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=index,uuid,name,driver_version,utilization.gpu,memory.total,memory.used,temperature.gpu,power.draw,fan.speed --format=csv,noheader,nounits 2>&1
 fi
 section gpu_processes
-if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>&1; fi
+gpu_process_output=''
+if command -v nvidia-smi >/dev/null 2>&1; then
+  gpu_process_output=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>&1)
+  printf '%s\n' "$gpu_process_output"
+fi
+section process_users
+printf '%s\n' "$gpu_process_output" | awk -F, '{gsub(/^[ \t]+|[ \t]+$/, "", $2); if ($2 ~ /^[0-9]+$/) print $2}' | sort -nu | head -n 256 | while read pid; do
+  [ -d "/proc/$pid" ] || continue
+  user=$(ps -o user= -p "$pid" 2>/dev/null | awk 'NR==1 {print $1}')
+  [ -n "$user" ] || user=unknown
+  cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null | tr '\000\011\012\015' '    ' | cut -c1-4096 || true)
+  command=$(tr '\000\011\012\015' '    ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-4096)
+  [ -n "$command" ] || command=$(ps -o args= -p "$pid" 2>/dev/null | tr '\011\012\015' '   ' | cut -c1-4096)
+  printf '%s\t%s\t%s\t%s\n' "$pid" "$user" "$cwd" "$command"
+done
+section gpu_health
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=index,uuid,pstate,power.limit,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,ecc.errors.corrected.aggregate.total,ecc.errors.uncorrected.aggregate.total,clocks_throttle_reasons.active,clocks.current.graphics,clocks.applications.graphics,clocks.default_applications.graphics,compute_mode --format=csv,noheader,nounits 2>&1
+fi
+section gpu_performance
+if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi -q -d PERFORMANCE 2>&1; fi
+section gpu_xid
+if command -v dmesg >/dev/null 2>&1; then
+  { dmesg --level=err,crit,alert,emerg 2>/dev/null || journalctl -k --since '-10 minutes' --no-pager 2>/dev/null; } | grep -Ei 'NVRM: Xid' | tail -n 20
+fi
 section temperatures
 if command -v sensors >/dev/null 2>&1; then sensors -u 2>&1; fi
 section temperature_sysfs
@@ -66,9 +105,13 @@ if command -v ss >/dev/null 2>&1; then
   { ss -Hltn 2>/dev/null | awk '{ endpoint=$4; port=endpoint; sub(/^.*:/, "", port); if (port ~ /^[0-9]+$/) print "tcp\\t" port "\\t" endpoint }'; ss -Hlun 2>/dev/null | awk '{ endpoint=$4; port=endpoint; sub(/^.*:/, "", port); if (port ~ /^[0-9]+$/) print "udp\\t" port "\\t" endpoint }'; } | sort -u | wc -l
 fi
 section docker
-if [ "${SERVER_MONITOR_DOCKER_ENABLED:-1}" = "1" ] && command -v docker >/dev/null 2>&1; then docker ps --format '{{json .}}' 2>&1; fi
+if [ "${SERVER_MONITOR_DOCKER_ENABLED:-1}" = "1" ] && command -v docker >/dev/null 2>&1; then docker ps -a --format '{{json .}}' 2>&1; fi
 section docker_stats
 if [ "${SERVER_MONITOR_DOCKER_ENABLED:-1}" = "1" ] && command -v docker >/dev/null 2>&1; then docker stats --no-stream --format '{{json .}}' 2>&1; fi
+section docker_inspect
+if [ "${SERVER_MONITOR_DOCKER_ENABLED:-1}" = "1" ] && command -v docker >/dev/null 2>&1; then
+  docker ps -aq 2>/dev/null | head -n 100 | while read container_id; do docker inspect --format '{{json .}}' "$container_id" 2>&1; done
+fi
 section smart
 if command -v smartctl >/dev/null 2>&1 && command -v lsblk >/dev/null 2>&1; then
   smartctl_path=$(command -v smartctl)
@@ -84,6 +127,13 @@ if command -v smartctl >/dev/null 2>&1 && command -v lsblk >/dev/null 2>&1; then
     printf '%s\n' "$smart_output"
   done
 fi
+section limits
+printf 'open_files_soft\t%s\nopen_files_hard\t%s\nprocesses_soft\t%s\nprocesses_hard\t%s\n' "$(ulimit -Sn 2>/dev/null)" "$(ulimit -Hn 2>/dev/null)" "$(ulimit -Su 2>/dev/null)" "$(ulimit -Hu 2>/dev/null)"
+section software
+printf 'kernel\t%s\n' "$(uname -r 2>/dev/null)"
+if command -v python3 >/dev/null 2>&1; then python3 --version 2>&1 | sed 's/^/python3\t/'; fi
+if command -v nvcc >/dev/null 2>&1; then nvcc --version 2>&1 | sed -n 's/.*release \([^,]*\).*/cuda\t\1/p' | tail -n 1; fi
+if command -v docker >/dev/null 2>&1; then docker --version 2>&1 | sed 's/^/docker\t/'; fi
 SERVER_MONITOR_EOF"""
 
 
@@ -94,6 +144,7 @@ class CollectionResult:
     optional_errors: dict[str, str]
     fingerprint: str | None = None
     error: str | None = None
+    error_code: str | None = None
 
 
 def _sections(output: str) -> dict[str, str]:
@@ -168,6 +219,45 @@ def _parse_cpu(text: str, previous: dict[str, Any] | None) -> dict[str, Any]:
         "logical_cores": len([name for name in counts if name.startswith("cpu") and name != "cpu"]),
         "cpu_counts": counts,
     }
+
+
+def _parse_system_activity(text: str, previous: dict[str, Any] | None, elapsed: float | None) -> dict[str, Any]:
+    counters: dict[str, int] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in {"ctxt", "intr"}:
+            try:
+                counters[parts[0]] = int(parts[1])
+            except ValueError:
+                continue
+    old = (previous or {}).get("system_activity", {}).get("counters", {})
+    rates: dict[str, float | None] = {}
+    for key, value in counters.items():
+        prior = old.get(key)
+        rates[key] = round((value - int(prior)) / elapsed, 2) if prior is not None and elapsed and value >= int(prior) else None
+    return {"counters": counters, "per_second": rates}
+
+
+def _parse_limits(text: str) -> dict[str, int | None]:
+    values: dict[str, int | None] = {}
+    for line in text.splitlines():
+        key, separator, raw = line.partition("\t")
+        if not separator:
+            continue
+        try:
+            values[key] = int(raw.strip())
+        except ValueError:
+            values[key] = None
+    return values
+
+
+def _parse_software(text: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("\t")
+        if separator and key in {"kernel", "python3", "cuda", "docker"} and value.strip():
+            result[key] = value.strip()
+    return result
 
 
 def _parse_meminfo(text: str) -> dict[str, Any]:
@@ -316,12 +406,143 @@ def _parse_network(text: str, previous: dict[str, Any] | None, elapsed: float | 
     return rows
 
 
-def _parse_gpu(text: str, process_text: str) -> list[dict[str, Any]]:
+def _parse_process_details(text: str) -> dict[str, dict[str, Any]]:
+    details: dict[str, dict[str, Any]] = {}
+    for line in text.splitlines():
+        if "\t" in line:
+            parts = line.split("\t", 3)
+        else:
+            # Older agents returned only "PID USER".  Preserve compatibility
+            # with samples collected before process details were introduced.
+            parts = line.split(None, 1)
+        if len(parts) < 2 or not parts[0].strip().isdigit():
+            continue
+        pid = parts[0].strip()
+        details[pid] = {
+            "user": parts[1].strip() or "unknown",
+            "cwd": (parts[2].strip() or None) if len(parts) > 2 else None,
+            "command": (parts[3].strip() or None) if len(parts) > 3 else None,
+        }
+    return details
+
+
+def _parse_process_users(text: str) -> dict[str, str]:
+    return {pid: item["user"] for pid, item in _parse_process_details(text).items()}
+
+
+def _normalise_bus(value: str | None) -> str:
+    normalized = str(value or "").strip().lower().removeprefix("pci:")
+    normalized = re.sub(r"^(?:0{4}|0{8}):", "", normalized)
+    return normalized.removesuffix(".0")
+
+
+def _parse_gpu_health(text: str) -> dict[str, dict[str, Any]]:
+    health: dict[str, dict[str, Any]] = {}
+    for line in text.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 12 or not parts[1].startswith("GPU-"):
+            continue
+        raw_throttle = parts[11]
+        throttle_active = bool(raw_throttle and raw_throttle.lower() not in {"n/a", "not supported", "0x0", "0"} and raw_throttle.lower().replace("0x", "").strip("0"))
+        health[parts[1]] = {
+            "pstate": None if parts[2].lower() in {"n/a", "not supported"} else parts[2],
+            "power_limit_w": _number(parts[3]),
+            "pci_bus": parts[4] if parts[4].lower() not in {"n/a", "not supported"} else None,
+            "pcie_gen": _number(parts[5]),
+            "pcie_gen_max": _number(parts[6]),
+            "pcie_width": _number(parts[7]),
+            "pcie_width_max": _number(parts[8]),
+            "ecc_corrected": _number(parts[9]),
+            "ecc_uncorrected": _number(parts[10]),
+            "throttle_mask": raw_throttle,
+            "throttle_active": throttle_active,
+            "throttle_reasons": [f"活动掩码 {raw_throttle}"] if throttle_active else [],
+            "clock_current_mhz": _number(parts[12]) if len(parts) > 12 else None,
+            "clock_application_mhz": _number(parts[13]) if len(parts) > 13 else None,
+            "clock_default_application_mhz": _number(parts[14]) if len(parts) > 14 else None,
+            "compute_mode": None if len(parts) <= 15 or parts[15].lower() in {"n/a", "not supported"} else parts[15],
+        }
+    return health
+
+
+def _parse_gpu_performance(text: str) -> dict[str, list[str]]:
+    reasons: dict[str, list[str]] = {}
+    bus: str | None = None
+    in_reasons = False
+    known = re.compile(r"(Power|Thermal|Slowdown|Reliability|Brake)", re.I)
+    for line in text.splitlines():
+        header = re.match(r"\s*GPU\s+([0-9A-Fa-f:.]+)", line)
+        if header:
+            bus = _normalise_bus(header.group(1))
+            in_reasons = False
+            continue
+        if not bus:
+            continue
+        if "Clocks Event Reasons" in line:
+            in_reasons = True
+            continue
+        if in_reasons and line and not line[0].isspace():
+            in_reasons = False
+        if in_reasons and ":" in line and re.search(r"\bActive\b", line, re.I) and not re.search(r"\bNot Active\b", line, re.I):
+            title = line.split(":", 1)[0].strip()
+            if known.search(title):
+                reasons.setdefault(bus, []).append(title)
+    return reasons
+
+
+def _parse_gpu_xid(text: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        match = re.search(r"Xid.*?(?:PCI:)?([0-9A-Fa-f:.]+)?\)?[: ]+([0-9]+)", line, re.I)
+        if not match:
+            continue
+        events.append({"bus": _normalise_bus(match.group(1)), "code": int(match.group(2)), "message": line.strip()[:500]})
+    return events
+
+
+def _parse_hardware(text: str) -> dict[str, Any]:
+    values: dict[str, Any] = {"cpu_model": "", "memory_total_bytes": None, "motherboard": "", "pci_devices": []}
+    board: dict[str, str] = {}
+    for line in text.splitlines():
+        if "\t" not in line:
+            continue
+        key, value = line.split("\t", 1)
+        value = value.strip()
+        if key == "cpu_model":
+            values["cpu_model"] = value
+        elif key == "memory_total_kib":
+            try:
+                values["memory_total_bytes"] = int(value) * 1024
+            except ValueError:
+                pass
+        elif key.startswith("board_"):
+            board[key.removeprefix("board_")] = value
+        elif key == "pci" and value:
+            bus, _, description = value.partition(" ")
+            values["pci_devices"].append({"bus": bus, "description": description})
+    values["motherboard"] = " ".join(item for item in (board.get("vendor"), board.get("name"), board.get("version")) if item)
+    return values
+
+
+def _parse_gpu(text: str, process_text: str, process_user_text: str = "", health_text: str = "", performance_text: str = "", xid_text: str = "") -> list[dict[str, Any]]:
     processes: dict[str, list[dict[str, Any]]] = {}
+    process_details = _parse_process_details(process_user_text)
     for line in process_text.splitlines():
         parts = [part.strip() for part in line.split(",")]
         if len(parts) >= 4 and parts[0].startswith("GPU-"):
-            processes.setdefault(parts[0], []).append({"pid": parts[1], "name": parts[2], "memory_mib": _number(parts[3])})
+            detail = process_details.get(parts[1], {})
+            processes.setdefault(parts[0], []).append({
+                "pid": parts[1],
+                "user": detail.get("user", "unknown"),
+                "pid_exists": parts[1] in process_details,
+                "name": parts[2],
+                "cwd": detail.get("cwd"),
+                "command": detail.get("command") or parts[2],
+                "memory_mib": _number(parts[3]),
+            })
+    health = _parse_gpu_health(health_text)
+    performance = _parse_gpu_performance(performance_text)
+    xid_events = _parse_gpu_xid(xid_text)
     gpus: list[dict[str, Any]] = []
     for line in text.splitlines():
         parts = [part.strip() for part in line.split(",")]
@@ -329,8 +550,7 @@ def _parse_gpu(text: str, process_text: str) -> list[dict[str, Any]]:
             continue
         total = _number(parts[5])
         used = _number(parts[6])
-        gpus.append(
-            {
+        item = {
                 "index": int(parts[0]),
                 "uuid": parts[1],
                 "name": parts[2],
@@ -344,7 +564,30 @@ def _parse_gpu(text: str, process_text: str) -> list[dict[str, Any]]:
                 "fan_percent": _number(parts[9]),
                 "processes": processes.get(parts[1], []),
             }
+        item.update(health.get(parts[1], {}))
+        process_rows = processes.get(parts[1], [])
+        stale_processes = [process for process in process_rows if not process.get("pid_exists")]
+        process_memory = sum(float(process.get("memory_mib") or 0) for process in process_rows)
+        residual_memory = max(0.0, float(used or 0) - process_memory)
+        item["stale_processes"] = stale_processes
+        item["residual_memory_mib"] = round(residual_memory, 1)
+        item["residual_memory_suspected"] = bool(stale_processes) or (not process_rows and residual_memory >= 256)
+        if item.get("pci_bus"):
+            item["throttle_reasons"] = performance.get(_normalise_bus(item["pci_bus"]), item.get("throttle_reasons", []))
+            item["throttle_active"] = bool(item.get("throttle_reasons")) or item.get("throttle_active", False)
+            item["xid_errors"] = [event for event in xid_events if not event["bus"] or event["bus"] == _normalise_bus(item["pci_bus"])]
+        else:
+            item["xid_errors"] = xid_events
+        width_degraded = bool(item.get("pcie_width") is not None and item.get("pcie_width_max") is not None and item["pcie_width"] < item["pcie_width_max"])
+        gen_degraded_under_load = bool(
+            item.get("utilization_percent") is not None
+            and item["utilization_percent"] >= 50
+            and item.get("pcie_gen") is not None
+            and item.get("pcie_gen_max") is not None
+            and item["pcie_gen"] < item["pcie_gen_max"]
         )
+        item["pcie_degraded"] = width_degraded or gen_degraded_under_load
+        gpus.append(item)
     return gpus
 
 
@@ -425,7 +668,7 @@ def _parse_block_devices(text: str) -> list[dict[str, Any]]:
     return devices
 
 
-def _parse_docker(text: str, stats_text: str = "") -> tuple[list[dict[str, Any]], str | None]:
+def _parse_docker(text: str, stats_text: str = "", inspect_text: str = "") -> tuple[list[dict[str, Any]], str | None]:
     containers: list[dict[str, Any]] = []
     if not text:
         return containers, None
@@ -456,6 +699,35 @@ def _parse_docker(text: str, stats_text: str = "") -> tuple[list[dict[str, Any]]
         container["memory_percent"] = _number(memory)
         container["memory_usage"] = current.get("MemUsage")
         container["network_io"] = current.get("NetIO")
+        container["block_io"] = current.get("BlockIO")
+        container["pids"] = current.get("PIDs")
+    inspected: dict[str, dict[str, Any]] = {}
+    for line in inspect_text.splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        container_id = str(item.get("Id") or "")
+        if container_id:
+            inspected[container_id] = item
+    for container in containers:
+        container_id = str(container.get("ID") or "")
+        detail = next((value for key, value in inspected.items() if key.startswith(container_id) or container_id.startswith(key[:12])), {})
+        host_config = detail.get("HostConfig") or {}
+        device_requests = host_config.get("DeviceRequests") or []
+        gpu_requests = [request for request in device_requests if "gpu" in (request.get("Capabilities") or [[]])[0]]
+        container["gpu_requests"] = gpu_requests
+        container["resource_limits"] = {
+            "nano_cpus": host_config.get("NanoCpus") or 0,
+            "memory_bytes": host_config.get("Memory") or 0,
+            "memory_swap_bytes": host_config.get("MemorySwap") or 0,
+            "pids_limit": host_config.get("PidsLimit"),
+        }
+        container["mounts"] = [
+            {"source": mount.get("Source"), "destination": mount.get("Destination"), "rw": bool(mount.get("RW"))}
+            for mount in (detail.get("Mounts") or [])[:50]
+        ]
+        container["storage_driver"] = (detail.get("GraphDriver") or {}).get("Name")
     return containers, None
 
 
@@ -506,7 +778,7 @@ class Collector:
             command = f"SERVER_MONITOR_DOCKER_ENABLED={docker_enabled} {CORE_COMMAND}"
             result = client.run(command, host.get("timeout_seconds") or self.settings["collection_timeout"])
             if result.exit_code != 0 and not result.stdout:
-                return CollectionResult(False, {}, {}, fingerprint, result.stderr or "远端采集命令失败")
+                return CollectionResult(False, {}, {}, fingerprint, result.stderr or "远端采集命令失败", "remote_command_failed")
             parts = _sections(result.stdout)
             cpu = _parse_cpu(parts.get("proc_stat", ""), previous)
             memory = _parse_meminfo(parts.get("meminfo", ""))
@@ -516,6 +788,7 @@ class Collector:
                 filesystem.update(inode_filesystems.get(filesystem["mountpoint"], {}))
             previous_time = (previous or {}).get("collected_monotonic")
             elapsed = time.monotonic() - previous_time if previous_time else None
+            system_activity = _parse_system_activity(parts.get("proc_stat", ""), previous, elapsed)
             network = _parse_network(parts.get("netdev", ""), previous, elapsed)
             disks_io = _parse_diskstats(parts.get("diskstats", ""), previous, elapsed)
             identity_lines = parts.get("identity", "").splitlines()
@@ -530,10 +803,19 @@ class Collector:
             optional_errors: dict[str, str] = {}
             gpus: list[dict[str, Any]] = []
             if tools.get("nvidia-smi") == "可用":
-                gpus = _parse_gpu(parts.get("gpu", ""), parts.get("gpu_processes", ""))
+                gpus = _parse_gpu(
+                    parts.get("gpu", ""),
+                    parts.get("gpu_processes", ""),
+                    parts.get("process_users", ""),
+                    parts.get("gpu_health", ""),
+                    parts.get("gpu_performance", ""),
+                    parts.get("gpu_xid", ""),
+                )
                 if not gpus and parts.get("gpu", ""):
-                    optional_errors["gpu"] = "输出解析失败"
-            docker, docker_error = _parse_docker(parts.get("docker", ""), parts.get("docker_stats", ""))
+                    optional_errors["gpu"] = f"nvidia-smi 执行或解析失败: {parts.get('gpu', '').splitlines()[0][:300]}"
+                elif parts.get("gpu_health", "") and not any(gpu.get("pstate") or gpu.get("power_limit_w") for gpu in gpus):
+                    optional_errors["gpu_health"] = "驱动不支持完整的 P-State、ECC 或 PCIe 查询"
+            docker, docker_error = _parse_docker(parts.get("docker", ""), parts.get("docker_stats", ""), parts.get("docker_inspect", ""))
             if docker_error:
                 optional_errors["docker"] = docker_error
             smart, smart_error = _parse_smart(parts.get("smart", ""))
@@ -548,7 +830,9 @@ class Collector:
                 "collected_at": utc_iso(),
                 "collected_monotonic": time.monotonic(),
                 "identity": {"hostname": identity_lines[0] if identity_lines else None, "machine_id": identity_lines[1] if len(identity_lines) > 1 else None},
+                "hardware": _parse_hardware(parts.get("hardware", "")),
                 "cpu": cpu,
+                "system_activity": system_activity,
                 "memory": memory,
                 "load": {"one": _number(load_parts[0]) if len(load_parts) > 0 else None, "five": _number(load_parts[1]) if len(load_parts) > 1 else None, "fifteen": _number(load_parts[2]) if len(load_parts) > 2 else None},
                 "uptime_seconds": _number(uptime_parts[0]) if uptime_parts else None,
@@ -566,14 +850,16 @@ class Collector:
                 "docker": docker,
                 "smart": smart,
                 "tools": tools,
+                "limits": _parse_limits(parts.get("limits", "")),
+                "software": _parse_software(parts.get("software", "")),
                 "optional_errors": optional_errors,
                 "duration_seconds": round(time.monotonic() - started, 3),
             }
             return CollectionResult(True, data, optional_errors, fingerprint)
-        except SSHError as exc:
-            return CollectionResult(False, {}, {}, None, str(exc))
+        except (SSHFingerprintError, SSHAuthenticationError, SSHTimeout, SSHConnectionError, SSHError) as exc:
+            return CollectionResult(False, {}, {}, None, str(exc), getattr(exc, "code", "ssh_error"))
         except (ValueError, KeyError, IndexError) as exc:
-            return CollectionResult(False, {}, {}, None, f"核心指标解析失败: {exc}")
+            return CollectionResult(False, {}, {}, None, f"核心指标解析失败: {exc}", "remote_command_failed")
         finally:
             client.close()
 
@@ -584,6 +870,7 @@ def flattened_metrics(data: dict[str, Any]) -> list[tuple[str, str, float]]:
         ("cpu_usage", data.get("cpu", {}).get("usage_percent")),
         ("cpu_iowait", data.get("cpu", {}).get("iowait_percent")),
         ("memory_usage", data.get("memory", {}).get("usage_percent")),
+        ("swap_usage", data.get("memory", {}).get("swap_usage_percent")),
     ):
         if value is not None:
             values.append((metric, "", float(value)))
@@ -610,7 +897,15 @@ def flattened_metrics(data: dict[str, Any]) -> list[tuple[str, str, float]]:
             if value is not None:
                 values.append((metric, interface["name"], float(value)))
     for gpu in data.get("gpus", []):
-        for metric, value in (("gpu_utilization", gpu["utilization_percent"]), ("gpu_memory", gpu["memory_percent"]), ("gpu_temperature", gpu["temperature_c"])):
+        for metric, value in (
+            ("gpu_utilization", gpu.get("utilization_percent")),
+            ("gpu_memory", gpu.get("memory_percent")),
+            ("gpu_temperature", gpu.get("temperature_c")),
+            ("gpu_power", gpu.get("power_w")),
+            ("gpu_fan", gpu.get("fan_percent")),
+            ("gpu_pcie_gen", gpu.get("pcie_gen")),
+            ("gpu_pcie_width", gpu.get("pcie_width")),
+        ):
             if value is not None:
                 values.append((metric, gpu["uuid"], float(value)))
     return values

@@ -10,7 +10,7 @@ from typing import Any, Iterator, Sequence
 
 
 SCHEMA = """
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -88,6 +88,9 @@ CREATE TABLE IF NOT EXISTS hosts (
     identity_degraded INTEGER NOT NULL DEFAULT 0,
     tags_json TEXT NOT NULL DEFAULT '[]',
     notes TEXT NOT NULL DEFAULT '',
+    asset_location TEXT NOT NULL DEFAULT '',
+    asset_owner TEXT NOT NULL DEFAULT '',
+    warranty_expires TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     docker_enabled INTEGER NOT NULL DEFAULT 1,
     allow_tmux INTEGER NOT NULL DEFAULT 1,
@@ -122,6 +125,7 @@ CREATE TABLE IF NOT EXISTS host_runtime (
     last_success_at TEXT,
     last_attempt_at TEXT,
     last_error TEXT,
+    error_code TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -262,7 +266,8 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     request_id TEXT,
     success INTEGER NOT NULL,
     summary TEXT NOT NULL,
-    error TEXT
+    error TEXT,
+    changes_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_search ON audit_logs(ts, action, username, success);
@@ -302,6 +307,17 @@ CREATE TABLE IF NOT EXISTS stress_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_stress_jobs_host ON stress_jobs(host_id, started_at);
 
+CREATE TABLE IF NOT EXISTS saved_views (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    page TEXT NOT NULL CHECK(page IN ('dashboard', 'hosts')),
+    name TEXT NOT NULL,
+    filters_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(user_id, page, name)
+);
+
 INSERT OR IGNORE INTO schema_migrations(version, applied_at)
 VALUES(1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 INSERT OR IGNORE INTO schema_migrations(version, applied_at)
@@ -312,6 +328,8 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at)
 VALUES(4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 INSERT OR IGNORE INTO schema_migrations(version, applied_at)
 VALUES(5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+VALUES(6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 """
 
 
@@ -350,7 +368,21 @@ class Database:
                 ):
                     if name not in columns:
                         connection.execute(f"ALTER TABLE alerts ADD COLUMN {name} {definition}")
-                connection.execute("PRAGMA user_version = 5")
+                host_columns = {row[1] for row in connection.execute("PRAGMA table_info(hosts)").fetchall()}
+                for name, definition in (
+                    ("asset_location", "TEXT NOT NULL DEFAULT ''"),
+                    ("asset_owner", "TEXT NOT NULL DEFAULT ''"),
+                    ("warranty_expires", "TEXT"),
+                ):
+                    if name not in host_columns:
+                        connection.execute(f"ALTER TABLE hosts ADD COLUMN {name} {definition}")
+                runtime_columns = {row[1] for row in connection.execute("PRAGMA table_info(host_runtime)").fetchall()}
+                if "error_code" not in runtime_columns:
+                    connection.execute("ALTER TABLE host_runtime ADD COLUMN error_code TEXT")
+                audit_columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_logs)").fetchall()}
+                if "changes_json" not in audit_columns:
+                    connection.execute("ALTER TABLE audit_logs ADD COLUMN changes_json TEXT")
+                connection.execute("PRAGMA user_version = 6")
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

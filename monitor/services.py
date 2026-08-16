@@ -27,7 +27,7 @@ from .utils import (
 
 
 ACTIVE_HOST_FIELDS = {
-    "name", "address", "port", "username", "auth_type", "tags", "notes", "enabled",
+    "name", "address", "port", "username", "auth_type", "tags", "notes", "asset_location", "asset_owner", "warranty_expires", "enabled",
     "docker_enabled", "allow_tmux", "allow_terminal", "allow_process", "allow_install",
     "allow_stress", "timeout_seconds", "scheduler_enabled", "scheduler_idle_seconds",
     "scheduler_process_guard", "schedule_command", "schedule_cwd", "schedule_shell",
@@ -40,7 +40,7 @@ BOOLEAN_HOST_FIELDS = {
 SECRET_HOST_FIELDS = {"auth_secret", "private_key", "private_key_passphrase", "sudo_password"}
 HOST_TRANSFER_FIELDS = (
     "name", "address", "port", "username", "auth_type", "auth_secret", "private_key",
-    "private_key_passphrase", "sudo_password", "tags", "notes", "enabled", "docker_enabled",
+    "private_key_passphrase", "sudo_password", "tags", "notes", "asset_location", "asset_owner", "warranty_expires", "enabled", "docker_enabled",
     "allow_tmux", "allow_terminal", "allow_process", "allow_install", "allow_stress",
     "timeout_seconds",
 )
@@ -184,7 +184,7 @@ class HostService:
             clauses.append("r.status=?")
             params.append(status)
         rows = self.database.query_all(
-            "SELECT h.*,r.status,r.failure_cycles,r.last_success_at,r.last_attempt_at,r.last_error,r.updated_at AS runtime_updated_at "
+            "SELECT h.*,r.status,r.failure_cycles,r.last_success_at,r.last_attempt_at,r.last_error,r.error_code,r.updated_at AS runtime_updated_at "
             "FROM hosts h LEFT JOIN host_runtime r ON r.host_id=h.id WHERE " + " AND ".join(clauses) + " ORDER BY h.name COLLATE NOCASE, h.id",
             params,
         )
@@ -192,7 +192,7 @@ class HostService:
 
     def get(self, host_id: int, *, include_secrets: bool = False, required: bool = True) -> dict[str, Any] | None:
         row = self.database.query_one(
-            "SELECT h.*,r.status,r.failure_cycles,r.last_success_at,r.last_attempt_at,r.last_error,r.updated_at AS runtime_updated_at "
+            "SELECT h.*,r.status,r.failure_cycles,r.last_success_at,r.last_attempt_at,r.last_error,r.error_code,r.updated_at AS runtime_updated_at "
             "FROM hosts h LEFT JOIN host_runtime r ON r.host_id=h.id WHERE h.id=? AND h.deleted_at IS NULL",
             (host_id,),
         )
@@ -258,6 +258,21 @@ class HostService:
                 if not isinstance(value, str) or len(value) > 4000:
                     raise ServiceError("备注无效")
                 result[key] = value
+            elif key in {"asset_location", "asset_owner"}:
+                if not isinstance(value, str) or len(value.strip()) > 255:
+                    raise ServiceError(f"{key} 无效")
+                result[key] = value.strip()
+            elif key == "warranty_expires":
+                if value in {None, ""}:
+                    result[key] = None
+                elif not isinstance(value, str) or len(value) != 10:
+                    raise ServiceError("warranty_expires 必须使用 YYYY-MM-DD 格式")
+                else:
+                    try:
+                        datetime.strptime(value, "%Y-%m-%d")
+                    except ValueError as exc:
+                        raise ServiceError("warranty_expires 日期无效") from exc
+                    result[key] = value
             elif key in {"schedule_command", "schedule_cwd", "schedule_shell"}:
                 if value is not None and not isinstance(value, str):
                     raise ServiceError(f"{key} 必须是字符串")
@@ -299,7 +314,7 @@ class HostService:
         physical_id, degraded = self.physical_id(fingerprint, machine_id)
         now = utc_iso()
         values = {
-            "port": 22, "tags_json": "[]", "notes": "", "enabled": 1, "docker_enabled": 1,
+            "port": 22, "tags_json": "[]", "notes": "", "asset_location": "", "asset_owner": "", "warranty_expires": None, "enabled": 1, "docker_enabled": 1,
             "allow_tmux": 1, "allow_terminal": 1, "allow_process": 1, "allow_install": 1,
             "allow_stress": 1, "schedule_shell": "/bin/bash", "schedule_env_json": "{}", "schedule_mode": "tmux",
             **clean, "fingerprint": fingerprint, "machine_id": machine_id, "physical_id": physical_id,
@@ -426,16 +441,16 @@ class HostService:
             )
         return self.mount_thresholds(host_id)
 
-    def status(self, host_id: int, status: str, *, failure_cycles: int | None = None, error: str | None = None, success: bool = False) -> None:
+    def status(self, host_id: int, status: str, *, failure_cycles: int | None = None, error: str | None = None, error_code: str | None = None, success: bool = False) -> None:
         now = utc_iso()
         existing = self.database.query_one("SELECT failure_cycles FROM host_runtime WHERE host_id=?", (host_id,))
         failure_cycles = existing["failure_cycles"] if failure_cycles is None and existing else failure_cycles or 0
         self.database.execute(
-            "INSERT INTO host_runtime(host_id,status,failure_cycles,last_success_at,last_attempt_at,last_error,updated_at) "
-            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(host_id) DO UPDATE SET status=excluded.status,"
+            "INSERT INTO host_runtime(host_id,status,failure_cycles,last_success_at,last_attempt_at,last_error,error_code,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(host_id) DO UPDATE SET status=excluded.status,"
             "failure_cycles=excluded.failure_cycles,last_success_at=COALESCE(excluded.last_success_at,host_runtime.last_success_at),"
-            "last_attempt_at=excluded.last_attempt_at,last_error=excluded.last_error,updated_at=excluded.updated_at",
-            (host_id, status, failure_cycles, now if success else None, now, error, now),
+            "last_attempt_at=excluded.last_attempt_at,last_error=excluded.last_error,error_code=excluded.error_code,updated_at=excluded.updated_at",
+            (host_id, status, failure_cycles, now if success else None, now, error, error_code, now),
         )
 
     def ingest_collection(self, host_id: int, result: CollectionResult) -> dict[str, Any]:
@@ -445,24 +460,31 @@ class HostService:
             self.mark_gpu_unknown(host_id, "主机采集已禁用")
             return {"status": "disabled"}
         if not result.core_ok:
-            if result.error and "指纹" in result.error:
-                self.status(host_id, "fingerprint_error", error=result.error)
+            if result.error_code == "fingerprint_changed" or (result.error and "指纹" in result.error):
+                self.status(host_id, "fingerprint_error", error=result.error, error_code="fingerprint_changed")
                 self.mark_gpu_unknown(host_id, "SSH 指纹异常")
                 return {"status": "fingerprint_error", "error": result.error}
             runtime = self.database.query_one("SELECT failure_cycles FROM host_runtime WHERE host_id=?", (host_id,))
             cycles = (runtime["failure_cycles"] if runtime else 0) + 1
-            status = "offline" if cycles >= 3 else "unknown"
-            self.status(host_id, status, failure_cycles=cycles, error=result.error)
-            if status == "offline":
+            specific_status = {
+                "authentication_failed": "auth_failed",
+                "timeout": "collection_timeout",
+                "connection_failed": "ssh_unreachable",
+                "remote_command_failed": "command_error",
+            }.get(result.error_code)
+            status = specific_status or ("offline" if cycles >= 3 else "unknown")
+            self.status(host_id, status, failure_cycles=cycles, error=result.error, error_code=result.error_code)
+            if status == "offline" or specific_status:
                 self.mark_gpu_unknown(host_id, "主机离线")
-            return {"status": status, "failure_cycles": cycles, "error": result.error}
+            return {"status": status, "failure_cycles": cycles, "error": result.error, "error_code": result.error_code}
         if result.fingerprint and host.get("fingerprint") and result.fingerprint != host["fingerprint"]:
-            self.status(host_id, "fingerprint_error", error="SSH 主机指纹与已记录值不一致")
+            self.status(host_id, "fingerprint_error", error="SSH 主机指纹与已记录值不一致", error_code="fingerprint_changed")
             self.mark_gpu_unknown(host_id, "SSH 指纹异常")
             return {"status": "fingerprint_error"}
         data = result.data
         now = data["collected_at"]
-        status = "degraded" if result.optional_errors else "online"
+        status = "gpu_error" if "gpu" in result.optional_errors else "degraded" if result.optional_errors else "online"
+        optional_summary = "; ".join(f"{key}: {value}" for key, value in result.optional_errors.items()) or None
         with self.database.transaction() as connection:
             connection.execute(
                 "INSERT INTO latest_samples(host_id,collected_at,data_json) VALUES(?,?,?) ON CONFLICT(host_id) "
@@ -470,10 +492,10 @@ class HostService:
                 (host_id, now, json_dump(data)),
             )
             connection.execute(
-                "INSERT INTO host_runtime(host_id,status,failure_cycles,last_success_at,last_attempt_at,last_error,updated_at) "
-                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(host_id) DO UPDATE SET status=excluded.status,failure_cycles=0,"
-                "last_success_at=excluded.last_success_at,last_attempt_at=excluded.last_attempt_at,last_error=NULL,updated_at=excluded.updated_at",
-                (host_id, status, 0, now, now, None, now),
+                "INSERT INTO host_runtime(host_id,status,failure_cycles,last_success_at,last_attempt_at,last_error,error_code,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(host_id) DO UPDATE SET status=excluded.status,failure_cycles=0,"
+                "last_success_at=excluded.last_success_at,last_attempt_at=excluded.last_attempt_at,last_error=excluded.last_error,error_code=excluded.error_code,updated_at=excluded.updated_at",
+                (host_id, status, 0, now, now, optional_summary, "gpu_command_failed" if status == "gpu_error" else None, now),
             )
             for metric, object_key, value in flattened_metrics(data):
                 connection.execute(
@@ -648,19 +670,33 @@ class AlertService:
         return alert_id
 
     def evaluate_host(self, host_id: int, status: str, data: dict[str, Any] | None = None) -> None:
-        if status == "offline":
-            self.emit(f"host-offline:{host_id}", host_id, "host_offline", "critical", "主机连续三个采集周期失败")
+        failure_labels = {
+            "offline": "主机连续三个采集周期失败",
+            "ssh_unreachable": "SSH 网络连接失败",
+            "auth_failed": "SSH 密码或密钥认证失败",
+            "collection_timeout": "SSH 采集命令超时",
+            "command_error": "远端核心采集命令执行失败",
+        }
+        if status in failure_labels:
+            self.emit(f"host-offline:{host_id}", host_id, "host_offline", "critical", failure_labels[status])
         elif status == "fingerprint_error":
             self.emit(f"host-fingerprint:{host_id}", host_id, "ssh_fingerprint_changed", "critical", "SSH 主机指纹异常，连接已停止")
-        elif status in {"online", "degraded"}:
+        elif status in {"online", "degraded", "gpu_error"}:
             self.emit(f"host-offline:{host_id}", host_id, "host_online", "info", "主机已恢复在线", state="recovered")
             self.emit(f"host-fingerprint:{host_id}", host_id, "ssh_fingerprint_recovered", "info", "SSH 主机指纹已确认", state="recovered")
         if not data:
             return
         settings = self.config.all()
+        memory = data.get("memory") or {}
+        if float(memory.get("swap_total") or 0) > 0:
+            self._utilization(
+                host_id, "swap_usage", "", "swap_usage_high", "swap_usage_recovered",
+                "Swap", memory.get("swap_usage_percent"), float(settings["swap_usage_threshold"]), settings,
+            )
         checks: list[tuple[str, str, float | None, float]] = [("cpu_temperature", "CPU", data.get("cpu_temperature_c"), settings["cpu_temp_threshold"])]
         for gpu in data.get("gpus", []):
             checks.append((f"gpu_temperature:{gpu['uuid']}", f"GPU {gpu['uuid'][:12]}", gpu.get("temperature_c"), settings["gpu_temp_threshold"]))
+            self._gpu_health(host_id, gpu, settings)
         for disk in data.get("smart", []):
             checks.append((f"disk_temperature:{disk['device']}", f"磁盘 {disk['device']}", disk.get("temperature_c"), settings["disk_temp_threshold"]))
         for key, title, value, limit in checks:
@@ -691,6 +727,61 @@ class AlertService:
                 host_id, "filesystem_inode_usage", mountpoint, "filesystem_inode_high", "filesystem_inode_recovered",
                 f"挂载点 {mountpoint} inode", filesystem.get("inode_usage_percent"), float(inode_limit), settings,
             )
+
+    def _gpu_health(self, host_id: int, gpu: dict[str, Any], settings: dict[str, Any]) -> None:
+        uuid = str(gpu.get("uuid") or "unknown")
+        title = f"GPU {gpu.get('index', '?')}"
+
+        def state_alert(suffix: str, active: bool, alert_type: str, summary: str, recovered_summary: str, severity: str = "warning") -> None:
+            key = f"gpu-health:{host_id}:{uuid}:{suffix}"
+            if active:
+                self.emit(key, host_id, alert_type, severity, summary)
+            else:
+                self.emit(key, host_id, f"{alert_type}_recovered", "info", recovered_summary, state="recovered")
+
+        power = gpu.get("power_w")
+        power_limit = gpu.get("power_limit_w")
+        power_percent = float(power) * 100 / float(power_limit) if power is not None and power_limit else None
+        state_alert(
+            "power",
+            power_percent is not None and power_percent >= settings["gpu_power_threshold_percent"],
+            "gpu_power_high",
+            f"{title} 功耗 {float(power or 0):.1f}W 达到功耗上限的 {float(power_percent or 0):.1f}%",
+            f"{title} 功耗恢复正常",
+        )
+        fan = gpu.get("fan_percent")
+        temperature = gpu.get("temperature_c")
+        fan_low = fan is not None and temperature is not None and float(temperature) >= settings["gpu_fan_alert_temperature"] and float(fan) <= settings["gpu_fan_min_percent"]
+        state_alert("fan", fan_low, "gpu_fan_low", f"{title} 温度 {float(temperature or 0):.1f}C 但风扇仅 {float(fan or 0):.1f}%", f"{title} 风扇状态恢复正常")
+        corrected = float(gpu.get("ecc_corrected") or 0)
+        uncorrected = float(gpu.get("ecc_uncorrected") or 0)
+        ecc_bad = uncorrected > 0 or corrected >= settings["gpu_ecc_corrected_threshold"]
+        state_alert("ecc", ecc_bad, "gpu_ecc_error", f"{title} ECC 错误：可纠正 {corrected:g}，不可纠正 {uncorrected:g}", f"{title} ECC 状态恢复正常", "critical" if uncorrected > 0 else "warning")
+        xid_events = gpu.get("xid_errors") or []
+        xid_codes = sorted({str(event.get("code")) for event in xid_events})
+        state_alert("xid", settings["gpu_xid_alert_enabled"] and bool(xid_events), "gpu_xid_error", f"{title} 检测到 XID 错误：{', '.join(xid_codes)}", f"{title} 最近未检测到 XID 错误", "critical")
+        state_alert(
+            "pcie",
+            settings["gpu_pcie_alert_enabled"] and bool(gpu.get("pcie_degraded")),
+            "gpu_pcie_degraded",
+            f"{title} PCIe 链路为 Gen{gpu.get('pcie_gen')} x{gpu.get('pcie_width')}，低于最大 Gen{gpu.get('pcie_gen_max')} x{gpu.get('pcie_width_max')}",
+            f"{title} PCIe 链路恢复正常",
+        )
+        reasons = gpu.get("throttle_reasons") or []
+        state_alert(
+            "throttle",
+            settings["gpu_throttle_alert_enabled"] and bool(reasons),
+            "gpu_throttling",
+            f"{title} 正在节流：{', '.join(str(reason) for reason in reasons)}",
+            f"{title} 节流状态已解除",
+        )
+        state_alert(
+            "residual-memory",
+            settings["gpu_residual_alert_enabled"] and bool(gpu.get("residual_memory_suspected")),
+            "gpu_residual_memory",
+            f"{title} 疑似存在残留显存：未归属 {float(gpu.get('residual_memory_mib') or 0):.1f} MiB",
+            f"{title} 残留显存异常已解除",
+        )
 
     def _temperature(self, host_id: int, key: str, title: str, value: float, limit: float, settings: dict[str, Any]) -> None:
         recent = self.database.query_all(
@@ -739,8 +830,8 @@ class AlertService:
         elif len(values) >= settings["alert_samples"] and all(item < limit - settings["alert_hysteresis"] for item in values):
             self.emit(alert_key, host_id, recovered_type, "info", f"{title} 使用率恢复正常", state="recovered")
 
-    def list(self, page: int = 1, page_size: int = 20, filters: dict[str, Any] | None = None) -> dict[str, Any]:
-        page, page_size = clamp_page(page), clamp_page_size(page_size)
+    @staticmethod
+    def _where(filters: dict[str, Any]) -> tuple[str, list[Any]]:
         filters = filters or {}
         clauses, params = ["1=1"], []
         if not filters.get("include_cleared"):
@@ -759,13 +850,48 @@ class AlertService:
         if search:
             clauses.append("(a.alert_type LIKE ? OR a.summary LIKE ? OR h.name LIKE ?)")
             params.extend([f"%{search}%"] * 3)
-        where = " AND ".join(clauses)
+        return " AND ".join(clauses), params
+
+    def list(self, page: int = 1, page_size: int = 20, filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        page, page_size = clamp_page(page), clamp_page_size(page_size)
+        where, params = self._where(filters or {})
         total = self.database.query_one(f"SELECT COUNT(*) AS count FROM alerts a LEFT JOIN hosts h ON h.id=a.host_id WHERE {where}", params)["count"]
         rows = self.database.query_all(
             f"SELECT a.*,h.name AS host_name FROM alerts a LEFT JOIN hosts h ON h.id=a.host_id WHERE {where} ORDER BY a.id DESC LIMIT ? OFFSET ?",
             [*params, page_size, (page - 1) * page_size],
         )
         return paged(total, page, page_size, [dict(row) for row in rows])
+
+    def _bulk_update(self, filters: dict[str, Any], *, user_id: int | None = None, clear: bool = False, limit: int = 1000) -> int:
+        limit = max(1, min(int(limit), 1000))
+        where, params = self._where(filters)
+        clauses = [where, "a.cleared_at IS NULL"]
+        if not clear:
+            clauses.append("a.acknowledged_at IS NULL")
+        with self.database.transaction() as connection:
+            rows = connection.execute(
+                f"SELECT a.id FROM alerts a LEFT JOIN hosts h ON h.id=a.host_id WHERE {' AND '.join(clauses)} ORDER BY a.id DESC LIMIT ?",
+                [*params, limit],
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            if not ids:
+                return 0
+            placeholders = ",".join("?" for _ in ids)
+            now = utc_iso()
+            if clear:
+                connection.execute(f"UPDATE alerts SET cleared_at=COALESCE(cleared_at,?) WHERE id IN ({placeholders})", [now, *ids])
+            else:
+                connection.execute(
+                    f"UPDATE alerts SET acknowledged_at=COALESCE(acknowledged_at,?),acknowledged_by=COALESCE(acknowledged_by,?) WHERE id IN ({placeholders})",
+                    [now, user_id, *ids],
+                )
+        return len(ids)
+
+    def bulk_acknowledge(self, filters: dict[str, Any], user_id: int, limit: int = 1000) -> int:
+        return self._bulk_update(filters, user_id=user_id, limit=limit)
+
+    def bulk_clear(self, filters: dict[str, Any], limit: int = 1000) -> int:
+        return self._bulk_update(filters, clear=True, limit=limit)
 
     def acknowledge(self, alert_id: int, user_id: int) -> dict[str, Any]:
         row = self.database.query_one("SELECT * FROM alerts WHERE id=?", (alert_id,))
@@ -834,3 +960,59 @@ def export_csv(rows: Iterable[dict[str, Any]], filename_prefix: str) -> tuple[st
     writer.writeheader()
     writer.writerows(materialized)
     return f"{filename_prefix}_{utc_now().strftime('%Y%m%d_%H%M%S')}.csv", "\ufeff" + output.getvalue()
+
+
+def gpu_user_usage(host_items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate GPU process ownership from the latest trusted samples."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in host_items:
+        host = item.get("host", item)
+        latest = item.get("latest") if isinstance(item, dict) else None
+        data = (latest or {}).get("data", {}) if isinstance(latest, dict) else {}
+        for gpu in data.get("gpus", []) or []:
+            for process in gpu.get("processes", []) or []:
+                username = str(process.get("user") or "unknown").strip() or "unknown"
+                row = grouped.setdefault(username, {"username": username, "gpu_count": 0, "process_count": 0, "memory_mib": 0.0, "hosts": set(), "gpus": set()})
+                gpu_key = (host.get("id"), gpu.get("uuid"))
+                if gpu_key not in row["gpus"]:
+                    row["gpu_count"] += 1
+                    row["gpus"].add(gpu_key)
+                row["process_count"] += 1
+                row["memory_mib"] += float(process.get("memory_mib") or 0)
+                row["hosts"].add(host.get("name") or str(host.get("id")))
+    result = []
+    for row in grouped.values():
+        row["memory_mib"] = round(row["memory_mib"], 2)
+        row["hosts"] = sorted(row["hosts"])
+        row["gpus"] = [f"{host_id}:{uuid}" for host_id, uuid in sorted(row["gpus"], key=lambda value: (value[0] or 0, value[1] or ""))]
+        result.append(row)
+    return sorted(result, key=lambda value: (-value["memory_mib"], value["username"].lower()))
+
+
+def hardware_asset_rows(host_items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in host_items:
+        host = item.get("host", item)
+        latest = item.get("latest") if isinstance(item, dict) else None
+        data = (latest or {}).get("data", {}) if isinstance(latest, dict) else {}
+        hardware = data.get("hardware") or {}
+        gpus = data.get("gpus") or []
+        rows.append({
+            "host_id": host.get("id"),
+            "host_name": host.get("name"),
+            "address": host.get("address"),
+            "status": host.get("status"),
+            "asset_location": host.get("asset_location", ""),
+            "asset_owner": host.get("asset_owner", ""),
+            "warranty_expires": host.get("warranty_expires") or "",
+            "cpu_model": hardware.get("cpu_model", ""),
+            "memory_total_bytes": hardware.get("memory_total_bytes"),
+            "motherboard": hardware.get("motherboard", ""),
+            "gpu_models": "; ".join(f"GPU {gpu.get('index')}: {gpu.get('name', '')}" for gpu in gpus),
+            "pci_devices": "; ".join(
+                " ".join(str(value) for value in (device.get("bus", device.get("name", "")), device.get("description", "")) if value)
+                for device in hardware.get("pci_devices", []) or []
+            ),
+            "collected_at": latest.get("collected_at") if isinstance(latest, dict) else None,
+        })
+    return rows

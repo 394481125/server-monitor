@@ -497,10 +497,13 @@ printf '\\0__SM_SCAN_STATUS__\\t%s\\0' "$scan_rc"
         if package_text and action in {"create", "install"}:
             if backend == "conda":
                 lines.append(f"{conda_binary} run -p \"$target\" python -m pip install {package_text}")
+                lines.append(f"{conda_binary} run -p \"$target\" python -m pip check || {{ echo '__SM_DEPENDENCY_CONFLICT__' >&2; exit 3; }}")
             elif backend == "uv":
                 lines.append(f"{uv_binary} pip install --python \"$target/bin/python\" {package_text}")
+                lines.append("\"$target/bin/python\" -m pip check || { echo '__SM_DEPENDENCY_CONFLICT__' >&2; exit 3; }")
             else:
                 lines.append(f"\"$target/bin/python\" -m pip install {package_text}")
+                lines.append("\"$target/bin/python\" -m pip check || { echo '__SM_DEPENDENCY_CONFLICT__' >&2; exit 3; }")
         lines.append("echo '环境方案执行完成；请重新盘点确认版本。'")
         return {
             "kind": "environment",
@@ -540,7 +543,30 @@ printf '\\0__SM_SCAN_STATUS__\\t%s\\0' "$scan_rc"
             "stdout_truncated": result.stdout_truncated,
             "stderr_truncated": result.stderr_truncated,
             "plan": plan,
+            "dependency_conflict": "__SM_DEPENDENCY_CONFLICT__" in result.stdout or "__SM_DEPENDENCY_CONFLICT__" in result.stderr,
         }
+
+    def environment_backup_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        backend = str(payload.get("backend", ""))
+        if backend not in {"venv", "conda", "uv"}:
+            raise OperationError("虚拟环境后端无效")
+        source = _remote_path(payload.get("path"), "虚拟环境路径")
+        if source in {"/", "/home", "/root", "/usr", "/opt", "/tmp"} or len(source.strip("/").split("/")) < 2:
+            raise OperationError("虚拟环境路径过于宽泛")
+        parent, _, name = source.rpartition("/")
+        archive_prefix = f"{parent}/{name}-backup"
+        lines = [
+            "#!/usr/bin/env bash",
+            "set -Eeuo pipefail",
+            f"source_path={shlex.quote(source)}",
+            f"archive_prefix={shlex.quote(archive_prefix)}",
+            "test -d \"$source_path\"",
+            "archive=\"${archive_prefix}-$(date +%Y%m%d_%H%M%S).tar.gz\"",
+            "tar -C \"$(dirname \"$source_path\")\" -czf \"$archive\" \"$(basename \"$source_path\")\"",
+            "sha256sum \"$archive\" > \"${archive}.sha256\"",
+            "printf '环境备份完成：%s\\n' \"$archive\"",
+        ]
+        return {"kind": "environment-backup", "backend": backend, "path": source, "script": "\n".join(lines) + "\n", "remote_execution": False}
 
     def export_conda_environment(self, host: dict[str, Any], path: str) -> str:
         path = _remote_path(path, "conda 环境路径")

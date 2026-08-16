@@ -24,11 +24,13 @@ class FakeOperations(OperationService):
                 exit_code=0,
                 stderr="",
                 stdout=(
-                    "  42   1 root S 1.0 2.0 Mon Jan 01 00:00:00 2024 /usr/bin/python worker.py\n"
-                    "   2   0 root S 0.0 0.0 Mon Jan 01 00:00:00 2024 [kthreadd]\n"
+                    "  42   1 root S 1.0 2.0 2048 Mon Jan 01 00:00:00 2024 /usr/bin/python worker.py\n"
+                    "  43  42 root Z 0.0 0.5 1024 Mon Jan 01 00:01:00 2024 python <defunct>\n"
+                    "   2   0 root S 0.0 0.0 0 Mon Jan 01 00:00:00 2024 [kthreadd]\n"
                     "\n__SERVER_MONITOR_CWD__\n"
-                    "42\t/srv/worker jobs\n"
-                    "2\t\n"
+                    "42\t/srv/worker jobs\t512\t1048576\t2097152\n"
+                    "43\t\t128\t0\t4096\n"
+                    "2\t\t0\t0\t0\n"
                 ),
             )
         if command.startswith("ps -p"):
@@ -65,11 +67,17 @@ def test_process_parser_and_pid_reuse_guard(app):
     assert rows[0]["pid"] == 42
     assert rows[0]["started"] == "Mon Jan 01 00:00:00 2024"
     assert rows[0]["cwd"] == "/srv/worker jobs"
-    assert len(rows) == 1
+    assert rows[0]["rss_bytes"] == 2 * 1024 * 1024
+    assert rows[0]["swap_bytes"] == 512 * 1024
+    assert rows[0]["read_bytes"] == 1024 * 1024
+    assert rows[0]["write_bytes"] == 2 * 1024 * 1024
+    assert rows[1]["zombie"] is True
+    assert rows[1]["tree_depth"] == 1
+    assert len(rows) == 2
     assert "/proc/[0-9]*" in service.calls[0][0]
     visible_rows = service.processes({}, hide_kernel=False)
-    assert len(visible_rows) == 2
-    assert visible_rows[1]["cwd"] is None
+    assert len(visible_rows) == 3
+    assert visible_rows[2]["cwd"] is None
     with pytest.raises(OperationError):
         service.terminate_process({}, 42, "Tue Jan 02 00:00:00 2024")
 
@@ -88,6 +96,108 @@ def test_process_api_returns_working_directory(client, app, admin, monkeypatch):
 
     assert response.status_code == 200
     assert response.get_json()["items"][0]["cwd"] == "/srv/worker"
+
+
+def _health_report(app, smart: str, dmesg: str):
+    service = FakeOperations(app.extensions["monitor_config"], app.extensions["database"])
+    output = (
+        "__SERVER_MONITOR_CHECK__:smart\n" + smart
+        + "\n__SERVER_MONITOR_CHECK__:dmesg\n" + dmesg
+    )
+    service.run = lambda *_args, **_kwargs: SimpleNamespace(exit_code=0, stderr="", stdout=output)
+    return {item["key"]: item for item in service.health_inspection({})["checks"]}
+
+
+def test_health_inspection_treats_smart_and_kernel_permission_as_unavailable(app):
+    report = _health_report(
+        app,
+        "__DEVICE__:/dev/nvme0\nSmartctl open device: /dev/nvme0 failed: Permission denied",
+        "dmesg: read kernel buffer failed: Operation not permitted\nNo journal files were opened due to insufficient permissions.",
+    )
+
+    assert report["smart"]["status"] == "unavailable"
+    assert "无权读取 SMART" in report["smart"]["summary"]
+    assert "健康异常" not in report["smart"]["summary"]
+    assert report["dmesg"]["status"] == "unavailable"
+    assert "内核日志" in report["dmesg"]["summary"]
+
+
+def test_health_inspection_accepts_journal_fallback_and_empty_kernel_log(app):
+    warning = _health_report(
+        app,
+        "__MISSING__",
+        "__SOURCE__:journalctl\nAug 17 10:20:00 kernel: NVRM: Xid 79",
+    )
+    empty = _health_report(app, "__MISSING__", "__SOURCE__:journalctl\n-- No entries --")
+
+    assert warning["dmesg"]["status"] == "warning"
+    assert "journalctl" in warning["dmesg"]["summary"]
+    assert "__SOURCE__" not in warning["dmesg"]["details"]
+    assert empty["dmesg"]["status"] == "passed"
+
+
+def test_system_service_network_and_docker_helpers_are_bounded(app):
+    service = FakeOperations(app.extensions["monitor_config"], app.extensions["database"])
+    with pytest.raises(OperationError, match="不允许读取"):
+        service.service_logs({}, "cron.service")
+    with pytest.raises(OperationError, match="不允许生成"):
+        service.service_restart_plan("cron.service")
+    assert "nvidia-persistenced.service" in service.service_restart_plan("nvidia-persistenced.service")
+    with pytest.raises(OperationError, match="单个 IP"):
+        service.network_diagnostic({}, "10.0.0.0/24", "ping")
+    with pytest.raises(OperationError, match="端口"):
+        service.network_diagnostic({}, "example.com", "port", 70000)
+    with pytest.raises(OperationError, match="容器名称"):
+        service.docker_logs({}, "name;id")
+
+
+def test_system_service_logs_network_and_docker_inventory_parsing(app):
+    service = FakeOperations(app.extensions["monitor_config"], app.extensions["database"])
+
+    def fake_run(_host, command, _timeout, _limit=None, stdin_data=None):
+        if command.startswith("journalctl"):
+            output = "2026-08-16 started\n2026-08-16 warning: retry\n2026-08-16 ready\n"
+        elif command.startswith("LC_ALL=C ping"):
+            output = "2 packets transmitted, 2 received"
+        elif "SERVER_MONITOR_DOCKER_EOF" in command:
+            output = (
+                "__SERVER_MONITOR_DOCKER__:info\n{\"Driver\":\"overlay2\",\"DockerRootDir\":\"/var/lib/docker\"}\n"
+                "__SERVER_MONITOR_DOCKER__:images\n{\"Repository\":\"ubuntu\",\"Tag\":\"24.04\",\"Size\":\"78MB\"}\n"
+                "__SERVER_MONITOR_DOCKER__:volumes\n{\"Name\":\"training-data\"}\n"
+                "__SERVER_MONITOR_DOCKER__:compose\n[{\"Name\":\"lab\",\"Status\":\"running(1)\"}]\n"
+            )
+        else:
+            output = ""
+        return SimpleNamespace(exit_code=0, stderr="", stdout=output, stdout_truncated=False, stderr_truncated=False)
+
+    service.run = fake_run
+    logs = service.service_logs({}, "docker.service", 20, "warning")
+    assert logs["lines"] == ["2026-08-16 warning: retry"]
+    diagnostic = service.network_diagnostic({}, "example.com", "ping")
+    assert diagnostic["success"] is True and diagnostic["target"] == "example.com"
+    inventory = service.docker_inventory({})
+    assert inventory["available"] is True
+    assert inventory["info"]["Driver"] == "overlay2"
+    assert inventory["images"][0]["Repository"] == "ubuntu"
+    assert inventory["volumes"][0]["Name"] == "training-data"
+    assert inventory["compose"][0]["Name"] == "lab"
+
+
+def test_diagnostic_and_docker_routes_return_structured_results(client, app, admin, monkeypatch):
+    host = app.extensions["hosts"].create(host_payload(), fingerprint="SHA256:key-diagnostics", machine_id="machine-diagnostics")
+    operations = app.extensions["operations"]
+    monkeypatch.setattr(operations, "systemd_services", lambda _host: [{"unit": "docker.service", "active": "active"}])
+    monkeypatch.setattr(operations, "service_logs", lambda _host, unit, lines, keyword: {"unit": unit, "lines": [keyword], "truncated": False})
+    monkeypatch.setattr(operations, "network_diagnostic", lambda _host, target, mode, port: {"success": True, "target": target, "mode": mode, "port": port, "output": "ok"})
+    monkeypatch.setattr(operations, "docker_inventory", lambda _host: {"available": True, "info": {}, "images": [], "volumes": [], "compose": []})
+    monkeypatch.setattr(operations, "docker_logs", lambda _host, container, lines, keyword: {"container": container, "lines": [keyword], "truncated": False})
+
+    assert client.get(f"/api/hosts/{host['id']}/system-services").get_json()["items"][0]["active"] == "active"
+    assert client.get(f"/api/hosts/{host['id']}/system-services/logs?unit=docker.service&lines=20&keyword=warn").get_json()["lines"] == ["warn"]
+    network = client.post(f"/api/hosts/{host['id']}/network-diagnostic", json={"target": "example.com", "mode": "ping"}, headers=csrf(admin))
+    assert network.status_code == 200 and network.get_json()["success"] is True
+    assert client.get(f"/api/hosts/{host['id']}/docker/inventory").get_json()["available"] is True
+    assert client.get(f"/api/hosts/{host['id']}/docker/logs?container=trainer&lines=20&keyword=ready").get_json()["lines"] == ["ready"]
 
 
 def test_tool_install_requires_verification(app):
@@ -369,6 +479,10 @@ def test_frontend_console_contract_and_csp(client):
     assert "function showGpuConfig" in script
     assert "function confirmFingerprintChange" in script
     assert "function gpuCardSummary" in script
+    assert "function gpuDetailMarkup" in script
+    assert 'data-gpu-detail-toggle' in script
+    assert 'data-alert-notification-toggle' in script
+    assert 'result.toast_enabled && "Notification" in window' in script
     assert "function physicalDisks" in script
     assert "使用中" in script and "storage-list" in script
     assert "ResizeObserver" in script

@@ -44,6 +44,8 @@ from .services import (
     ServiceError,
     compact_collection_result,
     export_csv,
+    gpu_user_usage,
+    hardware_asset_rows,
     host_transfer_rows,
     parse_host_import,
 )
@@ -248,8 +250,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         # The app does not trust forwarding headers unless a deployment explicitly adds ProxyFix.
         return request.remote_addr or "unknown"
 
-    def audit_action(action: str, *, target_type: str | None = None, target_id: Any = None, success: bool = True, summary: str = "", error: str | None = None) -> None:
-        audit.write(action, actor=g.user, source_ip=source_ip(), target_type=target_type, target_id=target_id, request_id=g.request_id, success=success, summary=summary, error=error)
+    def audit_action(action: str, *, target_type: str | None = None, target_id: Any = None, success: bool = True, summary: str = "", error: str | None = None, changes: dict[str, Any] | None = None) -> None:
+        audit.write(action, actor=g.user, source_ip=source_ip(), target_type=target_type, target_id=target_id, request_id=g.request_id, success=success, summary=summary, error=error, changes=changes)
+
+    def diff_changes(before: dict[str, Any], after: dict[str, Any], *, ignored: set[str] | None = None) -> dict[str, Any]:
+        ignored = ignored or set()
+        result: dict[str, Any] = {}
+        for key in sorted((set(before) | set(after)) - ignored):
+            left, right = before.get(key), after.get(key)
+            if left != right:
+                result[key] = {"before": left, "after": right}
+        return result
 
     @app.get("/")
     def index():
@@ -292,7 +303,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         except OSError:
             load_one = None
         managed = hosts.list()
-        reachable = sum(1 for item in managed if item.get("status") in {"online", "busy", "degraded"})
+        reachable = sum(1 for item in managed if item.get("status") in {"online", "busy", "degraded", "gpu_error"})
         storage = database.storage_info()
         memory_used = memory_total - memory_available if memory_total is not None and memory_available is not None else None
         return jsonify(
@@ -601,7 +612,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             "name": "gpu-node-01", "address": "10.0.0.10", "port": 22,
             "username": "monitor", "auth_type": "password", "auth_secret": "在导入前填写",
             "private_key": "", "private_key_passphrase": "", "sudo_password": "",
-            "tags": ["GPU", "测试"], "notes": "示例主机", "enabled": True,
+            "tags": ["GPU", "测试"], "notes": "示例主机",
+            "asset_location": "A 机房 / A03 机柜", "asset_owner": "运维负责人",
+            "warranty_expires": "2028-12-31", "enabled": True,
             "docker_enabled": True, "allow_tmux": True, "allow_terminal": True,
             "allow_process": True, "allow_install": False, "allow_stress": False,
             "timeout_seconds": 15,
@@ -674,6 +687,57 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         audit_action("hosts_batch_tested", target_type="host", success=failed == 0, summary=f"批量重测 SSH：正常 {len(results) - failed} 台，异常 {failed} 台")
         return jsonify(results=results, ok_count=len(results) - failed, attention_count=failed)
 
+    @app.get("/api/hosts/fingerprints")
+    @login_required(permission="page.hosts")
+    def list_host_fingerprints():
+        return jsonify(items=[{
+            "host_id": host["id"], "name": host["name"], "address": host["address"],
+            "fingerprint": host.get("fingerprint"), "status": host.get("status"),
+            "last_error": host.get("last_error"), "last_success_at": host.get("last_success_at"),
+        } for host in hosts.list()])
+
+    def confirm_host_fingerprint(host_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        observed = payload.get("observed")
+        if not observed:
+            raise ValueError("必须提交重测结果中的 observed 指纹")
+        identity = connection_test({}, host_id, str(observed))
+        if identity.get("duplicate"):
+            raise ValueError(f"该 SSH 身份已由主机 {identity['duplicate']['name']} 管理")
+        if identity.get("machine_id_changed") and payload.get("confirm_physical_replacement") is not True:
+            raise ValueError("machine-id 同时变化，必须逐台确认物理节点替换")
+        before = hosts.get(host_id)
+        updated = hosts.update(host_id, {}, fingerprint=identity["fingerprint"], machine_id=identity.get("machine_id"))
+        hosts.status(host_id, "unknown", error="SSH 指纹已更新，等待下一次采集", error_code=None)
+        audit_action(
+            "host_fingerprint_updated",
+            target_type="host",
+            target_id=host_id,
+            summary="管理员重新连接并确认 SSH 主机指纹",
+            changes={"fingerprint": {"before": before.get("fingerprint"), "after": updated.get("fingerprint")}},
+        )
+        return {"host_id": host_id, "name": updated["name"], "success": True, "fingerprint": updated["fingerprint"]}
+
+    @app.post("/api/hosts/<int:host_id>/fingerprint/confirm")
+    @login_required(permission="host.manage", write=True, elevated=True)
+    def confirm_fingerprint(host_id: int):
+        return jsonify(confirm_host_fingerprint(host_id, body()))
+
+    @app.post("/api/hosts/fingerprints/confirm")
+    @login_required(permission="host.manage", write=True, elevated=True)
+    def confirm_fingerprints():
+        items = body().get("items")
+        if not isinstance(items, list) or not items or len(items) > 20:
+            raise ValueError("items 必须是 1～20 条指纹确认记录")
+        results = []
+        for item in items:
+            try:
+                if not isinstance(item, dict):
+                    raise ValueError("指纹确认记录必须是对象")
+                results.append(confirm_host_fingerprint(int(item.get("host_id")), item))
+            except Exception as exc:
+                results.append({"host_id": item.get("host_id") if isinstance(item, dict) else None, "success": False, "error": redact(str(exc))})
+        return jsonify(results=results, success_count=sum(1 for item in results if item["success"]), failure_count=sum(1 for item in results if not item["success"]))
+
     @app.post("/api/hosts/batch-tags")
     @login_required(permission="host.manage", write=True)
     def batch_host_tags():
@@ -719,6 +783,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @login_required(permission="host.manage", write=True)
     def update_host(host_id: int):
         payload = body()
+        before_host = hosts.get(host_id)
         confirmed_fingerprint = payload.pop("confirmed_fingerprint", None)
         confirmed_physical_replacement = payload.pop("confirmed_physical_replacement", False)
         if not isinstance(confirmed_physical_replacement, bool):
@@ -729,7 +794,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return jsonify(error="修改连接信息、凭据、SSH 指纹或调度命令需要重新验证当前密码", requires_elevation=True), 403
         payload.pop("identity", None)
         try:
-            identity = connection_test(payload, host_id, confirmed_fingerprint) if connection_fields & set(payload) else None
+            identity = connection_test(payload, host_id, confirmed_fingerprint) if connection_fields & set(payload) or confirmed_fingerprint else None
         except SSHFingerprintError as error:
             audit_action("host_fingerprint_mismatch", target_type="host", target_id=host_id, success=False, summary="保存主机时发现 SSH 指纹变化", error=str(error))
             return fingerprint_mismatch_response(error)
@@ -746,7 +811,13 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         host = hosts.update(host_id, payload, fingerprint=identity.get("fingerprint") if identity else None, machine_id=identity.get("machine_id") if identity else None)
         if identity and identity["fingerprint_changed"]:
             audit_action("host_fingerprint_updated", target_type="host", target_id=host_id, summary="管理员确认并更新 SSH 主机指纹")
-        audit_action("host_updated", target_type="host", target_id=host_id, summary=f"修改主机 {host['name']}")
+        audit_action(
+            "host_updated",
+            target_type="host",
+            target_id=host_id,
+            summary=f"修改主机 {host['name']}",
+            changes=diff_changes(before_host, host, ignored={"auth_secret", "private_key", "private_key_passphrase", "sudo_password"}),
+        )
         return jsonify(host=host)
 
     @app.delete("/api/hosts/<int:host_id>")
@@ -794,7 +865,91 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         items = []
         for host in hosts.list(search=request.args.get("search"), status=request.args.get("status")):
             items.append({"host": host, "latest": hosts.latest(host["id"])})
-        return jsonify(items=items, settings={key: value for key, value in config.all().items() if key in {"frontend_refresh_interval", "green_threshold", "yellow_threshold", "gpu_util_threshold", "gpu_memory_threshold", "filesystem_usage_threshold", "filesystem_inode_threshold", "metric_retention_days", "timezone"}})
+        return jsonify(items=items, gpu_users=gpu_user_usage(items), settings={key: value for key, value in config.all().items() if key in {"frontend_refresh_interval", "green_threshold", "yellow_threshold", "gpu_util_threshold", "gpu_memory_threshold", "filesystem_usage_threshold", "filesystem_inode_threshold", "swap_usage_threshold", "metric_retention_days", "timezone"}})
+
+    @app.get("/api/gpu-usage/users")
+    @login_required(permission="page.dashboard")
+    def gpu_usage_users():
+        items = [{"host": host, "latest": hosts.latest(host["id"])} for host in hosts.list()]
+        users = gpu_user_usage(items)
+        username = request.args.get("username", "").strip()
+        if username:
+            users = [item for item in users if item["username"] == username]
+        return jsonify(items=users)
+
+    @app.get("/api/hardware-assets")
+    @login_required(permission="page.hosts")
+    def hardware_assets():
+        items = [{"host": host, "latest": hosts.latest(host["id"])} for host in hosts.list()]
+        return jsonify(items=hardware_asset_rows(items))
+
+    @app.get("/api/hardware-assets/export")
+    @login_required(permission="host.manage")
+    def export_hardware_assets():
+        items = [{"host": host, "latest": hosts.latest(host["id"])} for host in hosts.list()]
+        rows = hardware_asset_rows(items)
+        filename, content = export_csv(rows, "硬件资产清单")
+        audit_action("hardware_assets_exported", target_type="host", summary=f"导出 {len(rows)} 台主机硬件资产")
+        return Response(content, content_type="text/csv; charset=utf-8", headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"})
+
+    @app.get("/api/snapshots/current")
+    @login_required(permission="page.hosts")
+    def current_snapshot():
+        snapshot = {
+            "generated_at": utc_iso(),
+            "schema": 6,
+            "hosts": [{"host": host, "latest": hosts.latest(host["id"])} for host in hosts.list()],
+        }
+        content = json.dumps(snapshot, ensure_ascii=False, indent=2)
+        audit_action("current_snapshot_exported", target_type="snapshot", summary=f"导出 {len(snapshot['hosts'])} 台主机当前快照")
+        filename = f"server-monitor-snapshot-{utc_now().strftime('%Y%m%d_%H%M%S')}.json"
+        return Response(content, content_type="application/json; charset=utf-8", headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"})
+
+    @app.get("/api/saved-views")
+    @login_required()
+    def saved_views():
+        page_name = request.args.get("page", "dashboard")
+        if page_name not in {"dashboard", "hosts"}:
+            raise ValueError("快捷视图页面无效")
+        rows = database.query_all("SELECT id,page,name,filters_json,created_at,updated_at FROM saved_views WHERE user_id=? AND page=? ORDER BY name COLLATE NOCASE", (g.user["id"], page_name))
+        return jsonify(items=[{key: value for key, value in {**dict(row), "filters": json_load(row["filters_json"], {})}.items() if key != "filters_json"} for row in rows])
+
+    @app.post("/api/saved-views")
+    @login_required(write=True)
+    def create_saved_view():
+        payload = body()
+        page_name = payload.get("page", "dashboard")
+        name = str(payload.get("name", "")).strip()
+        filters = payload.get("filters")
+        if page_name not in {"dashboard", "hosts"} or not name or len(name) > 64 or not isinstance(filters, dict):
+            raise ValueError("快捷视图名称、页面或筛选条件无效")
+        allowed = {"search", "status", "tags", "gpu_user"} if page_name == "dashboard" else {"search", "status", "sort"}
+        if set(filters) - allowed or any(not isinstance(value, (str, list)) for value in filters.values()):
+            raise ValueError("快捷视图包含不支持的筛选条件")
+        if isinstance(filters.get("tags"), list) and (len(filters["tags"]) > 50 or any(not isinstance(tag, str) or len(tag) > 64 for tag in filters["tags"])):
+            raise ValueError("快捷视图标签无效")
+        count = database.query_one("SELECT COUNT(*) count FROM saved_views WHERE user_id=? AND page=?", (g.user["id"], page_name))["count"]
+        existing = database.query_one("SELECT id FROM saved_views WHERE user_id=? AND page=? AND name=?", (g.user["id"], page_name, name))
+        if count >= 20 and not existing:
+            raise ValueError("每个页面最多保存 20 个快捷视图")
+        now = utc_iso()
+        database.execute(
+            "INSERT INTO saved_views(user_id,page,name,filters_json,created_at,updated_at) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(user_id,page,name) DO UPDATE SET filters_json=excluded.filters_json,updated_at=excluded.updated_at",
+            (g.user["id"], page_name, name, json_dump(filters), now, now),
+        )
+        audit_action("saved_view_updated", target_type="saved_view", summary=f"保存快捷视图 {name}")
+        return jsonify(ok=True), 201
+
+    @app.delete("/api/saved-views/<int:view_id>")
+    @login_required(write=True)
+    def delete_saved_view(view_id: int):
+        row = database.query_one("SELECT id,name FROM saved_views WHERE id=? AND user_id=?", (view_id, g.user["id"]))
+        if not row:
+            return jsonify(error="快捷视图不存在"), 404
+        database.execute("DELETE FROM saved_views WHERE id=? AND user_id=?", (view_id, g.user["id"]))
+        audit_action("saved_view_deleted", target_type="saved_view", target_id=view_id, summary=f"删除快捷视图 {row['name']}")
+        return jsonify(ok=True)
 
     @app.get("/api/hosts/<int:host_id>/history")
     @login_required(permission="page.hosts")
@@ -832,6 +987,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @login_required(permission="settings.manage", write=True)
     def update_settings():
         payload = body()
+        before_settings = config.all()
         clear_sendkey = payload.pop("serverchan_sendkey_clear", False)
         if payload.get("serverchan_sendkey") == "configured":
             payload.pop("serverchan_sendkey")
@@ -842,7 +998,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if clear_sendkey:
             payload["serverchan_sendkey"] = ""
         values = config.update(payload)
-        audit_action("settings_updated", target_type="settings", summary="系统设置已更新")
+        audit_action(
+            "settings_updated",
+            target_type="settings",
+            summary="系统设置已更新",
+            changes=diff_changes(before_settings, values, ignored={"serverchan_sendkey"}),
+        )
         values["serverchan_sendkey"] = "configured" if values.get("serverchan_sendkey") else ""
         return jsonify(settings=values)
 
@@ -855,42 +1016,52 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         database.execute("UPDATE users SET theme=?,updated_at=? WHERE id=?", (theme, utc_iso(), g.user["id"]))
         return jsonify(theme=theme)
 
-    @app.get("/api/alerts")
-    @login_required(permission="page.alerts")
-    def list_alerts():
-        filters = {key: request.args.get(key) for key in ("host_id", "alert_type", "state", "severity", "search")}
-        filters["include_cleared"] = request.args.get("include_cleared") == "1"
-        if filters.get("host_id"):
+    def parse_alert_filters(values: Any) -> dict[str, Any]:
+        filters = {key: values.get(key) for key in ("host_id", "alert_type", "state", "severity", "search")}
+        include_cleared = values.get("include_cleared")
+        filters["include_cleared"] = include_cleared is True or str(include_cleared or "").lower() in {"1", "true"}
+        if filters.get("host_id") not in {None, ""}:
             try:
                 filters["host_id"] = int(filters["host_id"])
             except (TypeError, ValueError) as exc:
                 raise ValueError("host_id 必须是整数") from exc
         for key in ("start", "end"):
-            if request.args.get(key):
-                parsed = parse_utc(request.args[key])
+            value = values.get(key)
+            if value:
+                parsed = parse_utc(value)
                 if not parsed:
                     raise ValueError(f"{key} 时间格式无效")
                 filters[key] = utc_iso(parsed)
+        return filters
+
+    @app.get("/api/alerts")
+    @login_required(permission="page.alerts")
+    def list_alerts():
+        filters = parse_alert_filters(request.args)
         result = alerts.list(request.args.get("page", 1), request.args.get("page_size", 20), filters)
         result["toast_enabled"] = config.all()["toast_enabled"]
         return jsonify(result)
 
+    @app.patch("/api/alerts/notification-setting")
+    @login_required(permission="alerts.manage", write=True)
+    def update_alert_notification_setting():
+        enabled = body().get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled 必须是布尔值")
+        before = config.all()["toast_enabled"]
+        config.update({"toast_enabled": enabled})
+        audit_action(
+            "alert_notification_setting_updated",
+            target_type="settings",
+            summary="开启告警弹窗" if enabled else "关闭告警弹窗",
+            changes={"toast_enabled": {"before": before, "after": enabled}},
+        )
+        return jsonify(enabled=enabled)
+
     @app.get("/api/alerts/export")
     @login_required(permission="page.alerts")
     def export_alerts():
-        filters = {key: request.args.get(key) for key in ("host_id", "alert_type", "state", "severity", "search")}
-        filters["include_cleared"] = request.args.get("include_cleared") == "1"
-        if filters.get("host_id"):
-            try:
-                filters["host_id"] = int(filters["host_id"])
-            except (TypeError, ValueError) as exc:
-                raise ValueError("host_id 必须是整数") from exc
-        for key in ("start", "end"):
-            if request.args.get(key):
-                parsed = parse_utc(request.args[key])
-                if not parsed:
-                    raise ValueError(f"{key} 时间格式无效")
-                filters[key] = utc_iso(parsed)
+        filters = parse_alert_filters(request.args)
         rows: list[dict[str, Any]] = []
         page = 1
         while len(rows) < 10000:
@@ -915,9 +1086,19 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         fault_items = []
         for host in host_items:
             issues = list(by_host.get(host["id"], []))
-            if host.get("status") in {"offline", "fingerprint_error", "degraded", "busy"} and not issues:
-                summary = {"offline": "主机离线", "fingerprint_error": "SSH 主机指纹异常", "degraded": "可选指标采集降级", "busy": "主机采集繁忙"}.get(host["status"], host["status"])
-                issues.append({"alert_type": host["status"], "severity": "critical" if host["status"] in {"offline", "fingerprint_error"} else "warning", "summary": summary})
+            if host.get("status") in {"offline", "ssh_unreachable", "auth_failed", "collection_timeout", "command_error", "fingerprint_error", "degraded", "gpu_error", "busy"} and not issues:
+                summary = {
+                    "offline": "主机连续采集失败",
+                    "ssh_unreachable": "SSH 网络不可达",
+                    "auth_failed": "SSH 认证失败",
+                    "collection_timeout": "采集超时",
+                    "command_error": "远端采集命令失败",
+                    "fingerprint_error": "SSH 主机指纹异常",
+                    "degraded": "可选指标采集降级",
+                    "gpu_error": "GPU 指标采集失败",
+                    "busy": "主机采集繁忙",
+                }.get(host["status"], host["status"])
+                issues.append({"alert_type": host["status"], "severity": "critical" if host["status"] in {"offline", "ssh_unreachable", "auth_failed", "fingerprint_error"} else "warning", "summary": summary, "error_code": host.get("error_code"), "last_error": host.get("last_error")})
             if issues:
                 fault_items.append({"host": host, "issues": issues})
         return jsonify(items=fault_items, total=len(fault_items))
@@ -928,6 +1109,30 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         result = alerts.acknowledge(alert_id, g.user["id"])
         audit_action("alert_acknowledged", target_type="alert", target_id=alert_id, summary="确认告警，停止重复提示")
         return jsonify(alert=result)
+
+    @app.post("/api/alerts/bulk-acknowledge")
+    @login_required(permission="alerts.manage", write=True)
+    def bulk_acknowledge_alerts():
+        payload = body()
+        raw_filters = payload.get("filters", payload)
+        if not isinstance(raw_filters, dict):
+            raise ValueError("filters 必须是对象")
+        filters = parse_alert_filters(raw_filters)
+        count = alerts.bulk_acknowledge(filters, g.user["id"])
+        audit_action("alerts_bulk_acknowledged", target_type="alert", summary=f"按当前筛选条件忽略 {count} 条告警提示")
+        return jsonify(count=count, limit=1000)
+
+    @app.post("/api/alerts/bulk-clear")
+    @login_required(permission="alerts.manage", write=True)
+    def bulk_clear_alerts():
+        payload = body()
+        raw_filters = payload.get("filters", payload)
+        if not isinstance(raw_filters, dict):
+            raise ValueError("filters 必须是对象")
+        filters = parse_alert_filters(raw_filters)
+        count = alerts.bulk_clear(filters)
+        audit_action("alerts_bulk_cleared", target_type="alert", summary=f"按当前筛选条件软清理 {count} 条告警")
+        return jsonify(count=count, limit=1000)
 
     @app.delete("/api/alerts/<int:alert_id>")
     @login_required(permission="alerts.manage", write=True)
@@ -951,7 +1156,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             params.extend([f"%{search}%"] * 6)
         total = database.query_one("SELECT COUNT(*) count FROM audit_logs WHERE " + " AND ".join(clauses), params)["count"]
         rows = database.query_all("SELECT * FROM audit_logs WHERE " + " AND ".join(clauses) + " ORDER BY id DESC LIMIT ? OFFSET ?", [*params, page_size, (page - 1) * page_size])
-        return jsonify(paged(total, page, page_size, [dict(row) for row in rows]))
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["changes"] = json_load(item.pop("changes_json", None), None)
+            items.append(item)
+        return jsonify(paged(total, page, page_size, items))
 
     @app.get("/api/logs/export")
     @login_required(permission="logs.export")
@@ -970,8 +1180,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @login_required(permission="gpu.manage", write=True, elevated=True)
     def update_gpu_config(host_id: int, gpu_uuid: str):
         host = hosts.get(host_id)
+        before_config = scheduler.get_gpu_config(host, gpu_uuid) or {}
         result = scheduler.configure_gpu(host, gpu_uuid, body())
-        audit_action("gpu_config_updated", target_type="gpu", target_id=gpu_uuid, summary="GPU 调度配置已修改")
+        audit_action("gpu_config_updated", target_type="gpu", target_id=gpu_uuid, summary="GPU 调度配置已修改", changes=diff_changes(before_config, result or {}))
         return jsonify(config=result)
 
     @app.get("/api/schedule-jobs")
@@ -1045,10 +1256,69 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         audit_action("process_terminated", target_type="process", target_id=pid, summary=f"发送 SIG{payload.get('signal', 'TERM')} 到进程")
         return jsonify(ok=True)
 
+    @app.get("/api/hosts/<int:host_id>/system-services")
+    @login_required(permission="diagnostics.view")
+    def system_services(host_id: int):
+        return jsonify(items=operations.systemd_services(hosts.get(host_id, include_secrets=True)))
+
+    @app.get("/api/hosts/<int:host_id>/system-services/logs")
+    @login_required(permission="diagnostics.view")
+    def system_service_logs(host_id: int):
+        return jsonify(operations.service_logs(
+            hosts.get(host_id, include_secrets=True),
+            request.args.get("unit", ""),
+            int(request.args.get("lines", 100)),
+            request.args.get("keyword", ""),
+        ))
+
+    @app.get("/api/hosts/<int:host_id>/system-services/restart-plan")
+    @login_required(permission="diagnostics.view")
+    def system_service_restart_plan(host_id: int):
+        unit = request.args.get("unit", "")
+        plan = operations.service_restart_plan(unit)
+        audit_action("system_service_restart_plan", target_type="host", target_id=host_id, summary=f"生成 systemd 服务脚本 {unit}")
+        return jsonify(unit=unit, script=plan, remote_execution=False)
+
+    @app.post("/api/hosts/<int:host_id>/network-diagnostic")
+    @login_required(permission="diagnostics.view", write=True)
+    def network_diagnostic(host_id: int):
+        payload = body()
+        result = operations.network_diagnostic(
+            hosts.get(host_id, include_secrets=True),
+            payload.get("target", ""),
+            str(payload.get("mode", "ping")),
+            payload.get("port"),
+        )
+        audit_action("network_diagnostic", target_type="host", target_id=host_id, success=result["success"], summary=f"网络诊断 {result['mode']} {result['target']}", error=None if result["success"] else result["output"][:500])
+        return jsonify(result)
+
+    @app.get("/api/hosts/<int:host_id>/docker/inventory")
+    @login_required(permission="page.hosts")
+    def docker_inventory(host_id: int):
+        host = hosts.get(host_id, include_secrets=True)
+        if not host.get("docker_enabled"):
+            raise OperationError("该主机已关闭 Docker 采集")
+        return jsonify(operations.docker_inventory(host))
+
+    @app.get("/api/hosts/<int:host_id>/docker/logs")
+    @login_required(permission="page.hosts")
+    def docker_logs(host_id: int):
+        host = hosts.get(host_id, include_secrets=True)
+        if not host.get("docker_enabled"):
+            raise OperationError("该主机已关闭 Docker 采集")
+        return jsonify(operations.docker_logs(host, request.args.get("container", ""), int(request.args.get("lines", 100)), request.args.get("keyword", "")))
+
     @app.get("/api/hosts/<int:host_id>/tools")
     @login_required(permission="tools.view")
     def detect_tools(host_id: int):
         return jsonify(tools=operations.detect_tools(hosts.get(host_id, include_secrets=True)))
+
+    @app.post("/api/hosts/<int:host_id>/health-inspection")
+    @login_required(permission="diagnostics.view", write=True)
+    def health_inspection(host_id: int):
+        result = operations.health_inspection(hosts.get(host_id, include_secrets=True))
+        audit_action("host_health_inspection", target_type="host", target_id=host_id, summary=f"完成主机巡检：通过 {result['passed']}，警告 {result['warnings']}，不可用 {result['unavailable']}")
+        return jsonify(result)
 
     @app.get("/api/development/hosts")
     @login_required(permission="page.environments")
@@ -1082,6 +1352,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def environment_plan(host_id: int):
         plan = development.environment_plan(operation_host(host_id, "allow_install", "开发环境管理"), body())
         audit_action("environment_plan_generated", target_type="host", target_id=host_id, summary=f"生成虚拟环境 {plan['backend']} {plan['action']} 方案")
+        return jsonify(plan=plan)
+
+    @app.post("/api/hosts/<int:host_id>/development/environment-backup-plan")
+    @login_required(permission="development.plan", write=True)
+    def environment_backup_plan(host_id: int):
+        operation_host(host_id, "allow_install", "开发环境管理")
+        plan = development.environment_backup_plan(body())
+        audit_action("environment_backup_plan_generated", target_type="host", target_id=host_id, summary=f"生成虚拟环境备份脚本 {plan['path']}")
         return jsonify(plan=plan)
 
     @app.post("/api/hosts/<int:host_id>/development/environment-execute")

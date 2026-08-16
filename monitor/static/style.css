@@ -284,10 +284,16 @@ button:focus-visible, .button-link:focus-visible { outline: 2px solid color-mix(
 .status::before { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); content: ""; }
 .status.online { color: var(--success); }
 .status.online::before { background: var(--success); }
-.status.degraded, .status.busy { color: var(--warning); }
-.status.degraded::before, .status.busy::before { background: var(--warning); }
-.status.offline, .status.fingerprint_error { color: var(--danger); }
-.status.offline::before, .status.fingerprint_error::before { background: var(--danger); }
+.status.degraded, .status.gpu_error, .status.busy, .status.collection_timeout, .status.command_error { color: var(--warning); }
+.status.degraded::before, .status.gpu_error::before, .status.busy::before, .status.collection_timeout::before, .status.command_error::before { background: var(--warning); }
+.status.offline, .status.ssh_unreachable, .status.auth_failed, .status.fingerprint_error { color: var(--danger); }
+.status.offline::before, .status.ssh_unreachable::before, .status.auth_failed::before, .status.fingerprint_error::before { background: var(--danger); }
+.text-danger { color: var(--danger); font-weight: 650; }
+.dashboard-filter-band { display: grid; grid-template-columns: minmax(220px, 1.4fr) repeat(4, minmax(135px, 1fr)) auto; align-items: end; gap: 9px; margin-bottom: 14px; padding: 12px; border: 1px solid var(--line); background: var(--surface); }
+.dashboard-filter-band label { min-width: 0; margin: 0; color: var(--muted); font-size: 10px; }
+.dashboard-filter-band select { min-width: 0; }
+.dashboard-filter-band select[multiple] { min-height: 52px; padding: 3px 6px; }
+.gpu-user-summary { margin: 0 0 16px; }
 .resource-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 7px -15px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--surface-2); }
 .resource-stat { min-width: 0; padding: 10px 8px; border-right: 1px solid var(--line); text-align: center; }
 .resource-stat:last-child { border-right: 0; }
@@ -310,10 +316,32 @@ button:focus-visible, .button-link:focus-visible { outline: 2px solid color-mix(
 .card-section > header span { color: var(--muted); font-size: 10px; font-weight: 650; }
 .card-section > header strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .gpu-device-list { display: flex; flex-wrap: wrap; gap: 5px; }
-.gpu-device { min-width: 48px; padding: 4px 6px; border: 1px solid var(--line-strong); border-left-width: 3px; border-radius: 2px; background: var(--surface-2); color: var(--muted); font-size: 9px; text-align: center; white-space: nowrap; }
+.gpu-device { min-width: 48px; min-height: 26px; padding: 4px 6px; border: 1px solid var(--line-strong); border-left-width: 3px; border-radius: 2px; background: var(--surface-2); color: var(--muted); font-size: 9px; text-align: center; white-space: nowrap; cursor: pointer; }
+.gpu-device:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.gpu-device[aria-expanded="true"] { border-color: var(--primary); box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 22%, transparent); }
 .gpu-device.busy { border-left-color: var(--warning); background: color-mix(in srgb, var(--warning) 7%, var(--surface)); color: var(--warning); }
 .gpu-device.idle { border-left-color: var(--success); background: color-mix(in srgb, var(--success) 7%, var(--surface)); color: var(--success); }
 .gpu-device.unknown { border-left-color: var(--faint); }
+.gpu-detail-list { display: grid; gap: 7px; margin-top: 8px; }
+.gpu-card-detail { min-width: 0; padding: 9px; border: 1px solid var(--line); border-left: 3px solid var(--primary); background: var(--surface-2); }
+.gpu-card-detail > header { min-width: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 7px; }
+.gpu-card-detail > header div { min-width: 0; }
+.gpu-card-detail > header strong, .gpu-card-detail > header span { display: block; overflow-wrap: anywhere; }
+.gpu-card-detail > header strong { font-size: 11px; }
+.gpu-card-detail > header span { color: var(--muted); font-size: 9px; }
+.gpu-card-detail > header > span { flex: 0 0 auto; }
+.gpu-card-process { min-width: 0; padding: 7px 0; border-top: 1px solid var(--line); }
+.gpu-card-process > div { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 10px; }
+.gpu-card-process > div span { flex: 0 0 auto; color: var(--muted); }
+.gpu-card-process dl { min-width: 0; display: grid; gap: 4px; margin: 6px 0 0; }
+.gpu-card-process dl div { min-width: 0; display: grid; grid-template-columns: 54px minmax(0, 1fr); gap: 6px; }
+.gpu-card-process dt { color: var(--muted); font-size: 9px; }
+.gpu-card-process dd { min-width: 0; margin: 0; overflow-wrap: anywhere; white-space: normal; }
+.gpu-process-details { margin-top: 5px; min-width: 230px; }
+.gpu-process-details summary { color: var(--primary); cursor: pointer; font-size: 11px; }
+.gpu-process-row { display: grid; gap: 3px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); white-space: normal; }
+.gpu-process-row span { color: var(--muted); }
+.gpu-process-row small { display: block; max-width: 360px; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 .card-section-empty { padding: 7px 8px; border: 1px dashed var(--line); background: var(--surface-2); color: var(--muted); font-size: 10px; text-align: center; }
 .storage-list { display: grid; gap: 8px; }
 .storage-row { min-width: 0; display: grid; grid-template-columns: minmax(80px, 1fr) auto; column-gap: 9px; }
@@ -377,6 +405,20 @@ td .text-button { margin-right: 2px; }
 .console-panel { padding: 15px; border: 1px solid var(--line); background: var(--surface); }
 .history-chart { width: 100%; height: 240px; display: block; border: 1px solid var(--line); background: var(--surface); }
 .operation-workbench { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
+.inspection-grid { display: grid; grid-template-columns: repeat(3, minmax(190px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.inspection-item { min-width: 0; padding: 12px; border: 1px solid var(--line); border-left: 3px solid var(--faint); background: var(--surface-2); }
+.inspection-item.passed { border-left-color: var(--success); }
+.inspection-item.warning { border-left-color: var(--warning); }
+.inspection-item header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.inspection-item p { min-height: 34px; margin: 8px 0 0; color: var(--muted); font-size: 11px; }
+.inspection-item details { margin-top: 8px; font-size: 11px; }
+.inspection-item .snapshot { max-height: 220px; }
+.audit-diff { min-width: 210px; }
+.audit-diff summary { color: var(--primary); cursor: pointer; }
+.audit-diff > div { display: grid; grid-template-columns: minmax(90px, .7fr) 1fr 1fr; gap: 5px; margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--line); }
+.audit-diff del, .audit-diff ins { overflow-wrap: anywhere; padding: 3px; text-decoration: none; }
+.audit-diff del { background: color-mix(in srgb, var(--danger) 10%, var(--surface)); }
+.audit-diff ins { background: color-mix(in srgb, var(--success) 10%, var(--surface)); }
 .snapshot { max-height: 55vh; margin: 12px 0 0; overflow: auto; padding: 12px; background: #10151d; color: #dce8dd; white-space: pre-wrap; font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .settings-layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); align-items: start; gap: 18px; }
 .settings-nav { position: sticky; top: 72px; display: grid; border: 1px solid var(--line); background: var(--surface); }
@@ -419,6 +461,11 @@ dialog::backdrop { background: rgb(12 22 36 / 58%); }
 .toast { padding: 11px 13px; border-left: 4px solid var(--success); background: #243143; color: #fff; box-shadow: var(--shadow-raised); font-size: 12px; }
 .toast.error { border-left-color: var(--danger); }
 .toast.warning { border-left-color: var(--warning); }
+.alert-notification-control { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 12px; padding: 11px 13px; border: 1px solid var(--line); background: var(--surface-2); }
+.alert-notification-control > div { min-width: 0; }
+.alert-notification-control strong, .alert-notification-control span { display: block; }
+.alert-notification-control strong { font-size: 12px; }
+.alert-notification-control > div span { margin-top: 3px; color: var(--muted); font-size: 10px; }
 
 @media (max-width: 1120px) {
   .form-grid { grid-template-columns: repeat(2, minmax(160px, 1fr)); }
@@ -431,6 +478,9 @@ dialog::backdrop { background: rgb(12 22 36 / 58%); }
   .scan-path-field { grid-column: span 2; }
   #alert-filters > .toolbar-group { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   #alert-filters .toolbar-search, #alert-filters .date-range-picker { grid-column: span 2; }
+  .dashboard-filter-band { grid-template-columns: repeat(3, minmax(150px, 1fr)); }
+  .dashboard-filter-band > .toolbar-search { width: 100%; }
+  .inspection-grid { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
 }
 
 @media (max-width: 800px) {
@@ -460,6 +510,8 @@ dialog::backdrop { background: rgb(12 22 36 / 58%); }
   .toolbar-search { width: min(240px, 100%); }
   .date-range-picker { width: 100%; }
   .date-range-picker label { min-width: 0; flex: 1; }
+  .dashboard-filter-band { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dashboard-filter-band > .toolbar-search, .dashboard-filter-band > .toolbar-group { width: 100%; grid-column: 1 / -1; }
 }
 
 @media (max-width: 520px) {
@@ -506,4 +558,9 @@ dialog::backdrop { background: rgb(12 22 36 / 58%); }
   .date-range-picker > span { display: none; }
   #alert-filters > .toolbar-group { grid-template-columns: 1fr; }
   #alert-filters .toolbar-search, #alert-filters .date-range-picker { grid-column: auto; }
+  .dashboard-filter-band, .inspection-grid { grid-template-columns: 1fr; }
+  .dashboard-filter-band > .toolbar-search, .dashboard-filter-band > .toolbar-group { grid-column: auto; }
+  .audit-diff > div { grid-template-columns: 1fr; }
+  .alert-notification-control { align-items: stretch; flex-direction: column; }
+  .gpu-card-process > div { align-items: flex-start; flex-direction: column; gap: 2px; }
 }

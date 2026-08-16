@@ -36,9 +36,18 @@ DEFAULTS: dict[str, Any] = {
     "yellow_threshold": 80,
     "cpu_temp_threshold": 80,
     "gpu_temp_threshold": 85,
+    "gpu_power_threshold_percent": 95,
+    "gpu_fan_min_percent": 5,
+    "gpu_fan_alert_temperature": 60,
+    "gpu_ecc_corrected_threshold": 100,
+    "gpu_xid_alert_enabled": True,
+    "gpu_pcie_alert_enabled": True,
+    "gpu_throttle_alert_enabled": True,
+    "gpu_residual_alert_enabled": True,
     "disk_temp_threshold": 55,
     "filesystem_usage_threshold": 85,
     "filesystem_inode_threshold": 85,
+    "swap_usage_threshold": 50,
     "alert_samples": 3,
     "alert_hysteresis": 3,
     "alert_repeat_minutes": 30,
@@ -69,9 +78,17 @@ DEFAULTS: dict[str, Any] = {
         "temperature_high",
         "filesystem_usage_high",
         "filesystem_inode_high",
+        "swap_usage_high",
         "gpu_schedule_success",
         "gpu_schedule_failed",
         "gpu_schedule_frozen",
+        "gpu_power_high",
+        "gpu_fan_low",
+        "gpu_ecc_error",
+        "gpu_xid_error",
+        "gpu_pcie_degraded",
+        "gpu_throttling",
+        "gpu_residual_memory",
         "backup_failed",
     ],
     "timezone": "Asia/Shanghai",
@@ -115,9 +132,14 @@ NUMBER_RULES: dict[str, NumberRule] = {
     "yellow_threshold": NumberRule(1, 100),
     "cpu_temp_threshold": NumberRule(0, 150),
     "gpu_temp_threshold": NumberRule(0, 150),
+    "gpu_power_threshold_percent": NumberRule(50, 100),
+    "gpu_fan_min_percent": NumberRule(0, 100),
+    "gpu_fan_alert_temperature": NumberRule(0, 120),
+    "gpu_ecc_corrected_threshold": NumberRule(1, 1000000),
     "disk_temp_threshold": NumberRule(0, 150),
     "filesystem_usage_threshold": NumberRule(1, 100),
     "filesystem_inode_threshold": NumberRule(1, 100),
+    "swap_usage_threshold": NumberRule(1, 100),
     "alert_samples": NumberRule(1, 10),
     "alert_hysteresis": NumberRule(0, 20),
     "alert_repeat_minutes": NumberRule(0, 1440),
@@ -143,6 +165,10 @@ BOOLEAN_KEYS = {
     "gpu_process_guard",
     "toast_enabled",
     "serverchan_enabled",
+    "gpu_xid_alert_enabled",
+    "gpu_pcie_alert_enabled",
+    "gpu_throttle_alert_enabled",
+    "gpu_residual_alert_enabled",
 }
 
 CHOICES = {
@@ -201,7 +227,12 @@ def validate_settings(values: dict[str, Any], current: dict[str, Any] | None = N
                 raise ConfigError(f"{key} 过长")
             cleaned[key] = value
         elif key == "serverchan_events":
-            allowed_events = {"host_offline", "temperature_high", "filesystem_usage_high", "filesystem_inode_high", "gpu_schedule_success", "gpu_schedule_failed", "gpu_schedule_frozen", "backup_failed"}
+            allowed_events = {
+                "host_offline", "temperature_high", "filesystem_usage_high", "filesystem_inode_high", "swap_usage_high",
+                "gpu_schedule_success", "gpu_schedule_failed", "gpu_schedule_frozen", "gpu_power_high",
+                "gpu_fan_low", "gpu_ecc_error", "gpu_xid_error", "gpu_pcie_degraded", "gpu_throttling", "gpu_residual_memory",
+                "backup_failed",
+            }
             if not isinstance(value, list) or any(item not in allowed_events for item in value):
                 raise ConfigError("serverchan_events 包含无效事件类型")
             cleaned[key] = sorted(set(value))
@@ -212,7 +243,7 @@ def validate_settings(values: dict[str, Any], current: dict[str, Any] | None = N
     merged = {**DEFAULTS, **persisted, **cleaned}
     if merged["green_threshold"] >= merged["yellow_threshold"]:
         raise ConfigError("绿色上限必须小于黄色上限")
-    for threshold_key in ("cpu_temp_threshold", "gpu_temp_threshold", "disk_temp_threshold", "filesystem_usage_threshold", "filesystem_inode_threshold"):
+    for threshold_key in ("cpu_temp_threshold", "gpu_temp_threshold", "disk_temp_threshold", "filesystem_usage_threshold", "filesystem_inode_threshold", "swap_usage_threshold"):
         if merged["alert_hysteresis"] > merged[threshold_key]:
             raise ConfigError("告警恢复回差不得大于告警阈值")
     if merged["ssh_connect_timeout"] > merged["collection_timeout"]:

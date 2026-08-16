@@ -1,0 +1,19 @@
+{
+  "name": "Server Monitor 内网运维控制台",
+  "short_name": "Server Monitor",
+  "description": "服务器、GPU、存储与受控 SSH 运维控制台",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#eef2f6",
+  "theme_color": "#182232",
+  "icons": [
+    {
+      "src": "/static/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
