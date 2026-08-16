@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#182232">
+  <meta name="csp-style-nonce" content="{{ csp_style_nonce }}">
+  <title>Server Monitor 控制台</title>
+  <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-theme="light">
+  <section id="login-view" class="auth-shell">
+    <header class="auth-header">
+      <div class="product-logo" aria-hidden="true">SM</div>
+      <strong>Server Monitor</strong>
+      <span>可信内网运维控制台</span>
+    </header>
+    <div class="auth-workspace">
+      <div class="auth-context" aria-hidden="true">
+        <span class="context-kicker">SERVER OPERATIONS</span>
+        <h1>统一管理服务器资源</h1>
+        <p>监控、调度和远程运维集中在一个受控工作区。</p>
+        <div class="rack-visual">
+          <div><i></i><i></i><span></span></div>
+          <div><i></i><i></i><span></span></div>
+          <div><i></i><i></i><span></span></div>
+        </div>
+      </div>
+      <form id="login-form" class="auth-panel">
+        <span class="panel-kicker">控制台登录</span>
+        <h2>欢迎回来</h2>
+        <p>使用平台账户进入管理工作区</p>
+        <label>用户名<input name="username" value="admin" autocomplete="username" required autofocus></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit" class="primary full-width"><span aria-hidden="true">→</span> 登录</button>
+        <div id="login-error" class="form-error" role="alert"></div>
+      </form>
+    </div>
+    <footer class="auth-footer">Server Monitor · 内网轻量版</footer>
+  </section>
+
+  <div id="app-view" class="console-shell" hidden>
+    <header class="global-header">
+      <button id="mobile-menu-button" class="icon-button mobile-only" type="button" aria-label="打开导航" title="打开导航">☰</button>
+      <div class="global-brand"><span class="product-logo">SM</span><strong>Server Monitor</strong></div>
+      <div class="environment-label">内网管理平台</div>
+      <div class="global-spacer"></div>
+      <label class="theme-control"><span>主题</span><select id="theme-select" aria-label="界面主题"><option value="light">浅色</option><option value="dark">深色</option><option value="tech">科技蓝</option></select></label>
+      <button id="change-password-button" class="header-button" type="button" title="修改当前账户密码">修改密码</button>
+      <span id="current-user" class="user-chip"></span>
+      <button id="logout-button" class="header-button" type="button" title="退出登录">退出</button>
+    </header>
+
+    <aside id="sidebar" class="sidebar" aria-label="主导航">
+      <div class="sidebar-title">资源与运维</div>
+      <nav id="main-nav">
+        <button data-page="dashboard" class="active"><span class="nav-icon" aria-hidden="true">⌂</span><span>集群概览</span></button>
+        <button data-page="hosts"><span class="nav-icon" aria-hidden="true">▦</span><span>主机管理</span></button>
+        <button data-page="files"><span class="nav-icon" aria-hidden="true">▤</span><span>文件管理</span></button>
+        <button data-page="environments"><span class="nav-icon" aria-hidden="true">⌘</span><span>开发环境</span></button>
+        <button data-page="jobs"><span class="nav-icon" aria-hidden="true">▷</span><span>调度记录</span></button>
+        <button data-page="alerts"><span class="nav-icon" aria-hidden="true">!</span><span>告警事件</span><b id="alert-count" hidden></b></button>
+        <button data-page="logs"><span class="nav-icon" aria-hidden="true">≡</span><span>审计日志</span></button>
+        <button data-page="settings"><span class="nav-icon" aria-hidden="true">⚙</span><span>系统设置</span></button>
+        <button data-page="permissions"><span class="nav-icon" aria-hidden="true">✓</span><span>权限与界面</span></button>
+      </nav>
+      <div class="sidebar-meta"><span>服务状态</span><strong><i></i> 正常运行</strong></div>
+    </aside>
+    <button id="sidebar-scrim" class="sidebar-scrim" type="button" aria-label="关闭导航" hidden></button>
+
+    <main class="workspace">
+      <header class="page-header">
+        <div class="breadcrumb" id="breadcrumb"><span>控制台</span><i>/</i><strong>集群概览</strong></div>
+        <div class="page-heading">
+          <div><h1 id="page-title">集群概览</h1><p id="page-subtitle">全部受管服务器的实时缓存状态</p></div>
+          <span id="live-indicator" class="live-indicator"><i></i>缓存数据</span>
+        </div>
+      </header>
+      <section id="page-content" class="content" aria-live="polite"></section>
+    </main>
+  </div>
+
+  <dialog id="password-dialog">
+    <form method="dialog" id="password-form">
+      <div class="dialog-heading"><span class="dialog-icon" aria-hidden="true">●</span><div><h2>修改密码</h2><p id="password-dialog-copy">设置当前账户的新登录密码。</p></div></div>
+      <label>当前密码<input name="current_password" type="password" autocomplete="current-password" required></label>
+      <label>新密码<input name="new_password" type="password" autocomplete="new-password" minlength="10" maxlength="128" required></label>
+      <div class="form-error" role="alert"></div>
+      <div class="dialog-actions"><button id="password-cancel" value="cancel" type="button">取消</button><button value="default" type="submit" class="primary">确认修改</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="elevate-dialog">
+    <form method="dialog" id="elevate-form">
+      <div class="dialog-heading"><span class="dialog-icon warning-icon" aria-hidden="true">!</span><div><h2>安全验证</h2><p>该操作会改变平台或远端状态，请验证当前密码。</p></div></div>
+      <label>当前密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <div class="form-error" role="alert"></div>
+      <div class="dialog-actions"><button id="elevate-cancel" value="cancel" type="button">取消</button><button value="default" type="submit" class="danger">验证</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast-region" class="toasts" aria-live="assertive"></div>
+  <script src="/static/vendor/xterm/xterm.js" defer></script>
+  <script src="/static/vendor/xterm/addon-fit.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

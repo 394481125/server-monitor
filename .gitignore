@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/
+instance/
+test-artifacts/
+dist/
+.env
+*.sqlite3
+*.sqlite3-*
+*.key

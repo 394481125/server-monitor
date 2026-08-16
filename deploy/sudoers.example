@@ -1,0 +1,20 @@
+# Replace "monitor" with the dedicated SSH account. Start with no sudo rights,
+# then enable only the capabilities that are required on each managed host.
+
+# SMART read-only health data
+monitor ALL=(root) NOPASSWD: /usr/sbin/smartctl -H -A *
+
+# Optional package installation. Package managers can execute maintainer scripts;
+# grant this only to trusted administrators and only when one-click installation is used.
+# monitor ALL=(root) NOPASSWD: /usr/bin/apt-get install -y tmux
+# monitor ALL=(root) NOPASSWD: /usr/bin/apt-get install -y smartmontools
+# monitor ALL=(root) NOPASSWD: /usr/bin/apt-get install -y lm-sensors
+# monitor ALL=(root) NOPASSWD: /usr/bin/apt-get install -y stress-ng
+# monitor ALL=(root) NOPASSWD: /usr/bin/apt-get install -y docker.io
+
+# RHEL / Rocky / AlmaLinux equivalents. Docker installation is intentionally
+# omitted because its package source and package name are deployment-specific.
+# monitor ALL=(root) NOPASSWD: /usr/bin/dnf install -y tmux
+# monitor ALL=(root) NOPASSWD: /usr/bin/dnf install -y smartmontools
+# monitor ALL=(root) NOPASSWD: /usr/bin/dnf install -y lm_sensors
+# monitor ALL=(root) NOPASSWD: /usr/bin/dnf install -y stress-ng

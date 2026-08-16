@@ -1,0 +1,25 @@
+[Unit]
+Description=Server Monitor intranet operations console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=server-monitor
+Group=server-monitor
+WorkingDirectory=/opt/server-monitor
+Environment=SERVER_MONITOR_DATA_DIR=/var/lib/server-monitor
+Environment=SERVER_MONITOR_BIND=127.0.0.1:8000
+EnvironmentFile=-/etc/server-monitor/environment
+ExecStart=/opt/server-monitor/.venv/bin/python -m gunicorn -c gunicorn.conf.py monitor.wsgi:app
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=35
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/server-monitor
+
+[Install]
+WantedBy=multi-user.target
