@@ -78,6 +78,16 @@
         </div>
       </header>
       <section id="page-content" class="content" aria-live="polite"></section>
+      <footer id="platform-status-bar" class="platform-status-bar" aria-label="平台所在服务器状态">
+        <span class="platform-state"><i data-platform-led></i><b data-platform-service>平台正常</b></span>
+        <span data-platform-host>本机 --</span>
+        <span data-platform-uptime>开机 --</span>
+        <span data-platform-load>负载 --</span>
+        <span data-platform-memory>内存 --</span>
+        <span data-platform-disk>数据盘 --</span>
+        <span data-platform-database>数据库 --</span>
+        <span data-platform-hosts>受管主机 --</span>
+      </footer>
     </main>
   </div>
 
@@ -100,6 +110,7 @@
     </form>
   </dialog>
 
+  <div id="operation-progress-region" class="operation-progress-region" aria-live="polite"></div>
   <div id="toast-region" class="toasts" aria-live="assertive"></div>
   <script src="/static/vendor/xterm/xterm.js" defer></script>
   <script src="/static/vendor/xterm/addon-fit.js" defer></script>

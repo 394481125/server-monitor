@@ -159,6 +159,12 @@ def test_api_dashboard_and_settings_write(client, admin):
     assert settings["metric_mid_retention_hours"] == 6
     assert settings["collection_task_retention_minutes"] == 60
     assert settings["database_total_bytes"] >= settings["database_size_bytes"]
+    scan_settings = client.get("/api/scan-settings")
+    assert scan_settings.status_code == 200
+    assert scan_settings.get_json()["settings"]["scan_timeout_seconds"] == 60
+    platform = client.get("/api/platform-status")
+    assert platform.status_code == 200
+    assert platform.get_json()["uptime_seconds"] >= 0
 
 
 def test_api_host_create_retests_identity_server_side(client, admin, monkeypatch):

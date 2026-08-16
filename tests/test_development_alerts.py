@@ -33,7 +33,11 @@ class FakeRuns:
 class FakeConfig:
     @staticmethod
     def all():
-        return {"collection_timeout": 15, "install_timeout": 120, "schedule_output_limit": 1024 * 1024}
+        return {
+            "collection_timeout": 15, "install_timeout": 120, "schedule_output_limit": 1024 * 1024,
+            "scan_timeout_seconds": 60, "scan_max_depth": 8, "scan_result_limit": 100,
+            "scan_minimum_mib": 1024, "environment_inventory_timeout": 60,
+        }
 
 
 STACK_OUTPUT = """__SM_OS__\tubuntu\t24.04

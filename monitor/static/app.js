@@ -6,6 +6,7 @@ const state = {
   page: "dashboard",
   timer: null,
   alertTimer: null,
+  platformTimer: null,
   lastAlertId: null,
   refreshMs: 5000,
   timeZone: "Asia/Shanghai",
@@ -17,6 +18,9 @@ const state = {
   filePath: "/",
   developmentHostId: null,
   developmentRoots: {},
+  scanSettings: {scan_timeout_seconds:60, scan_max_depth:8, scan_result_limit:100, scan_minimum_mib:1024, environment_inventory_timeout:60},
+  scanSettingsPromise: null,
+  scanSettingsLoaded: false,
   stressTimers: new Set(),
 };
 
@@ -100,6 +104,142 @@ async function api(path, options = {}) {
   return result;
 }
 
+function shortDuration(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (days) return `${days}天${hours}小时`;
+  if (hours) return `${hours}小时${minutes}分`;
+  if (minutes) return `${minutes}分${total % 60}秒`;
+  return `${total}秒`;
+}
+
+function startOperationProgress(label, {target = null, timeoutSeconds = null} = {}) {
+  const node = document.createElement("section");
+  node.className = "operation-progress";
+  node.innerHTML = `<div class="operation-progress-head"><strong>${esc(label)}</strong><span data-operation-elapsed>0 秒</span></div><progress max="100" aria-label="${esc(label)}"></progress><div class="operation-progress-detail" data-operation-detail></div>`;
+  const host = target || $("#operation-progress-region");
+  if (target) {
+    target.className = "scan-result-host";
+    target.hidden = false;
+    target.replaceChildren(node);
+  } else {
+    host.append(node);
+  }
+  const meter = $("progress", node);
+  const elapsedNode = $("[data-operation-elapsed]", node);
+  const detailNode = $("[data-operation-detail]", node);
+  const started = Date.now();
+  let mode = timeoutSeconds ? "timed" : "indeterminate";
+  let manualDetail = "";
+  if (!timeoutSeconds) meter.removeAttribute("value");
+  const tick = () => {
+    const elapsed = Math.max(0, Math.floor((Date.now() - started) / 1000));
+    elapsedNode.textContent = `已运行 ${elapsed} 秒`;
+    if (mode === "timed") {
+      meter.value = Math.min(99, Math.round(elapsed / timeoutSeconds * 100));
+      detailNode.textContent = elapsed < timeoutSeconds ? `时间预算 ${elapsed} / ${timeoutSeconds} 秒` : `已到 ${timeoutSeconds} 秒预算，正在等待远端结束`;
+    } else if (mode === "indeterminate") {
+      detailNode.textContent = manualDetail || "任务正在运行，等待远端返回";
+    } else if (mode === "determinate" && manualDetail) {
+      detailNode.textContent = manualDetail;
+    }
+  };
+  tick();
+  const timer = setInterval(tick, 500);
+  return {
+    setDeterminate(value, maximum, detail = "") {
+      mode = "determinate";
+      manualDetail = detail;
+      meter.value = maximum > 0 ? Math.max(0, Math.min(100, value / maximum * 100)) : 0;
+      tick();
+    },
+    setIndeterminate(detail = "") {
+      mode = "indeterminate";
+      manualDetail = detail;
+      meter.removeAttribute("value");
+      tick();
+    },
+    stop() {
+      clearInterval(timer);
+      node.remove();
+      if (target && !target.childElementCount) target.hidden = true;
+    },
+  };
+}
+
+async function withOperationProgress(label, action, options = {}) {
+  const progress = startOperationProgress(label, options);
+  try { return await action(progress); }
+  finally { progress.stop(); }
+}
+
+function uploadApi(path, form, progress, processingDetail = "内容已送达平台，正在通过 SSH 写入远端服务器") {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", path);
+    xhr.setRequestHeader("Accept", "application/json");
+    if (state.csrf) xhr.setRequestHeader("X-CSRF-Token", state.csrf);
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) progress.setDeterminate(event.loaded, event.total, `${fmtBytes(event.loaded)} / ${fmtBytes(event.total)} 已传输到平台`);
+    });
+    xhr.upload.addEventListener("load", () => progress.setIndeterminate(processingDetail));
+    xhr.addEventListener("load", () => {
+      const type = xhr.getResponseHeader("content-type") || "";
+      let result = xhr.responseText;
+      if (type.includes("json")) {
+        try { result = JSON.parse(xhr.responseText); } catch (_) { result = {}; }
+      }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(result);
+      else {
+        const error = new Error(result?.error || `请求失败 (${xhr.status})`);
+        error.status = xhr.status;
+        error.details = result;
+        reject(error);
+      }
+    });
+    xhr.addEventListener("error", () => reject(new Error("上传连接中断")));
+    xhr.send(form);
+  });
+}
+
+async function getScanSettings(force = false) {
+  if (!can("storage.scan")) return state.scanSettings;
+  if (!force && state.scanSettingsLoaded) return state.scanSettings;
+  if (!force && state.scanSettingsPromise) return state.scanSettingsPromise;
+  state.scanSettingsPromise = api("/api/scan-settings").then((result) => {
+    state.scanSettings = {...state.scanSettings, ...(result.settings || {})};
+    state.scanSettingsLoaded = true;
+    return state.scanSettings;
+  }).catch(() => state.scanSettings).finally(() => { state.scanSettingsPromise = null; });
+  return state.scanSettingsPromise;
+}
+
+async function pollPlatformStatus() {
+  if (!state.user || $("#app-view").hidden) return;
+  try {
+    const result = await api("/api/platform-status");
+    $("[data-platform-service]").textContent = result.background_running ? "平台正常" : "后台任务异常";
+    $("[data-platform-led]").classList.toggle("offline", !result.background_running);
+    $(".platform-state").classList.toggle("is-offline", !result.background_running);
+    $("[data-platform-host]").textContent = `本机 ${result.hostname}`;
+    $("[data-platform-uptime]").textContent = `开机 ${result.uptime_seconds == null ? "-" : shortDuration(result.uptime_seconds)}`;
+    $("[data-platform-load]").textContent = `负载 ${result.load_one ?? "-"}`;
+    $("[data-platform-memory]").textContent = `内存 ${percentage(result.memory_usage_percent)}`;
+    $("[data-platform-disk]").textContent = `数据盘 ${percentage(result.disk_usage_percent)}`;
+    $("[data-platform-database]").textContent = `数据库 ${fmtBytes(result.database_bytes)}`;
+    $("[data-platform-hosts]").textContent = `受管 ${result.reachable_hosts}/${result.managed_hosts}`;
+    $("[data-platform-service]").title = `平台进程已运行 ${shortDuration(result.application_uptime_seconds)}`;
+    $("[data-platform-memory]").title = `${fmtBytes(result.memory_used_bytes)} / ${fmtBytes(result.memory_total_bytes)}`;
+    $("[data-platform-disk]").title = `${fmtBytes(result.disk_used_bytes)} / ${fmtBytes(result.disk_total_bytes)}`;
+  } catch (_) {
+    $("[data-platform-service]").textContent = "状态暂不可用";
+    $("[data-platform-led]").classList.add("offline");
+    $(".platform-state").classList.add("is-offline");
+  }
+}
+
 function toast(message, type = "success") {
   const element = document.createElement("div");
   element.className = `toast${type === "error" ? " error" : type === "warning" ? " warning" : ""}`;
@@ -111,8 +251,10 @@ function toast(message, type = "success") {
 function clearRuntime() {
   clearInterval(state.timer);
   clearInterval(state.alertTimer);
+  clearInterval(state.platformTimer);
   state.timer = null;
   state.alertTimer = null;
+  state.platformTimer = null;
   state.stressTimers.forEach((timer) => clearInterval(timer));
   state.stressTimers.clear();
 }
@@ -153,6 +295,9 @@ function acceptUser(user) {
     pollAlerts();
     state.alertTimer = setInterval(pollAlerts, 5000);
   }
+  pollPlatformStatus();
+  state.platformTimer = setInterval(pollPlatformStatus, 15000);
+  if (can("storage.scan")) getScanSettings();
   if (user.must_change_password) openPasswordDialog(true);
 }
 
@@ -472,7 +617,10 @@ async function importHosts(event) {
     await ensureElevated();
     const form = new FormData();
     form.append("file", file);
-    const result = await api("/api/hosts/import", {method:"POST", body:form});
+    const result = await withOperationProgress(
+      "正在导入主机清单",
+      (progress) => uploadApi("/api/hosts/import", form, progress, "内容已送达平台，正在校验并导入主机"),
+    );
     batchResultDialog("主机导入结果", result.results, (item) => `<tr><td>${esc(item.name)}</td><td><span class="status ${item.success ? "online" : "offline"}">${item.success ? "已纳管" : "失败"}</span></td><td>${esc(item.success ? `主机 ID ${item.host_id}` : item.error)}</td></tr>`);
     toast(`导入完成：成功 ${result.success_count} 台，失败 ${result.failure_count} 台`, result.failure_count ? "warning" : "success");
     renderHosts();
@@ -484,7 +632,10 @@ async function showBatchTest() {
   if (!ids.length) return;
   try {
     await ensureElevated();
-    const result = await api("/api/hosts/batch-test", {method:"POST", body:{host_ids:ids}});
+    const result = await withOperationProgress(
+      `正在重测 ${ids.length} 台主机的 SSH`,
+      () => api("/api/hosts/batch-test", {method:"POST", body:{host_ids:ids}}),
+    );
     const label = {ok:"正常",fingerprint_mismatch:"指纹不一致",physical_identity_changed:"物理身份变化",duplicate:"已纳管重复",failed:"连接失败"};
     batchResultDialog("批量 SSH 重测", result.results, (item) => `<tr><td>${esc(item.name || state.hostsCache.find((host) => host.id === Number(item.host_id))?.name || item.host_id)}</td><td><span class="status ${item.status === "ok" ? "online" : "offline"}">${esc(label[item.status] || item.status)}</span></td><td>${esc(item.error || item.duplicate?.name || (item.status === "ok" ? item.identity?.hostname || "SSH 身份已验证" : "需要逐台处理"))}</td></tr>`);
     toast(`重测完成：正常 ${result.ok_count} 台，需处理 ${result.attention_count} 台`, result.attention_count ? "warning" : "success");
@@ -757,6 +908,19 @@ function scanResultMarkup(result, mode = "large") {
   return `<div class="scan-result"><div class="scan-result-head"><div><strong>${title}</strong><span class="hint mono">${esc(result?.path || "")}</span></div>${scanStatusLabel(result)}</div><div class="scan-meta"><span>阈值 ${esc(fmtBytes(result?.minimum_bytes))}</span><span>深度 ${esc(result?.max_depth ?? "-")}</span><span>超时 ${esc(result?.timeout_seconds ?? "-")} 秒</span><span>返回 ${items.length} 条${result?.truncated ? "（已截断）" : ""}</span></div>${items.length ? `<div class="table-wrap scan-table"><table><thead><tr><th>大小</th><th>路径</th><th>修改时间</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="scan-empty">没有超过阈值的文件</div>'}${warning}</div>`;
 }
 
+function scanSelectOptions(values, selected, suffix) {
+  const current = Number(selected);
+  const options = [...new Set([...values, current])].filter(Number.isFinite).sort((left, right) => left - right);
+  return options.map((value) => `<option value="${value}" ${value === current ? "selected" : ""}>${esc(value)} ${esc(suffix)}${value === current ? "（系统默认）" : ""}</option>`).join("");
+}
+
+function scanDepthOptions(selected) {
+  const current = Number(selected);
+  const option = (value) => `<option value="${value}" ${value === current ? "selected" : ""}>${value} 层${value === current ? "（系统默认）" : ""}</option>`;
+  const custom = [1, 3, 5, 8, 12].includes(current) ? "" : `<optgroup label="系统默认">${option(current)}</optgroup>`;
+  return `<optgroup label="快速">${option(1)}${option(3)}${option(5)}</optgroup><optgroup label="完整">${option(8)}${option(12)}</optgroup>${custom}`;
+}
+
 function scanParams(root) {
   const path = $("[data-dev-scan-path]", root).value.trim();
   const minimumMiB = Number($("[data-dev-scan-min]", root).value);
@@ -787,23 +951,25 @@ async function renderDevelopmentPanel(host, root) {
   root.innerHTML = '<div class="loading">正在盘点远端 GPU 软件栈</div>';
   let stack = {};
   try {
-    if (can("development.view")) stack = (await api(`/api/hosts/${host.id}/development/stack`)).stack || {};
+    const scanSettingsRequest = can("storage.scan") ? getScanSettings() : Promise.resolve(state.scanSettings);
+    if (can("development.view")) stack = (await withOperationProgress("正在盘点 GPU 软件栈", () => api(`/api/hosts/${host.id}/development/stack`))).stack || {};
+    const scanSettings = await scanSettingsRequest;
     const scanRoot = developmentRootFor(host);
     root.innerHTML = `<section class="section"><div class="section-title"><div><h3>GPU 软件栈现状</h3><p class="hint">当前目标：${esc(host.username)}@${esc(host.address)} · 驱动、CUDA、cuDNN 只生成可审阅方案，不直接修改系统。</p></div><div class="toolbar-group">${can("development.view") ? '<button data-dev-refresh>刷新盘点</button>' : ""}${can("diagnostics.view") ? '<button data-dev-gpu>GPU 健康自检</button>' : ""}</div></div>${developmentStackSummary(stack)}<pre class="diagnostic-output" data-dev-output hidden></pre></section>
       ${can("development.view") ? `<section class="section"><div class="section-title"><div><h3>虚拟环境</h3><p class="hint">支持 venv、conda、uv；网页执行仅对创建和依赖安装开放，删除环境只生成脚本。</p></div><button data-dev-inventory>刷新环境列表</button></div><div class="toolbar-group"><label class="compact-field">扫描根目录<input data-dev-root value="${esc(scanRoot)}" placeholder="例如 /home/ops/projects"></label></div><div class="table-wrap"><table><thead><tr><th>后端</th><th>路径</th><th>Python / 主要包</th><th>操作</th></tr></thead><tbody data-dev-environments><tr><td colspan="4" class="hint">点击刷新环境列表</td></tr></tbody></table></div><form data-dev-environment-form class="settings-section"><h4>创建或管理环境</h4><div class="form-grid two"><label>后端<select name="backend"><option value="venv" ${stack.python_versions?.length ? "" : "disabled"}>venv（Python 自带）${stack.python_versions?.length ? "" : "（未检测到 Python 3）"}</option><option value="conda" ${stack.tools?.conda?.available ? "" : "disabled"}>conda${stack.tools?.conda?.available ? "" : "（未安装）"}</option><option value="uv" ${stack.tools?.uv?.available ? "" : "disabled"}>uv${stack.tools?.uv?.available ? "" : "（未安装）"}</option></select></label><label>操作<select name="action"><option value="create">创建环境</option><option value="install">安装依赖</option><option value="remove">删除环境（仅脚本）</option></select></label><label>目标路径<input name="path" value="${esc(`${scanRoot.replace(/\/$/, "")}/.venv`)}" required></label><label>Python 版本<select name="python">${developmentPythonOptions(stack)}<option value="">conda 默认</option></select></label><label>PyTorch 预设<select name="pytorch"><option value="none">不安装</option><option value="cpu">CPU</option><option value="cu118">CUDA 11.8</option><option value="cu121">CUDA 12.1</option><option value="cu124">CUDA 12.4</option></select></label><label>额外依赖（空格或逗号分隔）<input name="packages" placeholder="numpy pandas==2.2"></label></div><div class="action-strip">${can("development.plan") ? '<button type="button" data-dev-environment-plan>仅生成脚本</button>' : '<span class="hint">当前账号没有生成环境方案的权限</span>'}${can("development.execute") && host.allow_install ? '<button type="button" class="primary" data-dev-environment-execute>复核后网页执行</button>' : ""}</div><div class="form-error" data-dev-env-error></div></form>${can("development.plan") && host.allow_install ? '<form data-dev-conda-yaml-form class="settings-section"><h4>conda YAML 导入重建</h4><div class="form-grid two"><label>YAML 文件<input name="file" type="file" accept=".yml,.yaml,text/yaml,text/x-yaml" required></label><label>目标环境路径<input name="path" value="/home/' + esc(host.username) + '/conda-env" required></label></div><div class="action-strip"><button type="button" data-dev-conda-plan>仅生成脚本</button>' + (can("development.execute") ? '<button type="button" class="primary" data-dev-conda-execute>复核后网页执行</button>' : "") + '</div><div class="form-error" data-dev-conda-error></div></form>' : ""}</section>` : '<div class="notice-panel">当前账号只有 GPU 自检权限，开发环境盘点需管理员授权。</div>'}
       ${can("development.plan") && host.allow_install ? `<section class="section"><div class="section-title"><div><h3>GPU 驱动、CUDA、cuDNN 与 APT 方案</h3><p class="hint">先选方案类型，再填写对应参数；页面只生成可复核脚本，不直接执行系统级安装。</p></div></div><form data-dev-system-form><div class="form-grid two"><label>方案类型<select name="kind"><optgroup label="GPU 软件栈"><option value="gpu-driver">NVIDIA 驱动（推荐）</option><option value="cuda">CUDA Toolkit</option><option value="cudnn">cuDNN</option></optgroup><optgroup label="开发工具"><option value="uv-install">安装 uv</option><option value="conda-install">安装 Miniconda</option></optgroup><optgroup label="系统包管理"><option value="apt">APT 常用操作</option></optgroup></select></label><label data-system-field="gpu-driver">驱动包（推荐值）<input name="package" value="${esc(stack.gpu?.recommended_driver || "")}" placeholder="由 ubuntu-drivers 提供"></label><label data-system-field="cuda">CUDA 版本<select name="cuda_version"><option value="11.8">11.8</option><option value="12.1">12.1</option><option value="12.4">12.4</option></select></label><label data-system-field="cudnn">cuDNN 版本<select name="cudnn_version"><option value="9-cuda12">9 / CUDA 12</option><option value="8">8</option></select></label><label data-system-field="apt">APT 操作<select name="apt_action"><option value="update">update</option><option value="upgrade">upgrade</option><option value="autofix">autofix</option><option value="install">install</option><option value="remove">remove</option><option value="purge">purge</option></select></label><label data-system-field="apt">APT 包名<input name="apt_package" placeholder="例如 build-essential"></label></div><button class="primary" type="submit">生成方案脚本</button><div class="form-error" data-dev-system-error></div></form></section>` : ""}
       ${can("development.view") ? `<section class="section"><div class="section-title"><h3>APT 已安装包</h3><form data-dev-apt-search class="toolbar-group"><input name="search" placeholder="按包名筛选"><button>查询</button></form></div><div class="table-wrap"><table><thead><tr><th>包</th><th>版本</th><th>状态</th></tr></thead><tbody data-dev-packages><tr><td colspan="3" class="hint">输入条件查询，最多返回 200 项</td></tr></tbody></table></div></section>` : ""}
-      ${can("storage.scan") ? `<section class="section scan-workbench"><div class="section-title"><div><h3>目录容量与大文件扫描</h3><p class="hint">限制跨文件系统、扫描深度和运行时限；超时会保留已发现的部分结果。</p></div></div><div class="scan-options"><label class="scan-path-field">目录<input data-dev-scan-path value="${esc(scanRoot)}"></label><label>最小大小<select data-dev-scan-min><option value="64">64 MiB</option><option value="256">256 MiB</option><option value="1024" selected>1 GiB</option><option value="4096">4 GiB</option><option value="10240">10 GiB</option></select></label><label>扫描深度<select data-dev-scan-depth><optgroup label="快速"><option value="3">3 层</option><option value="5" selected>5 层</option></optgroup><optgroup label="完整"><option value="8">8 层</option><option value="12">12 层</option></optgroup></select></label><label>超时<select data-dev-scan-timeout><option value="30">30 秒</option><option value="60" selected>60 秒</option><option value="120">120 秒</option></select></label><label>返回条数<select data-dev-scan-limit><option value="50">50 条</option><option value="100" selected>100 条</option><option value="200">200 条</option></select></label><div class="split-button"><button type="button" class="primary" data-dev-large>扫描大文件</button><button type="button" class="primary split-toggle" aria-expanded="false" aria-label="展开扫描操作">⌄</button><div class="split-menu-panel" hidden><button type="button" data-dev-usage>统计目录容量</button></div></div></div><div class="scan-result-host" data-dev-scan-output hidden></div></section>` : ""}
+      ${can("storage.scan") ? `<section class="section scan-workbench"><div class="section-title"><div><h3>目录容量与大文件扫描</h3><p class="hint">限制跨文件系统、扫描深度和运行时限；超时会保留已发现的部分结果。默认值可在“系统设置 / 扫描与长任务”调整。</p></div></div><div class="scan-options"><label class="scan-path-field">目录<input data-dev-scan-path value="${esc(scanRoot)}"></label><label>最小大小<select data-dev-scan-min>${scanSelectOptions([64, 256, 1024, 4096, 10240], scanSettings.scan_minimum_mib, "MiB")}</select></label><label>扫描深度<select data-dev-scan-depth>${scanDepthOptions(scanSettings.scan_max_depth)}</select></label><label>超时<select data-dev-scan-timeout>${scanSelectOptions([10, 30, 60, 120], scanSettings.scan_timeout_seconds, "秒")}</select></label><label>返回条数<select data-dev-scan-limit>${scanSelectOptions([50, 100, 200], scanSettings.scan_result_limit, "条")}</select></label><div class="split-button"><button type="button" class="primary" data-dev-large>扫描大文件</button><button type="button" class="primary split-toggle" aria-expanded="false" aria-label="展开扫描操作">⌄</button><div class="split-menu-panel" hidden><button type="button" data-dev-usage>统计目录容量</button></div></div></div><div class="scan-result-host" data-dev-scan-output hidden></div></section>` : ""}
     `;
     $("[data-dev-refresh]", root)?.addEventListener("click", () => renderDevelopmentPanel(host, root));
-    $("[data-dev-gpu]", root)?.addEventListener("click", async () => { try { developmentOutput(root, "GPU 健康自检", (await api(`/api/hosts/${host.id}/development/gpu-diagnostics`)).diagnostics); } catch (error) { developmentOutput(root, "GPU 自检失败", error.message, true); } });
-    $("[data-dev-inventory]", root)?.addEventListener("click", async () => { try { const path = $("[data-dev-root]", root).value.trim(); state.developmentRoots[host.id] = path; const result = await api(`/api/hosts/${host.id}/development/environments?root=${encodeURIComponent(path)}`); $("[data-dev-environments]", root).innerHTML = result.items.length ? result.items.map((item) => `<tr><td>${esc(item.backend)}</td><td class="mono">${esc(item.path)}</td><td>${esc(item.python || "未知")}${item.packages?.length ? `<div class="hint">${esc(item.packages.slice(0, 8).map((pkg) => `${pkg.name} ${pkg.version}`).join(" · "))}${item.packages.length > 8 ? " · …" : ""}</div>` : ""}</td><td>${item.backend === "conda" ? `<button class="text-button" data-conda-export="${esc(item.path)}">导出 yml</button>` : "-"}</td></tr>`).join("") : '<tr><td colspan="4" class="hint">未发现 pyvenv.cfg 或 conda 环境</td></tr>'; $$('[data-conda-export]', root).forEach((button) => { button.onclick = async () => { try { const content = await api(`/api/hosts/${host.id}/development/conda-export?path=${encodeURIComponent(button.dataset.condaExport)}`); const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([content], {type:"text/yaml;charset=utf-8"})); link.download = "environment.yml"; link.click(); URL.revokeObjectURL(link.href); } catch (error) { developmentOutput(root, "导出 conda YAML 失败", error.message, true); } }; }); } catch (error) { developmentOutput(root, "环境盘点失败", error.message, true); } });
+    $("[data-dev-gpu]", root)?.addEventListener("click", async () => { try { developmentOutput(root, "GPU 健康自检", (await withOperationProgress("正在执行 GPU 健康自检", () => api(`/api/hosts/${host.id}/development/gpu-diagnostics`))).diagnostics); } catch (error) { developmentOutput(root, "GPU 自检失败", error.message, true); } });
+    $("[data-dev-inventory]", root)?.addEventListener("click", async () => { try { const path = $("[data-dev-root]", root).value.trim(); state.developmentRoots[host.id] = path; const result = await withOperationProgress("正在盘点虚拟环境", () => api(`/api/hosts/${host.id}/development/environments?root=${encodeURIComponent(path)}`), {timeoutSeconds:scanSettings.environment_inventory_timeout}); $("[data-dev-environments]", root).innerHTML = result.items.length ? result.items.map((item) => `<tr><td>${esc(item.backend)}</td><td class="mono">${esc(item.path)}</td><td>${esc(item.python || "未知")}${item.packages?.length ? `<div class="hint">${esc(item.packages.slice(0, 8).map((pkg) => `${pkg.name} ${pkg.version}`).join(" · "))}${item.packages.length > 8 ? " · …" : ""}</div>` : ""}</td><td>${item.backend === "conda" ? `<button class="text-button" data-conda-export="${esc(item.path)}">导出 yml</button>` : "-"}</td></tr>`).join("") : '<tr><td colspan="4" class="hint">未发现 pyvenv.cfg 或 conda 环境</td></tr>'; $$('[data-conda-export]', root).forEach((button) => { button.onclick = async () => { try { const content = await withOperationProgress("正在导出 conda YAML", () => api(`/api/hosts/${host.id}/development/conda-export?path=${encodeURIComponent(button.dataset.condaExport)}`)); const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([content], {type:"text/yaml;charset=utf-8"})); link.download = "environment.yml"; link.click(); URL.revokeObjectURL(link.href); } catch (error) { developmentOutput(root, "导出 conda YAML 失败", error.message, true); } }; }); } catch (error) { developmentOutput(root, "环境盘点失败", error.message, true); } });
     const environmentPayload = (form) => ({backend:form.backend.value, action:form.action.value, path:form.path.value.trim(), python:form.python.value, pytorch:form.pytorch.value, packages:form.packages.value});
     $("[data-dev-environment-form] [name='backend']", root)?.addEventListener("change", (event) => { const python = $("[data-dev-environment-form] [name='python']", root); if (!python) return; if (event.target.value === "conda") python.value = ""; else if (!python.value) python.selectedIndex = 0; });
-    const submitEnvironment = async (mode) => { const form = $("[data-dev-environment-form]", root); const payload = environmentPayload(form); const safePayload = {...payload, confirmed_path:payload.action !== "create"}; const errorNode = $("[data-dev-env-error]", root); errorNode.textContent = ""; try { if (mode === "execute") { await ensureElevated(); if (!confirm(`确认通过 SSH 在 ${host.name} 执行 ${payload.action} 方案？远端输出将在完成后返回，页面不会执行删除环境。`)) return; } const result = await api(`/api/hosts/${host.id}/development/environment-${mode === "execute" ? "execute" : "plan"}`, {method:"POST", body:safePayload}); if (mode === "execute") { developmentOutput(root, result.ok ? "网页执行完成" : "网页执行失败", `${result.stdout || ""}\n${result.stderr || ""}`, !result.ok); } else developmentOutput(root, "环境方案脚本", result.plan.script); } catch (error) { errorNode.textContent = error.message; } };
+    const submitEnvironment = async (mode) => { const form = $("[data-dev-environment-form]", root); const payload = environmentPayload(form); const safePayload = {...payload, confirmed_path:payload.action !== "create"}; const errorNode = $("[data-dev-env-error]", root); errorNode.textContent = ""; try { if (mode === "execute") { await ensureElevated(); if (!confirm(`确认通过 SSH 在 ${host.name} 执行 ${payload.action} 方案？远端输出将在完成后返回，页面不会执行删除环境。`)) return; } const result = await withOperationProgress(mode === "execute" ? "正在执行环境方案" : "正在生成环境方案", () => api(`/api/hosts/${host.id}/development/environment-${mode === "execute" ? "execute" : "plan"}`, {method:"POST", body:safePayload})); if (mode === "execute") { developmentOutput(root, result.ok ? "网页执行完成" : "网页执行失败", `${result.stdout || ""}\n${result.stderr || ""}`, !result.ok); } else developmentOutput(root, "环境方案脚本", result.plan.script); } catch (error) { errorNode.textContent = error.message; } };
     $("[data-dev-environment-plan]", root)?.addEventListener("click", () => submitEnvironment("plan"));
     $("[data-dev-environment-execute]", root)?.addEventListener("click", () => submitEnvironment("execute"));
-    const submitCondaYaml = async (mode) => { const form = $("[data-dev-conda-yaml-form]", root); if (!form) return; const errorNode = $("[data-dev-conda-error]", root); errorNode.textContent = ""; try { const file = form.file.files[0]; if (!file) throw new Error("请选择 conda YAML 文件"); if (file.size > 512 * 1024) throw new Error("conda YAML 不能超过 512 KiB"); const payload = {path:form.path.value.trim(), yaml:await file.text()}; if (mode === "execute") { await ensureElevated(); if (!confirm(`确认通过 SSH 在 ${host.name} 重建 conda 环境？已有同路径环境不会被自动删除。`)) return; } const result = await api(`/api/hosts/${host.id}/development/conda-yaml-${mode === "execute" ? "execute" : "plan"}`, {method:"POST", body:payload}); if (mode === "execute") developmentOutput(root, result.ok ? "conda YAML 重建完成" : "conda YAML 重建失败", `${result.stdout || ""}\n${result.stderr || ""}`, !result.ok); else developmentOutput(root, "conda YAML 重建脚本", result.plan.script); } catch (error) { errorNode.textContent = error.message; } };
+    const submitCondaYaml = async (mode) => { const form = $("[data-dev-conda-yaml-form]", root); if (!form) return; const errorNode = $("[data-dev-conda-error]", root); errorNode.textContent = ""; try { const file = form.file.files[0]; if (!file) throw new Error("请选择 conda YAML 文件"); if (file.size > 512 * 1024) throw new Error("conda YAML 不能超过 512 KiB"); const payload = {path:form.path.value.trim(), yaml:await file.text()}; if (mode === "execute") { await ensureElevated(); if (!confirm(`确认通过 SSH 在 ${host.name} 重建 conda 环境？已有同路径环境不会被自动删除。`)) return; } const result = await withOperationProgress(mode === "execute" ? "正在重建 conda 环境" : "正在生成 conda 重建方案", () => api(`/api/hosts/${host.id}/development/conda-yaml-${mode === "execute" ? "execute" : "plan"}`, {method:"POST", body:payload})); if (mode === "execute") developmentOutput(root, result.ok ? "conda YAML 重建完成" : "conda YAML 重建失败", `${result.stdout || ""}\n${result.stderr || ""}`, !result.ok); else developmentOutput(root, "conda YAML 重建脚本", result.plan.script); } catch (error) { errorNode.textContent = error.message; } };
     $("[data-dev-conda-plan]", root)?.addEventListener("click", () => submitCondaYaml("plan"));
     $("[data-dev-conda-execute]", root)?.addEventListener("click", () => submitCondaYaml("execute"));
     const systemForm = $("[data-dev-system-form]", root);
@@ -824,7 +990,7 @@ async function renderDevelopmentPanel(host, root) {
         } catch (error) { $("[data-dev-system-error]", root).textContent = error.message; }
       });
     }
-    $("[data-dev-apt-search]", root)?.addEventListener("submit", async (event) => { event.preventDefault(); try { const result = await api(`/api/hosts/${host.id}/development/apt-packages?search=${encodeURIComponent(event.target.search.value)}`); $("[data-dev-packages]", root).innerHTML = result.items.length ? result.items.map((item) => `<tr><td class="mono">${esc(item.package)}</td><td>${esc(item.version)}</td><td>${esc(item.status)}</td></tr>`).join("") : '<tr><td colspan="3" class="hint">没有匹配包</td></tr>'; } catch (error) { developmentOutput(root, "APT 查询失败", error.message, true); } });
+    $("[data-dev-apt-search]", root)?.addEventListener("submit", async (event) => { event.preventDefault(); try { const result = await withOperationProgress("正在查询 APT 软件包", () => api(`/api/hosts/${host.id}/development/apt-packages?search=${encodeURIComponent(event.target.search.value)}`)); $("[data-dev-packages]", root).innerHTML = result.items.length ? result.items.map((item) => `<tr><td class="mono">${esc(item.package)}</td><td>${esc(item.version)}</td><td>${esc(item.status)}</td></tr>`).join("") : '<tr><td colspan="3" class="hint">没有匹配包</td></tr>'; } catch (error) { developmentOutput(root, "APT 查询失败", error.message, true); } });
     $(".split-toggle", root)?.addEventListener("click", (event) => {
       const menu = $(".split-menu-panel", root);
       const open = menu.hidden;
@@ -845,8 +1011,12 @@ async function renderDevelopmentPanel(host, root) {
         button.textContent = "统计中";
         const params = scanParams(root);
         const query = new URLSearchParams({path:params.path, timeout_seconds:String(params.timeoutSeconds)});
-        const result = await api(`/api/hosts/${host.id}/files/usage?${query}`);
         const output = $("[data-dev-scan-output]", root);
+        const result = await withOperationProgress(
+          "正在统计目录容量",
+          () => api(`/api/hosts/${host.id}/files/usage?${query}`),
+          {target:output, timeoutSeconds:params.timeoutSeconds},
+        );
         output.innerHTML = scanResultMarkup(result, "usage");
         output.hidden = false;
         $(".split-menu-panel", root).hidden = true;
@@ -865,8 +1035,12 @@ async function renderDevelopmentPanel(host, root) {
         button.textContent = "扫描中";
         const params = scanParams(root);
         const query = new URLSearchParams({path:params.path, minimum_bytes:String(params.minimumBytes), limit:String(params.limit), max_depth:String(params.maxDepth), timeout_seconds:String(params.timeoutSeconds)});
-        const result = await api(`/api/hosts/${host.id}/files/large-files?${query}`);
         const output = $("[data-dev-scan-output]", root);
+        const result = await withOperationProgress(
+          "正在扫描大文件",
+          () => api(`/api/hosts/${host.id}/files/large-files?${query}`),
+          {target:output, timeoutSeconds:params.timeoutSeconds},
+        );
         output.innerHTML = scanResultMarkup(result, "large");
         output.hidden = false;
       } catch (error) {
@@ -1180,7 +1354,10 @@ async function renderTools(host, root) {
       if (!confirm(`将在 ${host.name} 执行：\n\n${plan.command}\n\n${sudoNotice}\n\n确认继续？`)) return;
       button.disabled = true;
       button.textContent = "安装中";
-      await api(`/api/hosts/${host.id}/tools/${encodeURIComponent(button.dataset.installTool)}/install`, {method:"POST", body:{}});
+      await withOperationProgress(
+        `正在安装 ${button.dataset.installTool}`,
+        () => api(`/api/hosts/${host.id}/tools/${encodeURIComponent(button.dataset.installTool)}/install`, {method:"POST", body:{}}),
+      );
       toast("安装命令已完成并验证工具可用");
       renderTools(host, root);
     } catch (error) { button.disabled = false; button.textContent = "安装"; toast(error.message, "error"); }
@@ -1214,26 +1391,42 @@ function showStressDialog(host) {
 function showStressStatus(host, taskId, durationSeconds) {
   const root = $("#operation-workbench");
   root.hidden = false;
-  root.innerHTML = `<section class="console-panel"><div class="toolbar"><h3>压力测试 <span class="mono">${esc(taskId.slice(0,8))}</span></h3><button data-stop-stress class="danger">停止测试</button></div><div class="kv-grid"><div class="kv"><small>任务状态</small><strong data-stress-state>运行中</strong></div><div class="kv"><small>已运行</small><strong data-stress-elapsed>0 秒</strong></div><div class="kv"><small>预计剩余</small><strong data-stress-remaining>${durationSeconds} 秒</strong></div><div class="kv"><small>任务 ID</small><strong class="mono">${esc(taskId)}</strong></div></div></section>`;
+  root.innerHTML = `<section class="console-panel"><div class="toolbar"><h3>压力测试 <span class="mono">${esc(taskId.slice(0,8))}</span></h3><button data-stop-stress class="danger">停止测试</button></div><div class="kv-grid"><div class="kv"><small>任务状态</small><strong data-stress-state>运行中</strong></div><div class="kv"><small>已运行</small><strong data-stress-elapsed>0 秒</strong></div><div class="kv"><small>预计剩余</small><strong data-stress-remaining>${durationSeconds} 秒</strong></div><div class="kv"><small>任务 ID</small><strong class="mono">${esc(taskId)}</strong></div></div><div class="metric-line"><header><span>计划时长</span><strong data-stress-percent>0.0%</strong></header><progress class="bar" data-stress-progress max="100" value="0" aria-label="压力测试计划时长进度"></progress></div></section>`;
   const started = Date.now();
+  const updateElapsed = () => {
+    const elapsed = Math.min(durationSeconds, Math.floor((Date.now() - started) / 1000));
+    $("[data-stress-elapsed]", root).textContent = `${elapsed} 秒`;
+    $("[data-stress-remaining]", root).textContent = `${Math.max(0, durationSeconds - elapsed)} 秒`;
+    const percent = durationSeconds ? elapsed / durationSeconds * 100 : 0;
+    $("[data-stress-progress]", root).value = percent;
+    $("[data-stress-percent]", root).textContent = `${percent.toFixed(1)}%`;
+  };
+  const finish = () => {
+    clearInterval(pollTimer);
+    clearInterval(visualTimer);
+    state.stressTimers.delete(pollTimer);
+    state.stressTimers.delete(visualTimer);
+    $("[data-stop-stress]", root).disabled = true;
+  };
   const poll = async () => {
     try {
       const result = await api(`/api/hosts/${host.id}/stress/${taskId}`);
-      const elapsed = Math.floor((Date.now() - started) / 1000);
       $('[data-stress-state]', root).textContent = result.task.state;
-      $('[data-stress-elapsed]', root).textContent = `${elapsed} 秒`;
-      $('[data-stress-remaining]', root).textContent = `${Math.max(0, durationSeconds - elapsed)} 秒`;
-      if (result.task.state !== "running") { clearInterval(timer); state.stressTimers.delete(timer); $('[data-stop-stress]', root).disabled = true; }
-    } catch (error) { clearInterval(timer); state.stressTimers.delete(timer); toast(error.message, "error"); }
+      updateElapsed();
+      if (result.task.state !== "running") finish();
+    } catch (error) { finish(); toast(error.message, "error"); }
   };
-  const timer = setInterval(poll, 3000);
-  state.stressTimers.add(timer);
+  const pollTimer = setInterval(poll, 3000);
+  const visualTimer = setInterval(updateElapsed, 1000);
+  state.stressTimers.add(pollTimer);
+  state.stressTimers.add(visualTimer);
+  updateElapsed();
+  poll();
   $('[data-stop-stress]', root).onclick = async () => {
     try {
       await api(`/api/hosts/${host.id}/stress/${taskId}/stop`, {method:"POST", body:{}});
-      clearInterval(timer); state.stressTimers.delete(timer);
+      finish();
       $('[data-stress-state]', root).textContent = "已停止";
-      $('[data-stop-stress]', root).disabled = true;
       toast("压力测试已停止");
     } catch (error) { toast(error.message, "error"); }
   };
@@ -1422,6 +1615,7 @@ async function renderLogs(page = 1, filters = null) {
 
 const settingGroups = {
   collection: {title:"采集与 SSH", copy:"控制后台采集频率、并发、超时及分层历史保留。", keys:["collection_interval","frontend_refresh_interval","ssh_concurrency","queue_limit","interactive_ssh_limit","ssh_connect_timeout","collection_timeout","collection_retries","retry_interval","install_timeout","ssh_reuse","ssh_idle_close","metric_raw_retention_minutes","metric_mid_retention_hours","metric_retention_days","collection_task_retention_minutes","aggregation_mid_seconds","aggregation_long_seconds"]},
+  storage: {title:"扫描与长任务", copy:"统一控制目录容量、大文件扫描和开发环境盘点的默认范围与时限。", keys:["scan_timeout_seconds","scan_max_depth","scan_result_limit","scan_minimum_mib","environment_inventory_timeout"]},
   alerts: {title:"告警阈值", copy:"利用率颜色档位、文件系统容量、inode 和温度告警规则。", keys:["green_threshold","yellow_threshold","filesystem_usage_threshold","filesystem_inode_threshold","cpu_temp_threshold","gpu_temp_threshold","disk_temp_threshold","alert_samples","alert_hysteresis","alert_repeat_minutes"]},
   gpu: {title:"GPU 调度", copy:"全局调度规则；主机默认命令在主机编辑页配置。", keys:["gpu_scheduler_enabled","gpu_idle_mode","gpu_util_threshold","gpu_memory_threshold","gpu_idle_seconds","gpu_process_guard","gpu_cooldown_seconds","gpu_max_attempts","gpu_retry_seconds","gpu_freeze_seconds","gpu_submit_timeout","gpu_direct_timeout"]},
   security: {title:"安全与数据", copy:"登录限制、终端会话、备份和日志数据策略。", keys:["login_fail_limit","login_window_minutes","login_lock_minutes","session_idle_minutes","terminal_idle_seconds","backup_time","backup_dir","backup_keep","log_retention_days","schedule_output_limit","timezone"]},
@@ -1430,6 +1624,7 @@ const settingGroups = {
 
 const settingLabels = {
   collection_interval:"采集间隔（秒）",frontend_refresh_interval:"前端刷新（秒）",ssh_concurrency:"常规 SSH 并发",queue_limit:"任务队列上限",interactive_ssh_limit:"交互 SSH 并发",ssh_connect_timeout:"SSH 连接超时（秒）",collection_timeout:"采集总超时（秒）",collection_retries:"采集重试次数",retry_interval:"重试间隔（秒）",install_timeout:"工具安装超时（秒）",ssh_reuse:"启用 SSH 连接复用",ssh_idle_close:"复用连接空闲关闭（秒）",metric_raw_retention_minutes:"原始指标保留（分钟）",metric_mid_retention_hours:"中期聚合保留（小时）",metric_retention_days:"长期指标保留（天）",collection_task_retention_minutes:"采集任务摘要保留（分钟）",aggregation_mid_seconds:"中期聚合粒度（秒）",aggregation_long_seconds:"长期聚合粒度（秒）",
+  scan_timeout_seconds:"目录扫描超时（秒）",scan_max_depth:"大文件扫描深度",scan_result_limit:"大文件返回条数",scan_minimum_mib:"大文件默认阈值（MiB）",environment_inventory_timeout:"环境盘点超时（秒）",
   green_threshold:"绿色上限（%）",yellow_threshold:"黄色上限（%）",filesystem_usage_threshold:"文件系统容量阈值（%）",filesystem_inode_threshold:"文件系统 inode 阈值（%）",cpu_temp_threshold:"CPU 温度阈值（C）",gpu_temp_threshold:"GPU 温度阈值（C）",disk_temp_threshold:"磁盘温度阈值（C）",alert_samples:"连续样本数",alert_hysteresis:"告警恢复回差",alert_repeat_minutes:"重复提醒间隔（分钟）",
   gpu_scheduler_enabled:"全局 GPU 自动调度",gpu_idle_mode:"空闲判定模式",gpu_util_threshold:"GPU 利用率阈值（%）",gpu_memory_threshold:"显存阈值（%）",gpu_idle_seconds:"默认空闲时长（秒）",gpu_process_guard:"默认计算进程保护",gpu_cooldown_seconds:"冷却时间（秒）",gpu_max_attempts:"最大尝试次数",gpu_retry_seconds:"重试间隔（秒）",gpu_freeze_seconds:"冻结时长（秒）",gpu_submit_timeout:"Tmux 提交超时（秒）",gpu_direct_timeout:"直接 Shell 超时（秒）",
   login_fail_limit:"登录失败上限",login_window_minutes:"登录统计窗口（分钟）",login_lock_minutes:"登录暂停时间（分钟）",session_idle_minutes:"会话闲置超时（分钟）",terminal_idle_seconds:"终端闲置超时（秒）",backup_time:"自动备份时间",backup_dir:"备份目录",backup_keep:"备份保留份数",log_retention_days:"日志保留天数",schedule_output_limit:"单流输出上限（字节）",timezone:"显示时区",toast_enabled:"网页 Toast",serverchan_enabled:"Server 酱通知",serverchan_sendkey:"Server 酱 SendKey",
@@ -1437,6 +1632,7 @@ const settingLabels = {
 
 const numberRules = {
   collection_interval:[5,60],frontend_refresh_interval:[3,30],ssh_concurrency:[1,30],queue_limit:[10,200],interactive_ssh_limit:[1,10],ssh_connect_timeout:[3,30],collection_timeout:[5,60],collection_retries:[0,3],retry_interval:[1,30],install_timeout:[30,600],ssh_idle_close:[10,600],metric_raw_retention_minutes:[5,360],metric_mid_retention_hours:[1,168],metric_retention_days:[1,30],collection_task_retention_minutes:[15,1440],aggregation_mid_seconds:[30,120],aggregation_long_seconds:[120,600],green_threshold:[0,99],yellow_threshold:[1,100],filesystem_usage_threshold:[1,100],filesystem_inode_threshold:[1,100],cpu_temp_threshold:[0,150],gpu_temp_threshold:[0,150],disk_temp_threshold:[0,150],alert_samples:[1,10],alert_hysteresis:[0,20],alert_repeat_minutes:[0,1440],gpu_util_threshold:[0,100],gpu_memory_threshold:[0,100],gpu_idle_seconds:[60,86400],gpu_cooldown_seconds:[0,3600],gpu_max_attempts:[1,5],gpu_retry_seconds:[5,3600],gpu_freeze_seconds:[60,86400],gpu_submit_timeout:[10,120],gpu_direct_timeout:[30,600],login_fail_limit:[1,20],login_window_minutes:[1,60],login_lock_minutes:[1,60],session_idle_minutes:[5,240],terminal_idle_seconds:[30,1800],backup_keep:[1,10],log_retention_days:[7,180],schedule_output_limit:[65536,5242880],
+  scan_timeout_seconds:[10,120],scan_max_depth:[1,12],scan_result_limit:[1,200],scan_minimum_mib:[1,10240],environment_inventory_timeout:[10,120],
 };
 
 function settingInput(key, value) {
@@ -1540,9 +1736,10 @@ async function renderFiles() {
     if (state.page === "files") $("#page-content").innerHTML = '<div class="notice-panel">当前账号尚未获得“浏览文件”权限，请联系管理员在权限与界面页授权。</div>';
     return;
   }
-  const [hostsResult, listing] = await Promise.all([
+  const [hostsResult, listing, scanSettings] = await Promise.all([
     api("/api/file-manager/hosts"),
     state.fileHostId ? api(`/api/hosts/${state.fileHostId}/files?path=${encodeURIComponent(state.filePath)}`) : Promise.resolve(null),
+    can("storage.scan") ? getScanSettings() : Promise.resolve(state.scanSettings),
   ]);
   if (state.page !== "files") return;
   if (!state.fileHostId && hostsResult.items.length) state.fileHostId = hostsResult.items[0].id;
@@ -1553,12 +1750,47 @@ async function renderFiles() {
     return renderFiles();
   }
   const activeListing = currentHost ? (listing || await api(`/api/hosts/${currentHost.id}/files?path=${encodeURIComponent(state.filePath)}`)) : {path:"/", parent:null, items:[]};
-  $("#page-content").innerHTML = `<div class="toolbar"><div class="toolbar-group file-manager-toolbar"><select id="file-host-select">${hostsResult.items.map((host) => `<option value="${host.id}" ${host.id === currentHost?.id ? "selected" : ""}>${esc(host.name)} · ${esc(host.address)}</option>`).join("")}</select><input id="file-path" value="${esc(activeListing.path)}" aria-label="当前路径"><button id="file-go">前往</button>${activeListing.parent ? '<button id="file-up">上一级</button>' : ""}</div><div class="toolbar-group">${can("storage.scan") ? '<button id="file-directory-usage" type="button">目录容量</button><button id="file-large-scan" type="button">扫描大文件</button>' : ""}${can("files.upload") ? '<button id="file-upload-button" type="button" class="primary">上传文件</button><button id="file-folder-upload-button" type="button">上传文件夹</button>' : ""}${fileActionButton("新建目录", "mkdir", "files.manage")}${fileActionButton("刷新", "refresh", "files.browse")}</div></div>${currentHost ? `<div class="notice-panel">当前主机：${esc(currentHost.username)}@${esc(currentHost.address)}。目录下载会自动打包成 ZIP。</div><pre id="file-scan-output" class="diagnostic-output" hidden></pre><div class="table-wrap"><table><thead><tr><th>类型</th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th>操作</th></tr></thead><tbody>${fileRows(activeListing.items)}</tbody></table></div>` : '<div class="empty"><div><strong>没有可用主机</strong>先添加并授权至少一台主机。</div></div>'}<input id="file-upload-input" type="file" multiple hidden><input id="file-folder-upload-input" type="file" webkitdirectory multiple hidden>`;
+  $("#page-content").innerHTML = `<div class="toolbar"><div class="toolbar-group file-manager-toolbar"><select id="file-host-select">${hostsResult.items.map((host) => `<option value="${host.id}" ${host.id === currentHost?.id ? "selected" : ""}>${esc(host.name)} · ${esc(host.address)}</option>`).join("")}</select><input id="file-path" value="${esc(activeListing.path)}" aria-label="当前路径"><button id="file-go">前往</button>${activeListing.parent ? '<button id="file-up">上一级</button>' : ""}</div><div class="toolbar-group">${can("storage.scan") ? '<button id="file-directory-usage" type="button">目录容量</button><button id="file-large-scan" type="button">扫描大文件</button>' : ""}${can("files.upload") ? '<button id="file-upload-button" type="button" class="primary">上传文件</button><button id="file-folder-upload-button" type="button">上传文件夹</button>' : ""}${fileActionButton("新建目录", "mkdir", "files.manage")}${fileActionButton("刷新", "refresh", "files.browse")}</div></div>${currentHost ? `<div class="notice-panel">当前主机：${esc(currentHost.username)}@${esc(currentHost.address)}。目录下载会自动打包成 ZIP；扫描采用系统设置中的默认阈值、深度与超时。</div><div id="file-scan-output" class="scan-result-host" hidden></div><div class="table-wrap"><table><thead><tr><th>类型</th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th>操作</th></tr></thead><tbody>${fileRows(activeListing.items)}</tbody></table></div>` : '<div class="empty"><div><strong>没有可用主机</strong>先添加并授权至少一台主机。</div></div>'}<input id="file-upload-input" type="file" multiple hidden><input id="file-folder-upload-input" type="file" webkitdirectory multiple hidden>`;
   $("#file-host-select")?.addEventListener("change", (event) => { state.fileHostId = Number(event.target.value); state.filePath = "/"; renderFiles(); });
   $("#file-go")?.addEventListener("click", () => { state.filePath = $("#file-path").value || "/"; renderFiles(); });
   $("#file-up")?.addEventListener("click", () => { state.filePath = activeListing.parent || "/"; renderFiles(); });
-  $("#file-directory-usage")?.addEventListener("click", async () => { try { const query = new URLSearchParams({path:activeListing.path, timeout_seconds:"60"}); const result = await api(`/api/hosts/${state.fileHostId}/files/usage?${query}`); const output = $("#file-scan-output"); output.className = "scan-result-host"; output.innerHTML = scanResultMarkup(result, "usage"); output.hidden = false; } catch (error) { toast(error.message, "error"); } });
-  $("#file-large-scan")?.addEventListener("click", async () => { try { const query = new URLSearchParams({path:activeListing.path, minimum_bytes:String(1024 * 1024 * 1024), limit:"100", max_depth:"8", timeout_seconds:"60"}); const result = await api(`/api/hosts/${state.fileHostId}/files/large-files?${query}`); const output = $("#file-scan-output"); output.className = "scan-result-host"; output.innerHTML = scanResultMarkup(result, "large"); output.hidden = false; } catch (error) { toast(error.message, "error"); } });
+  const runFileScan = async (button, label, mode) => {
+    const output = $("#file-scan-output");
+    if (!output) return;
+    const timeoutSeconds = Number(scanSettings.scan_timeout_seconds);
+    const query = mode === "usage"
+      ? new URLSearchParams({path:activeListing.path, timeout_seconds:String(timeoutSeconds)})
+      : new URLSearchParams({
+        path:activeListing.path,
+        minimum_bytes:String(Number(scanSettings.scan_minimum_mib) * 1024 * 1024),
+        limit:String(scanSettings.scan_result_limit),
+        max_depth:String(scanSettings.scan_max_depth),
+        timeout_seconds:String(timeoutSeconds),
+      });
+    const originalText = button.textContent;
+    try {
+      button.disabled = true;
+      button.textContent = mode === "usage" ? "统计中" : "扫描中";
+      const endpoint = mode === "usage" ? "usage" : "large-files";
+      const result = await withOperationProgress(
+        label,
+        () => api(`/api/hosts/${state.fileHostId}/files/${endpoint}?${query}`),
+        {target:output, timeoutSeconds},
+      );
+      output.className = "scan-result-host";
+      output.innerHTML = scanResultMarkup(result, mode);
+      output.hidden = false;
+    } catch (error) {
+      output.className = "scan-result-host";
+      output.innerHTML = `<div class="error-panel">${esc(label)}失败：${esc(error.message)}</div>`;
+      output.hidden = false;
+    } finally {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  };
+  $("#file-directory-usage")?.addEventListener("click", (event) => runFileScan(event.currentTarget, "正在统计目录容量", "usage"));
+  $("#file-large-scan")?.addEventListener("click", (event) => runFileScan(event.currentTarget, "正在扫描大文件", "large"));
   $$('[data-file-open]').forEach((button) => { button.onclick = () => {
     const row = button.closest("tr");
     if (row?.dataset.fileType === "directory") { state.filePath = button.dataset.fileOpen; renderFiles(); }
@@ -1566,22 +1798,27 @@ async function renderFiles() {
   }; });
   $$('[data-file-download]').forEach((button) => { button.onclick = () => window.open(`/api/hosts/${state.fileHostId}/files/download?path=${encodeURIComponent(button.dataset.fileDownload)}`, "_blank"); });
   $$('[data-file-rename]').forEach((button) => { button.onclick = () => showFilePrompt("重命名或移动", button.dataset.fileRename, async (destination) => { await api(`/api/hosts/${state.fileHostId}/files`, {method:"PATCH", body:{source:button.dataset.fileRename, destination}}); renderFiles(); toast("文件路径已更新"); }); });
-  $$('[data-file-copy]').forEach((button) => { button.onclick = () => showFilePrompt("复制到", button.dataset.fileCopy, async (destination) => { await api(`/api/hosts/${state.fileHostId}/files/copy`, {method:"POST", body:{source:button.dataset.fileCopy, destination}}); renderFiles(); toast("文件已复制"); }); });
+  $$('[data-file-copy]').forEach((button) => { button.onclick = () => showFilePrompt("复制到", button.dataset.fileCopy, async (destination) => { await withOperationProgress("正在复制远端文件", () => api(`/api/hosts/${state.fileHostId}/files/copy`, {method:"POST", body:{source:button.dataset.fileCopy, destination}})); renderFiles(); toast("文件已复制"); }); });
   $$('[data-file-delete]').forEach((button) => { button.onclick = async () => {
     try {
       await ensureElevated();
       if (!confirm(`确认删除 ${button.dataset.fileDelete}？`)) return;
-      await api(`/api/hosts/${state.fileHostId}/files`, {method:"DELETE", body:{path:button.dataset.fileDelete}});
+      await withOperationProgress("正在删除远端文件", () => api(`/api/hosts/${state.fileHostId}/files`, {method:"DELETE", body:{path:button.dataset.fileDelete}}));
       renderFiles();
       toast("文件已删除");
     } catch (error) { toast(error.message, "error"); }
   }; });
   const uploadFiles = async (event) => {
     try {
+      const selectedFiles = [...event.target.files];
+      if (!selectedFiles.length) return;
       const form = new FormData();
       form.append("path", activeListing.path);
-      [...event.target.files].forEach((file) => form.append("files", file, file.webkitRelativePath || file.name));
-      await api(`/api/hosts/${state.fileHostId}/files/upload`, {method:"POST", body:form});
+      selectedFiles.forEach((file) => form.append("files", file, file.webkitRelativePath || file.name));
+      await withOperationProgress(
+        `正在上传 ${selectedFiles.length} 个文件`,
+        (progress) => uploadApi(`/api/hosts/${state.fileHostId}/files/upload`, form, progress),
+      );
       toast("上传完成");
       renderFiles();
     } catch (error) {
@@ -1629,9 +1866,11 @@ function bindSettings(values) {
     payload.serverchan_events = $$('[name="serverchan_event"]', form).filter((input) => input.checked).map((input) => input.value);
     if (form.serverchan_sendkey_clear.checked) payload.serverchan_sendkey_clear = true;
     try {
-      await api("/api/settings", {method:"PATCH", body:payload});
+      const response = await api("/api/settings", {method:"PATCH", body:payload});
       state.timeZone = payload.timezone;
       state.refreshMs = payload.frontend_refresh_interval * 1000;
+      state.scanSettings = {...state.scanSettings, ...response.settings};
+      state.scanSettingsLoaded = true;
       toast("系统设置已保存");
       renderSettings();
     } catch (error) { $(".form-error", form).textContent = error.message; }

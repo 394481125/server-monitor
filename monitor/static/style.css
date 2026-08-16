@@ -179,7 +179,23 @@ button:focus-visible, .button-link:focus-visible { outline: 2px solid color-mix(
 .page-heading p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
 .live-indicator { flex: 0 0 auto; padding: 4px 8px; border: 1px solid color-mix(in srgb, var(--success) 24%, var(--line)); color: var(--success); background: color-mix(in srgb, var(--success) 6%, var(--surface)); font-size: 11px; }
 .live-indicator i { margin-right: 5px; }
-.content { min-width: 0; padding: 20px 24px 44px; }
+.content { min-width: 0; padding: 20px 24px 72px; }
+
+.platform-status-bar { position: fixed; z-index: 18; right: 0; bottom: 0; left: 220px; height: 29px; display: flex; align-items: center; gap: 0; overflow-x: auto; border-top: 1px solid var(--line); background: color-mix(in srgb, var(--surface) 95%, transparent); color: var(--muted); font-size: 10px; white-space: nowrap; scrollbar-width: none; }
+.platform-status-bar::-webkit-scrollbar { display: none; }
+.platform-status-bar > span { flex: 0 0 auto; padding: 0 10px; border-right: 1px solid var(--line); }
+.platform-status-bar .platform-state { display: inline-flex; align-items: center; gap: 5px; color: var(--success); }
+.platform-status-bar .platform-state i { width: 6px; height: 6px; border-radius: 50%; background: var(--success); }
+.platform-status-bar .platform-state i.offline { background: var(--danger); }
+.platform-status-bar .platform-state.is-offline { color: var(--danger); }
+
+.operation-progress-region { position: fixed; z-index: 60; top: 64px; right: 16px; width: min(360px, calc(100vw - 32px)); display: grid; gap: 7px; pointer-events: none; }
+.operation-progress { min-width: 0; padding: 11px 12px; border: 1px solid var(--line-strong); border-left: 3px solid var(--primary); border-radius: 3px; background: var(--surface); box-shadow: var(--shadow-raised); pointer-events: auto; }
+.operation-progress-head { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; }
+.operation-progress-head strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.operation-progress-head span { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
+.operation-progress progress { width: 100%; height: 7px; display: block; margin: 8px 0 6px; accent-color: var(--primary); }
+.operation-progress-detail { min-height: 15px; color: var(--muted); font-size: 10px; }
 
 /* Development environment workbench */
 .development-panel { display: grid; gap: 14px; }
@@ -431,6 +447,7 @@ dialog::backdrop { background: rgb(12 22 36 / 58%); }
   .sidebar-scrim { position: fixed; z-index: 15; inset: 52px 0 0; width: 100%; height: auto; border: 0; border-radius: 0; background: rgb(11 20 32 / 46%); }
   body.nav-open .sidebar-scrim { display: block !important; }
   .workspace { min-width: 0; }
+  .platform-status-bar { left: 0; }
   .page-header { padding: 13px 15px; }
   .content { padding: 15px 13px 34px; }
   .stats-band { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -480,6 +497,7 @@ dialog::backdrop { background: rgb(12 22 36 / 58%); }
   .terminal-screen { height: 66vh; }
   .dialog-actions button { flex: 1; }
   .toasts { right: 10px; bottom: 10px; width: calc(100vw - 20px); }
+  .operation-progress-region { top: 59px; right: 10px; width: calc(100vw - 20px); }
   .scan-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .scan-path-field, .split-button { grid-column: 1 / -1; }
   .split-button > button:first-child { flex: 1; }

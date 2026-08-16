@@ -9,6 +9,7 @@ import secrets
 import shlex
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -85,6 +86,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     if app.config["INITIAL_ADMIN_PASSWORD"] is None and app.config.get("TESTING"):
         app.config["INITIAL_ADMIN_PASSWORD"] = "qwer1234"
     data_dir = Path(app.config["DATA_DIR"])
+    started_monotonic = time.monotonic()
     data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(data_dir, 0o700)
     if data_dir.stat().st_mode & 0o077:
@@ -261,6 +263,54 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def health():
         database.query_one("SELECT 1")
         return jsonify(status="ok", background=bool(background and background._thread and background._thread.is_alive()))
+
+    @app.get("/api/platform-status")
+    @login_required()
+    def platform_status():
+        memory_total = None
+        memory_available = None
+        system_uptime_seconds = None
+        try:
+            for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition(":")
+                if separator and key in {"MemTotal", "MemAvailable"}:
+                    parsed = value.strip().split()[0]
+                    if parsed.isdigit():
+                        if key == "MemTotal":
+                            memory_total = int(parsed) * 1024
+                        else:
+                            memory_available = int(parsed) * 1024
+        except OSError:
+            pass
+        try:
+            system_uptime_seconds = max(0, int(float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])))
+        except (OSError, ValueError, IndexError):
+            pass
+        disk = shutil.disk_usage(data_dir)
+        try:
+            load_one = round(os.getloadavg()[0], 2)
+        except OSError:
+            load_one = None
+        managed = hosts.list()
+        reachable = sum(1 for item in managed if item.get("status") in {"online", "busy", "degraded"})
+        storage = database.storage_info()
+        memory_used = memory_total - memory_available if memory_total is not None and memory_available is not None else None
+        return jsonify(
+            hostname=os.uname().nodename,
+            uptime_seconds=system_uptime_seconds if system_uptime_seconds is not None else max(0, int(time.monotonic() - started_monotonic)),
+            application_uptime_seconds=max(0, int(time.monotonic() - started_monotonic)),
+            load_one=load_one,
+            memory_used_bytes=memory_used,
+            memory_total_bytes=memory_total,
+            memory_usage_percent=round(memory_used / memory_total * 100, 1) if memory_used is not None and memory_total else None,
+            disk_used_bytes=disk.used,
+            disk_total_bytes=disk.total,
+            disk_usage_percent=round(disk.used / disk.total * 100, 1) if disk.total else None,
+            database_bytes=storage["database_total_bytes"],
+            background_running=bool(background and background._thread and background._thread.is_alive()),
+            managed_hosts=len(managed),
+            reachable_hosts=reachable,
+        )
 
     @app.post("/api/auth/login")
     def login():
@@ -769,6 +819,15 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         values.update(database.storage_info())
         return jsonify(settings=values)
 
+    @app.get("/api/scan-settings")
+    @login_required(permission="storage.scan")
+    def get_scan_settings():
+        values = config.all()
+        return jsonify(settings={key: values[key] for key in (
+            "scan_timeout_seconds", "scan_max_depth", "scan_result_limit",
+            "scan_minimum_mib", "environment_inventory_timeout",
+        )})
+
     @app.patch("/api/settings")
     @login_required(permission="settings.manage", write=True)
     def update_settings():
@@ -1076,17 +1135,22 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @app.get("/api/hosts/<int:host_id>/files/usage")
     @login_required(permission="storage.scan")
     def directory_usage(host_id: int):
+        settings = config.all()
         return jsonify(development.directory_usage(
-            file_host(host_id), request.args.get("path", ""), request.args.get("timeout_seconds", 60),
+            file_host(host_id), request.args.get("path", ""),
+            request.args.get("timeout_seconds", settings["scan_timeout_seconds"]),
         ))
 
     @app.get("/api/hosts/<int:host_id>/files/large-files")
     @login_required(permission="storage.scan")
     def large_files(host_id: int):
+        settings = config.all()
         return jsonify(development.large_files(
             file_host(host_id), request.args.get("path", ""),
-            request.args.get("minimum_bytes", 1024 * 1024 * 1024), request.args.get("limit", 100),
-            request.args.get("max_depth", 8), request.args.get("timeout_seconds", 60),
+            request.args.get("minimum_bytes", settings["scan_minimum_mib"] * 1024 * 1024),
+            request.args.get("limit", settings["scan_result_limit"]),
+            request.args.get("max_depth", settings["scan_max_depth"]),
+            request.args.get("timeout_seconds", settings["scan_timeout_seconds"]),
         ))
 
     @app.post("/api/hosts/<int:host_id>/tools/<tool>/install")

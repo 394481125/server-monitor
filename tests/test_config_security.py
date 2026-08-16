@@ -20,6 +20,9 @@ def test_settings_validate_ranges_and_cross_fields():
         validate_settings({"metric_raw_retention_minutes": 120, "metric_mid_retention_hours": 1})
     with pytest.raises(ConfigError):
         validate_settings({"metric_mid_retention_hours": 24, "metric_retention_days": 1})
+    with pytest.raises(ConfigError):
+        validate_settings({"scan_timeout_seconds": 121})
+    assert validate_settings({"scan_max_depth": "6"})["scan_max_depth"] == 6
     assert validate_settings({"collection_interval": "10"})["collection_interval"] == 10
 
 

@@ -41,7 +41,7 @@ class DevelopmentService:
         self.operations = operations
         self.config = config
 
-    def development_stack(self, host: dict[str, Any]) -> dict[str, Any]:
+    def development_stack(self, host: dict[str, Any], timeout_seconds: int | None = None) -> dict[str, Any]:
         script = r'''set +e
 sm_run() {
   duration=$1
@@ -135,10 +135,11 @@ if command -v ldconfig >/dev/null 2>&1; then
   fi
 fi
 '''
+        timeout_seconds = timeout_seconds or self.config.all()["collection_timeout"]
         result = self.operations.run(
             host,
             _bash(script),
-            self.config.all()["collection_timeout"],
+            timeout_seconds,
             self.config.all()["schedule_output_limit"],
         )
         return _parse_development_stack(result.stdout)
@@ -196,7 +197,11 @@ sm_timed_out "$nvlink_rc" && printf "__SM_DIAGNOSTIC_WARNING__\tNVLink 探测超
 
     def environment_inventory(self, host: dict[str, Any], root: str) -> dict[str, Any]:
         root = _remote_path(root, "扫描目录")
-        stack = self.development_stack(host)
+        settings = self.config.all()
+        timeout_seconds = _bounded_scan_value(
+            settings.get("environment_inventory_timeout"), "环境盘点时限", 60, 10, 120,
+        )
+        stack = self.development_stack(host, timeout_seconds)
         conda_path = str(stack.get("tools", {}).get("conda", {}).get("path") or "")
         script = r'''set +e
 sm_run() {
@@ -256,8 +261,8 @@ fi
         result = self.operations.run(
             host,
             _bash(script),
-            self.config.all()["collection_timeout"],
-            self.config.all()["schedule_output_limit"],
+            timeout_seconds,
+            settings["schedule_output_limit"],
         )
         environments: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
@@ -285,9 +290,10 @@ fi
                     conda_packages_seen.add(package_key)
         return {"root": root, "items": environments, "tooling": stack}
 
-    def directory_usage(self, host: dict[str, Any], path: str, timeout_seconds: int = 60) -> dict[str, Any]:
+    def directory_usage(self, host: dict[str, Any], path: str, timeout_seconds: int | None = None) -> dict[str, Any]:
         path = _remote_path(path, "统计目录")
-        timeout_seconds = _bounded_scan_value(timeout_seconds, "扫描时限", 60, 10, 120)
+        default_timeout = self.config.all().get("scan_timeout_seconds", 60)
+        timeout_seconds = _bounded_scan_value(timeout_seconds, "扫描时限", default_timeout, 10, 120)
         script = f'''set +e
 path={shlex.quote(path)}
 if command -v timeout >/dev/null 2>&1; then
@@ -348,21 +354,22 @@ printf "__SM_SCAN_STATUS__\\t%s\\n" "$scan_rc"
         self,
         host: dict[str, Any],
         path: str,
-        minimum_bytes: int = 1024 * 1024 * 1024,
-        limit: int = 100,
-        max_depth: int = 8,
-        timeout_seconds: int = 60,
+        minimum_bytes: int | None = None,
+        limit: int | None = None,
+        max_depth: int | None = None,
+        timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
         path = _remote_path(path, "扫描目录")
-        try:
-            minimum_bytes = int(minimum_bytes)
-            limit = int(limit)
-        except (TypeError, ValueError) as exc:
-            raise OperationError("扫描参数无效") from exc
-        if not 1024 * 1024 <= minimum_bytes <= 10 * 1024 * 1024 * 1024 or not 1 <= limit <= 200:
-            raise OperationError("最小大小须在 1 MiB～10 GiB，结果数须在 1～200")
-        max_depth = _bounded_scan_value(max_depth, "扫描深度", 8, 1, 12)
-        timeout_seconds = _bounded_scan_value(timeout_seconds, "扫描时限", 60, 10, 120)
+        settings = self.config.all()
+        minimum_bytes = _bounded_scan_value(
+            minimum_bytes, "最小文件大小", settings.get("scan_minimum_mib", 1024) * 1024 * 1024,
+            1024 * 1024, 10 * 1024 * 1024 * 1024,
+        )
+        limit = _bounded_scan_value(limit, "结果数", settings.get("scan_result_limit", 100), 1, 200)
+        max_depth = _bounded_scan_value(max_depth, "扫描深度", settings.get("scan_max_depth", 8), 1, 12)
+        timeout_seconds = _bounded_scan_value(
+            timeout_seconds, "扫描时限", settings.get("scan_timeout_seconds", 60), 10, 120,
+        )
         script = f'''set +e
 if command -v timeout >/dev/null 2>&1; then
   timeout --signal=TERM --kill-after=2s {timeout_seconds}s find {shlex.quote(path)} -xdev -maxdepth {max_depth} -type f -size +{minimum_bytes - 1}c -printf '%s\\t%T@\\t%p\\0' 2>/dev/null
