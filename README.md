@@ -2,7 +2,7 @@
 
 Server Monitor 是一个面向可信内网的 Linux 多机监控与运维控制台。平台通过 SSH 采集主机指标，不要求被管主机安装常驻 Agent；服务端使用 Flask、SQLite、Paramiko 和 Gunicorn，前端使用原生 HTML/CSS/JavaScript，内置 xterm.js。
 
-完整功能范围和安全边界见 [需求规格](docs/REQUIREMENTS.md)，生产部署、备份和恢复见 [部署文档](docs/DEPLOYMENT.md)，代码上传与日常更新见 [GitHub 教程](docs/GITHUB_GUIDE.md)。
+完整功能范围和安全边界见 [需求规格](docs/REQUIREMENTS.md)，日常启动、停止、排错和更新命令见 [常用命令速查](docs/QUICK_COMMANDS.md)，生产部署、备份和恢复见 [部署文档](docs/DEPLOYMENT.md)，代码上传与日常更新见 [GitHub 教程](docs/GITHUB_GUIDE.md)。
 
 当前控制台包含：
 
@@ -105,26 +105,49 @@ python3 -m venv --copies .venv
 SERVER_MONITOR_INITIAL_PASSWORD='Replace-With-A-Long-Initial-Password' bash scripts/start_ubuntu.sh
 ```
 
-另开终端确认：
+脚本会在后台启动服务并返回终端。确认状态：
 
 ```bash
-curl http://127.0.0.1:8000/health
+bash scripts/start_ubuntu.sh status
 ```
 
-返回 `{"background":true,"status":"ok"}` 后访问 `http://127.0.0.1:8000`。首次登录用户是 `admin`，首次登录必须改密码。`SERVER_MONITOR_INITIAL_PASSWORD` 只在第一次创建管理员时读取，不会覆盖已有密码。
+显示 `healthy` 后访问 `http://127.0.0.1:8000`。首次登录用户是 `admin`，首次登录必须改密码。`SERVER_MONITOR_INITIAL_PASSWORD` 只在第一次创建管理员时读取，不会覆盖已有密码。
 
 ### Ubuntu 二次启动与异常恢复
 
-上面的脚本以前台方式运行，按 `Ctrl+C`、关闭终端或进程异常会停止服务。首次管理员已经创建后，不再需要提供初始密码；以后在项目根目录直接执行：
+首次管理员已经创建后，不再需要提供初始密码。以后在项目根目录直接执行：
 
 ```bash
 bash scripts/start_ubuntu.sh
+```
+
+不带参数等价于 `start`；服务已经运行时会直接显示 PID 和访问地址，不会重复启动。常用管理命令：
+
+```bash
+# 查看状态
+bash scripts/start_ubuntu.sh status
+
+# 重启并加载新代码
+bash scripts/start_ubuntu.sh restart
+
+# 停止
+bash scripts/start_ubuntu.sh stop
+
+# 查看实时日志
+tail -f data/logs/server-monitor.log
 ```
 
 脚本会继续使用项目下的 `data/` 数据库和 `master.key`，不会重建管理员或清空数据。默认监听 `127.0.0.1:8000`；需要临时修改监听地址时可以执行：
 
 ```bash
 SERVER_MONITOR_BIND=0.0.0.0:8000 bash scripts/start_ubuntu.sh
+```
+
+需要临时以前台方式运行和直接查看 Gunicorn 输出时：
+
+```bash
+bash scripts/start_ubuntu.sh stop
+bash scripts/start_ubuntu.sh foreground
 ```
 
 正式长期运行建议按 [部署文档](docs/DEPLOYMENT.md) 配置 systemd。配置完成后，服务器重启会自动启动；日常只使用：

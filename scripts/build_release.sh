@@ -56,7 +56,7 @@ deploy_files=(
     requirements.lock
     monitor
     deploy
-    docs/DEPLOYMENT.md
+    docs
     scripts/reset_admin_password.py
     scripts/quick_start.sh
     scripts/start_ubuntu.sh

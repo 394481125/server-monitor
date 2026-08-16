@@ -1,5 +1,7 @@
 # GitHub 上传与更新教程
 
+启动、停止、日志、端口占用和打包命令集中记录在 [常用命令速查](QUICK_COMMANDS.md)。
+
 本文适用于当前仓库：
 
 - GitHub 地址：`git@github.com:394481125/server-monitor.git`
