@@ -156,7 +156,6 @@ def test_host_status_is_split_by_ssh_failure_reason(app, error_code, expected):
 def test_gpu_health_alerts_emit_and_recover(app):
     hosts = app.extensions["hosts"]
     host = hosts.create(host_payload(), fingerprint="SHA256:key-one", machine_id="machine-one")
-    app.extensions["monitor_config"].update({"gpu_power_threshold_percent": 95})
     data = {**sample_data(), "gpus": [{
         "index": 0, "uuid": "GPU-1", "power_w": 290, "power_limit_w": 300, "temperature_c": 75, "fan_percent": 0,
         "ecc_corrected": 200, "ecc_uncorrected": 1, "pcie_degraded": True, "pcie_gen": 1, "pcie_gen_max": 4, "pcie_width": 4, "pcie_width_max": 16,

@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "server-monitor-shell-v2";
+const CACHE_NAME = "server-monitor-shell-v1";
 const SHELL_FILES = [
   "/",
   "/static/style.css",
