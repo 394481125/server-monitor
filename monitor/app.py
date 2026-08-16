@@ -106,6 +106,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         PasswordService.validate_initial(app.config["INITIAL_ADMIN_PASSWORD"])
     secret_box = SecretBox(app.config["MASTER_KEY"] or data_dir / "master.key")
     config = ConfigStore(database)
+    config.migrate_alert_defaults()
     permission_service = PermissionService(database)
     permission_service.ensure_defaults()
     audit = AuditService(database)
@@ -1043,6 +1044,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         return jsonify(result)
 
     @app.patch("/api/alerts/notification-setting")
+    @app.post("/api/alerts/notification-setting")
     @login_required(permission="alerts.manage", write=True)
     def update_alert_notification_setting():
         enabled = body().get("enabled")
@@ -1053,7 +1055,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         audit_action(
             "alert_notification_setting_updated",
             target_type="settings",
-            summary="开启告警弹窗" if enabled else "关闭告警弹窗",
+            summary="开启告警提醒" if enabled else "关闭告警提醒",
             changes={"toast_enabled": {"before": before, "after": enabled}},
         )
         return jsonify(enabled=enabled)

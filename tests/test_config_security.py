@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import os
+import json
 
 import pytest
 
-from monitor.config import ConfigError, ConfigStore, validate_settings
+from monitor.config import DEFAULTS, LEGACY_ALERT_DEFAULTS, ConfigError, ConfigStore, validate_settings
 from monitor.app import create_app
 from monitor.security import PasswordService, ProcessLock, SecretBox, redact
 
 
 def test_settings_validate_ranges_and_cross_fields():
+    assert DEFAULTS["filesystem_usage_threshold"] == 90
+    assert DEFAULTS["swap_usage_threshold"] == 80
+    assert DEFAULTS["alert_samples"] == 5
     with pytest.raises(ConfigError):
         validate_settings({"collection_interval": 1})
     with pytest.raises(ConfigError):
@@ -83,6 +87,27 @@ def test_config_store_round_trip(tmp_path):
     with pytest.raises(ConfigError, match="中期聚合"):
         store.update({"metric_retention_days": 1})
     assert os.stat(database.path).st_mode & 0o777 == 0o600
+
+
+def test_legacy_alert_defaults_are_migrated_but_custom_values_are_preserved(tmp_path):
+    from monitor.db import Database
+
+    database = Database(tmp_path / "db")
+    database.initialize()
+    for key, value in LEGACY_ALERT_DEFAULTS.items():
+        database.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?)",
+            (key, json.dumps(value)),
+        )
+    database.execute(
+        "UPDATE settings SET value=? WHERE key=?",
+        (json.dumps(82), "cpu_temp_threshold"),
+    )
+    store = ConfigStore(database)
+    values = store.migrate_alert_defaults()
+    assert values["gpu_temp_threshold"] == DEFAULTS["gpu_temp_threshold"]
+    assert values["filesystem_usage_threshold"] == DEFAULTS["filesystem_usage_threshold"]
+    assert values["cpu_temp_threshold"] == 82
 
 
 def test_app_data_directory_permissions(tmp_path):

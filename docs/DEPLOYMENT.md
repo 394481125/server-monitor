@@ -1,6 +1,6 @@
 # Server Monitor 部署与运维
 
-本文对应 `v1.3.5` 和数据库 schema `6`。生产环境只运行一组 Gunicorn，并把 SQLite、主密钥、日志和 PID 文件放在独立数据目录。
+本文对应 `v1.3.6` 和数据库 schema `6`。生产环境只运行一组 Gunicorn，并把 SQLite、主密钥、日志和 PID 文件放在独立数据目录。
 
 ## 前提
 

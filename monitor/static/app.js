@@ -8,6 +8,7 @@ const state = {
   alertTimer: null,
   platformTimer: null,
   lastAlertId: null,
+  alertNotifiedKeys: new Set(),
   openGpuDetail: null,
   refreshMs: 5000,
   timeZone: "Asia/Shanghai",
@@ -290,6 +291,7 @@ function acceptUser(user) {
   $("#login-view").hidden = true;
   $("#app-view").hidden = false;
   state.lastAlertId = null;
+  state.alertNotifiedKeys.clear();
   const firstPage = ["dashboard", "hosts", "files", "environments", "jobs", "alerts", "logs", "settings", "permissions"].find(canShowPage) || "permissions";
   navigate(firstPage);
   if (can("page.alerts")) {
@@ -305,15 +307,20 @@ function acceptUser(user) {
 async function pollAlerts() {
   try {
     const result = await api("/api/alerts?page_size=20");
-    const active = result.items.filter((item) => item.state === "active" && !item.acknowledged_at);
+    const notificationsEnabled = result.toast_enabled !== false;
+    const active = notificationsEnabled ? result.items.filter((item) => item.state === "active" && !item.acknowledged_at && !item.cleared_at) : [];
     const badge = $("#alert-count");
     badge.textContent = String(Math.min(active.length, 99));
     badge.hidden = active.length === 0;
     const newest = Math.max(0, ...result.items.map((item) => item.id));
+    result.items.filter((item) => item.state === "recovered").forEach((item) => state.alertNotifiedKeys.delete(item.alert_key || `${item.host_id || "platform"}:${item.alert_type}`));
     if (state.lastAlertId != null) {
-      result.items.filter((item) => item.id > state.lastAlertId && item.state === "active" && !item.acknowledged_at).reverse().forEach((item) => {
-        if (result.toast_enabled) toast(item.summary, item.severity === "critical" ? "error" : "warning");
-        if (result.toast_enabled && "Notification" in window && Notification.permission === "granted") {
+      result.items.filter((item) => item.id > state.lastAlertId && item.state === "active" && !item.acknowledged_at && !item.cleared_at).reverse().forEach((item) => {
+        const alertKey = item.alert_key || `${item.host_id || "platform"}:${item.alert_type}`;
+        if (!notificationsEnabled || state.alertNotifiedKeys.has(alertKey)) return;
+        state.alertNotifiedKeys.add(alertKey);
+        toast(item.summary, item.severity === "critical" ? "error" : "warning");
+        if ("Notification" in window && Notification.permission === "granted") {
           const notification = new Notification(item.severity === "critical" ? "Server Monitor 严重告警" : "Server Monitor 告警", {
             body: item.summary,
             icon: "/static/icon.svg",
@@ -326,6 +333,16 @@ async function pollAlerts() {
     state.lastAlertId = Math.max(state.lastAlertId || 0, newest);
   } catch (error) {
     if (error.status === 401) showLogin();
+  }
+}
+
+async function updateAlertNotificationSetting(enabled) {
+  try {
+    return await api("/api/alerts/notification-setting", {method:"PATCH", body:{enabled}});
+  } catch (error) {
+    // Older deployments may still expose only the general settings endpoint.
+    if (error.status !== 404) throw error;
+    return api("/api/settings", {method:"PATCH", body:{toast_enabled:enabled}});
   }
 }
 
@@ -542,7 +559,7 @@ async function renderDashboard(backgroundRefresh = false) {
       <label>快捷视图<select id="dashboard-saved-view"><option value="">选择视图</option>${views.map((view) => `<option value="${view.id}">${esc(view.name)}</option>`).join("")}</select></label>
       <div class="toolbar-group"><button id="save-dashboard-view" title="保存当前筛选条件">保存视图</button><button id="delete-dashboard-view" class="danger-quiet" ${views.length ? "" : "disabled"}>删除视图</button>${can("host.manage") ? '<button id="add-host" class="primary"><span aria-hidden="true">+</span> 添加主机</button>' : ""}</div>
     </div>
-    ${(result.gpu_users || []).length ? `<section class="section gpu-user-summary"><div class="section-title"><div><h3>GPU 用户占用</h3><p class="hint">卡数按用户出现计算进程的唯一 GPU 统计，同卡多个进程不会重复计卡。</p></div></div>${textTable(["Linux 用户","占用 GPU","进程数","显存合计","涉及主机"], result.gpu_users.map((item) => [item.username,`${item.gpu_count} 张`,item.process_count,`${Number(item.memory_mib).toFixed(1)} MiB`,item.hosts.join("、")]))}</section>` : ""}
+    ${(result.gpu_users || []).length ? `<details class="gpu-user-summary"><summary><strong>GPU 用户占用</strong><span>${result.gpu_users.length} 个用户 · ${result.gpu_users.reduce((total, item) => total + Number(item.process_count || 0), 0)} 个进程 · 点击查看汇总</span></summary><div class="gpu-user-summary-body">${textTable(["Linux 用户","占用 GPU","进程数","显存合计","涉及主机"], result.gpu_users.map((item) => [item.username,`${item.gpu_count} 张`,item.process_count,`${Number(item.memory_mib).toFixed(1)} MiB`,item.hosts.join("、")]))}</div></details>` : ""}
     ${items.length ? `<div class="host-grid">${items.map((item) => hostCard(item, result.settings)).join("")}</div>` : '<div class="empty"><div><strong>尚未添加主机</strong>添加第一台 Linux 服务器后，采集状态会显示在这里。</div></div>'}`;
   $("#dashboard-status").value = state.dashboardFilters.status;
   bindHostLinks();
@@ -1803,7 +1820,7 @@ async function renderAlerts(page = 1, filters = null) {
   if (state.page !== "alerts") return;
   const exportQuery = new URLSearchParams(query); exportQuery.delete("page"); exportQuery.delete("page_size");
   $("#page-content").innerHTML = `<section class="section fault-summary"><div class="section-title"><h3>故障主机聚合</h3><strong>${faults.total} 台需处理</strong></div>${faults.items.length ? `<div class="table-wrap"><table><thead><tr><th>主机</th><th>状态</th><th>活动问题</th><th>操作</th></tr></thead><tbody>${faults.items.map((item) => `<tr><td><strong>${esc(item.host.name)}</strong><div class="hint">${esc(item.host.address)}</div></td><td><span class="status ${esc(item.host.status || "unknown")}">${statusName(item.host)}</span></td><td>${item.issues.map((issue) => esc(alertNames[issue.alert_type] || issue.summary)).join(" / ")}</td><td><button class="text-button" data-detail="${item.host.id}">查看主机</button></td></tr>`).join("")}</tbody></table></div>` : '<div class="notice-panel">当前没有离线、指纹异常、采集降级或活动资源告警主机。</div>'}</section>
-    <div class="alert-notification-control"><div><strong>告警弹窗</strong><span>控制网页和浏览器桌面弹窗；不会停止告警采集、历史记录或 Server 酱通知。</span></div>${can("alerts.manage") ? `<button type="button" data-alert-notification-toggle role="switch" aria-checked="${Boolean(result.toast_enabled)}" class="${result.toast_enabled ? "danger-quiet" : ""}">${result.toast_enabled ? "关闭告警弹窗" : "开启告警弹窗"}</button>` : `<span class="status ${result.toast_enabled ? "online" : "disabled"}">${result.toast_enabled ? "已开启" : "已关闭"}</span>`}</div>
+    <div class="alert-notification-control"><div><strong>告警提醒 · ${result.toast_enabled ? "当前已开启" : "当前已关闭"}</strong><span>关闭后隐藏顶部红点，并停止网页弹窗、浏览器桌面通知和 Server 酱；告警历史仍会保留。</span></div>${can("alerts.manage") ? `<button type="button" data-alert-notification-toggle role="switch" aria-checked="${Boolean(result.toast_enabled)}" class="${result.toast_enabled ? "danger-quiet" : ""}">${result.toast_enabled ? "关闭告警提醒" : "开启告警提醒"}</button>` : `<span class="status ${result.toast_enabled ? "online" : "disabled"}">${result.toast_enabled ? "已开启" : "已关闭"}</span>`}</div>
     <form id="alert-filters" class="toolbar"><div class="toolbar-group"><div class="toolbar-search"><input name="search" placeholder="搜索事件、主机或摘要" value="${esc(current.search)}"></div><input name="host_id" type="number" min="1" placeholder="主机 ID" value="${esc(current.host_id)}"><input name="alert_type" placeholder="事件类型" value="${esc(current.alert_type)}"><select name="state"><option value="">全部状态</option><option value="active" ${current.state === "active" ? "selected" : ""}>活动中</option><option value="recovered" ${current.state === "recovered" ? "selected" : ""}>已恢复</option></select><select name="severity"><option value="">全部级别</option><option value="critical" ${current.severity === "critical" ? "selected" : ""}>严重</option><option value="warning" ${current.severity === "warning" ? "selected" : ""}>警告</option><option value="info" ${current.severity === "info" ? "selected" : ""}>信息</option></select><div class="date-range-picker" role="group" aria-label="告警时间范围"><label>开始<input name="start" type="datetime-local" value="${esc(localDateTimeValue(current.start))}"></label><span aria-hidden="true">至</span><label>结束<input name="end" type="datetime-local" value="${esc(localDateTimeValue(current.end))}"></label></div><label class="check-label"><input name="include_cleared" type="checkbox" value="1" ${current.include_cleared === "1" ? "checked" : ""}>包含已清理</label><button type="submit">筛选</button></div><div class="toolbar-group">${can("alerts.manage") ? `<button type="button" data-alert-bulk-ack ${result.total ? "" : "disabled"}>一键忽略当前结果</button><button type="button" class="danger-quiet" data-alert-bulk-clear ${result.total ? "" : "disabled"}>一键清理当前结果</button>` : ""}<a class="button-link" href="/api/alerts/export?${exportQuery}">导出 CSV</a></div></form>
     ${result.items.length ? `<div class="table-wrap"><table id="alerts-table"><thead><tr><th>发生时间</th><th>事件</th><th>主机</th><th>级别</th><th>状态</th><th>摘要</th><th>恢复时间</th><th>操作</th></tr></thead><tbody>${result.items.map((item) => `<tr><td>${fmtTime(item.created_at)}</td><td>${esc(alertNames[item.alert_type] || item.alert_type)}</td><td>${esc(item.host_name || item.host_id || "平台")}${item.host_name ? `<div class="hint">ID ${item.host_id}</div>` : ""}</td><td>${esc(({critical:"严重",warning:"警告",info:"信息"})[item.severity] || item.severity)}</td><td><span class="status ${item.cleared_at ? "disabled" : item.state === "active" ? (item.severity === "critical" ? "offline" : "degraded") : "online"}">${item.cleared_at ? "已清理" : item.acknowledged_at ? "已忽略提示" : item.state === "active" ? "活动中" : "已恢复"}</span></td><td>${esc(item.summary)}</td><td>${fmtTime(item.recovered_at)}</td><td class="nowrap">${can("alerts.manage") && !item.acknowledged_at && !item.cleared_at ? `<button class="text-button" data-alert-ack="${item.id}">忽略提示</button>` : ""}${can("alerts.manage") && !item.cleared_at ? `<button class="text-button danger-quiet" data-alert-clear="${item.id}">清理</button>` : "-"}</td></tr>`).join("")}</tbody></table></div>` : '<div class="empty"><div><strong>没有符合条件的告警</strong>调整筛选条件后重试。</div></div>'}${pageControls(result)}`;
   bindHostLinks($("#page-content"));
@@ -1819,8 +1836,9 @@ async function renderAlerts(page = 1, filters = null) {
     const enabled = button.getAttribute("aria-checked") !== "true";
     try {
       button.disabled = true;
-      await api("/api/alerts/notification-setting", {method:"PATCH", body:{enabled}});
-      toast(enabled ? "告警弹窗已开启" : "告警弹窗已关闭");
+      await updateAlertNotificationSetting(enabled);
+      toast(enabled ? "告警提醒已开启" : "告警提醒已关闭");
+      await pollAlerts();
       renderAlerts(page, current);
     } catch (error) { button.disabled = false; toast(error.message, "error"); }
   });
@@ -1829,6 +1847,7 @@ async function renderAlerts(page = 1, filters = null) {
       if (!confirm(`确认忽略当前筛选结果中的未处理告警提示？单次最多处理 1000 条。`)) return;
       const response = await api("/api/alerts/bulk-acknowledge", {method:"POST", body:{filters:current}});
       toast(`已忽略 ${response.count} 条告警提示`);
+      await pollAlerts();
       renderAlerts(1, current);
     } catch (error) { toast(error.message, "error"); }
   });
@@ -1837,11 +1856,12 @@ async function renderAlerts(page = 1, filters = null) {
       if (!confirm(`确认软清理当前筛选结果中的告警？单次最多处理 1000 条，审计历史仍会保留。`)) return;
       const response = await api("/api/alerts/bulk-clear", {method:"POST", body:{filters:current}});
       toast(`已软清理 ${response.count} 条告警`);
+      await pollAlerts();
       renderAlerts(1, current);
     } catch (error) { toast(error.message, "error"); }
   });
-  $$('[data-alert-ack]').forEach((button) => { button.onclick = async () => { try { await api(`/api/alerts/${button.dataset.alertAck}/acknowledge`, {method:"POST", body:{}}); toast("已忽略该告警的后续页面提示"); renderAlerts(page, current); } catch (error) { toast(error.message, "error"); } }; });
-  $$('[data-alert-clear]').forEach((button) => { button.onclick = async () => { try { if (!confirm("确认从默认告警列表软清理该事件？审计历史仍会保留。")) return; await api(`/api/alerts/${button.dataset.alertClear}`, {method:"DELETE", body:{}}); toast("告警已软清理"); renderAlerts(page, current); } catch (error) { toast(error.message, "error"); } }; });
+  $$('[data-alert-ack]').forEach((button) => { button.onclick = async () => { try { await api(`/api/alerts/${button.dataset.alertAck}/acknowledge`, {method:"POST", body:{}}); toast("已忽略该告警的后续页面提示"); await pollAlerts(); renderAlerts(page, current); } catch (error) { toast(error.message, "error"); } }; });
+  $$('[data-alert-clear]').forEach((button) => { button.onclick = async () => { try { if (!confirm("确认从默认告警列表软清理该事件？审计历史仍会保留。")) return; await api(`/api/alerts/${button.dataset.alertClear}`, {method:"DELETE", body:{}}); toast("告警已软清理"); await pollAlerts(); renderAlerts(page, current); } catch (error) { toast(error.message, "error"); } }; });
 }
 
 function auditChangesMarkup(changes) {
@@ -1872,7 +1892,7 @@ const settingGroups = {
   alerts: {title:"告警阈值", copy:"利用率、Swap、温度及 GPU 功耗、风扇、ECC、XID、PCIe、节流与残留显存告警规则。", keys:["green_threshold","yellow_threshold","filesystem_usage_threshold","filesystem_inode_threshold","swap_usage_threshold","cpu_temp_threshold","gpu_temp_threshold","gpu_power_threshold_percent","gpu_fan_min_percent","gpu_fan_alert_temperature","gpu_ecc_corrected_threshold","gpu_xid_alert_enabled","gpu_pcie_alert_enabled","gpu_throttle_alert_enabled","gpu_residual_alert_enabled","disk_temp_threshold","alert_samples","alert_hysteresis","alert_repeat_minutes"]},
   gpu: {title:"GPU 调度", copy:"全局调度规则；主机默认命令在主机编辑页配置。", keys:["gpu_scheduler_enabled","gpu_idle_mode","gpu_util_threshold","gpu_memory_threshold","gpu_idle_seconds","gpu_process_guard","gpu_cooldown_seconds","gpu_max_attempts","gpu_retry_seconds","gpu_freeze_seconds","gpu_submit_timeout","gpu_direct_timeout"]},
   security: {title:"安全与数据", copy:"登录限制、终端会话、备份和日志数据策略。", keys:["login_fail_limit","login_window_minutes","login_lock_minutes","session_idle_minutes","terminal_idle_seconds","backup_time","backup_dir","backup_keep","log_retention_days","schedule_output_limit","timezone"]},
-  notifications: {title:"通知", copy:"告警网页/桌面弹窗和 Server 酱外部通知配置。", keys:["toast_enabled","serverchan_enabled","serverchan_sendkey"]},
+  notifications: {title:"通知", copy:"告警总提醒开关控制红点、网页/桌面弹窗和 Server 酱发送。", keys:["toast_enabled","serverchan_enabled","serverchan_sendkey"]},
 };
 
 const settingLabels = {
@@ -1880,7 +1900,7 @@ const settingLabels = {
   scan_timeout_seconds:"目录扫描超时（秒）",scan_max_depth:"大文件扫描深度",scan_result_limit:"大文件返回条数",scan_minimum_mib:"大文件默认阈值（MiB）",environment_inventory_timeout:"环境盘点超时（秒）",
   green_threshold:"绿色上限（%）",yellow_threshold:"黄色上限（%）",filesystem_usage_threshold:"文件系统容量阈值（%）",filesystem_inode_threshold:"文件系统 inode 阈值（%）",swap_usage_threshold:"Swap 使用率阈值（%）",cpu_temp_threshold:"CPU 温度阈值（C）",gpu_temp_threshold:"GPU 温度阈值（C）",gpu_power_threshold_percent:"GPU 功耗上限比例（%）",gpu_fan_min_percent:"GPU 最低风扇转速（%）",gpu_fan_alert_temperature:"风扇告警温度门槛（C）",gpu_ecc_corrected_threshold:"可纠正 ECC 告警累计值",gpu_xid_alert_enabled:"启用 GPU XID 告警",gpu_pcie_alert_enabled:"启用 PCIe 降级告警",gpu_throttle_alert_enabled:"启用 GPU 节流告警",gpu_residual_alert_enabled:"启用 GPU 残留显存告警",disk_temp_threshold:"磁盘温度阈值（C）",alert_samples:"连续样本数",alert_hysteresis:"告警恢复回差",alert_repeat_minutes:"重复提醒间隔（分钟）",
   gpu_scheduler_enabled:"全局 GPU 自动调度",gpu_idle_mode:"空闲判定模式",gpu_util_threshold:"GPU 利用率阈值（%）",gpu_memory_threshold:"显存阈值（%）",gpu_idle_seconds:"默认空闲时长（秒）",gpu_process_guard:"默认计算进程保护",gpu_cooldown_seconds:"冷却时间（秒）",gpu_max_attempts:"最大尝试次数",gpu_retry_seconds:"重试间隔（秒）",gpu_freeze_seconds:"冻结时长（秒）",gpu_submit_timeout:"Tmux 提交超时（秒）",gpu_direct_timeout:"直接 Shell 超时（秒）",
-  login_fail_limit:"登录失败上限",login_window_minutes:"登录统计窗口（分钟）",login_lock_minutes:"登录暂停时间（分钟）",session_idle_minutes:"会话闲置超时（分钟）",terminal_idle_seconds:"终端闲置超时（秒）",backup_time:"自动备份时间",backup_dir:"备份目录",backup_keep:"备份保留份数",log_retention_days:"日志保留天数",schedule_output_limit:"单流输出上限（字节）",timezone:"显示时区",toast_enabled:"告警网页和桌面弹窗",serverchan_enabled:"Server 酱通知",serverchan_sendkey:"Server 酱 SendKey",
+  login_fail_limit:"登录失败上限",login_window_minutes:"登录统计窗口（分钟）",login_lock_minutes:"登录暂停时间（分钟）",session_idle_minutes:"会话闲置超时（分钟）",terminal_idle_seconds:"终端闲置超时（秒）",backup_time:"自动备份时间",backup_dir:"备份目录",backup_keep:"备份保留份数",log_retention_days:"日志保留天数",schedule_output_limit:"单流输出上限（字节）",timezone:"显示时区",toast_enabled:"告警总提醒（含红点和 Server 酱）",serverchan_enabled:"Server 酱通知",serverchan_sendkey:"Server 酱 SendKey",
 };
 
 const numberRules = {

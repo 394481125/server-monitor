@@ -2,7 +2,7 @@
 
 Server Monitor 是面向可信内网的 Linux 多机 GPU、主机和受控运维平台。平台服务器通过 SSH 采集，不要求被管主机安装常驻 Agent；数据保存在 SQLite，页面由 Flask/Gunicorn 提供。
 
-当前交付版本：`v1.3.5`，数据库 schema：`6`。
+当前交付版本：`v1.3.6`，数据库 schema：`6`。
 
 ## 快速启动
 
@@ -79,7 +79,7 @@ SERVER_MONITOR_BIND=127.0.0.1:18000 bash scripts/start_ubuntu.sh restart
 - 疑似 GPU 残留显存检测、Swap 使用率告警、按 Linux 用户聚合 GPU 卡数/显存/进程数。
 - 进程 RSS、Swap、累计读写 IO、父子层级、僵尸状态和受保护的终止操作。
 - 主机连通性分级、SSH 指纹确认、硬件资产、只读健康巡检、SMART 权限降级提示和底部平台状态条。
-- 告警按当前筛选条件一键忽略提示或软清理，单次最多 1000 条；告警页可关闭网页和浏览器桌面弹窗而不停止采集、历史记录或 Server 酱通知，所有修改保留审计记录。
+- 告警按当前筛选条件一键忽略提示或软清理，单次最多 1000 条；告警页可关闭全部提醒，关闭后隐藏红点并停止网页、桌面和 Server 酱通知，但保留告警历史，所有修改保留审计记录。
 - systemd 关键服务只读状态、journal 日志筛选、重启脚本生成；单目标 ping/TCP 端口诊断。
 - Docker 容器、镜像、Volume、Compose、Docker info 和容器日志只读查看。
 - 开发环境盘点、环境备份脚本、conda YAML、依赖安装后的 `pip check` 冲突提示。
@@ -92,8 +92,8 @@ Docker 和 systemd 的高危写操作、GPU 残留显存一键清理、任意批
 首次上传新仓库：
 
 ```bash
-cd /home/qq394481125/app/server_monitor/dist/server-monitor-github-v1.3.5
-bash scripts/publish_github.sh git@github.com:394481125/server-monitor.git "发布 v1.3.5"
+cd /home/qq394481125/app/server_monitor/dist/server-monitor-github-v1.3.6
+bash scripts/publish_github.sh git@github.com:394481125/server-monitor.git "发布 v1.3.6"
 ```
 
 日常修改在已经有 `.git` 和 `origin` 的源码目录执行：
@@ -108,14 +108,14 @@ bash scripts/update_github.sh "说明本次修改"
 
 ```bash
 cd /home/qq394481125/app/server_monitor
-bash scripts/build_release.sh v1.3.5
+bash scripts/build_release.sh v1.3.6
 (cd dist && sha256sum -c SHA256SUMS)
 ```
 
 输出：
 
-- `dist/server-monitor-github-v1.3.5/`：源码、测试、CI 和文档。
-- `dist/server-monitor-deploy-v1.3.5/`：不含测试的轻量部署包。
+- `dist/server-monitor-github-v1.3.6/`：源码、测试、CI 和文档。
+- `dist/server-monitor-deploy-v1.3.6/`：不含测试的轻量部署包。
 - 两个 `.tar.gz` 和 `dist/SHA256SUMS`。
 
 脚本不会覆盖已有版本目录；请选择新版本号。`.env`、`data/`、`.venv/`、数据库、主密钥和真实凭据不会进入发布包。

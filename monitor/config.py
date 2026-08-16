@@ -34,23 +34,23 @@ DEFAULTS: dict[str, Any] = {
     "aggregation_long_seconds": 300,
     "green_threshold": 60,
     "yellow_threshold": 80,
-    "cpu_temp_threshold": 80,
-    "gpu_temp_threshold": 85,
-    "gpu_power_threshold_percent": 95,
+    "cpu_temp_threshold": 90,
+    "gpu_temp_threshold": 90,
+    "gpu_power_threshold_percent": 98,
     "gpu_fan_min_percent": 5,
-    "gpu_fan_alert_temperature": 60,
-    "gpu_ecc_corrected_threshold": 100,
+    "gpu_fan_alert_temperature": 70,
+    "gpu_ecc_corrected_threshold": 1000,
     "gpu_xid_alert_enabled": True,
     "gpu_pcie_alert_enabled": True,
     "gpu_throttle_alert_enabled": True,
     "gpu_residual_alert_enabled": True,
-    "disk_temp_threshold": 55,
-    "filesystem_usage_threshold": 85,
-    "filesystem_inode_threshold": 85,
-    "swap_usage_threshold": 50,
-    "alert_samples": 3,
-    "alert_hysteresis": 3,
-    "alert_repeat_minutes": 30,
+    "disk_temp_threshold": 60,
+    "filesystem_usage_threshold": 90,
+    "filesystem_inode_threshold": 90,
+    "swap_usage_threshold": 80,
+    "alert_samples": 5,
+    "alert_hysteresis": 5,
+    "alert_repeat_minutes": 120,
     "gpu_scheduler_enabled": False,
     "gpu_idle_mode": "both",
     "gpu_util_threshold": 10,
@@ -92,6 +92,24 @@ DEFAULTS: dict[str, Any] = {
         "backup_failed",
     ],
     "timezone": "Asia/Shanghai",
+}
+
+# Values shipped before the calmer alert profile.  They are migrated only when
+# a stored value still equals the old built-in default; custom thresholds are
+# left untouched.
+LEGACY_ALERT_DEFAULTS = {
+    "cpu_temp_threshold": 80,
+    "gpu_temp_threshold": 85,
+    "gpu_power_threshold_percent": 95,
+    "gpu_fan_alert_temperature": 60,
+    "gpu_ecc_corrected_threshold": 100,
+    "disk_temp_threshold": 55,
+    "filesystem_usage_threshold": 85,
+    "filesystem_inode_threshold": 85,
+    "swap_usage_threshold": 50,
+    "alert_samples": 3,
+    "alert_hysteresis": 3,
+    "alert_repeat_minutes": 30,
 }
 
 
@@ -275,3 +293,13 @@ class ConfigStore:
                     (key, json.dumps(value, ensure_ascii=False)),
                 )
         return self.all()
+
+    def migrate_alert_defaults(self) -> dict[str, Any]:
+        """Raise only values that were persisted from the old default profile."""
+        rows = {row["key"]: json.loads(row["value"]) for row in self.database.query_all("SELECT key,value FROM settings")}
+        updates = {
+            key: DEFAULTS[key]
+            for key, legacy in LEGACY_ALERT_DEFAULTS.items()
+            if rows.get(key) == legacy and DEFAULTS[key] != legacy
+        }
+        return self.update(updates) if updates else self.all()

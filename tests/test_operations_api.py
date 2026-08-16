@@ -482,7 +482,10 @@ def test_frontend_console_contract_and_csp(client):
     assert "function gpuDetailMarkup" in script
     assert 'data-gpu-detail-toggle' in script
     assert 'data-alert-notification-toggle' in script
-    assert 'result.toast_enabled && "Notification" in window' in script
+    assert 'if ("Notification" in window && Notification.permission === "granted")' in script
+    assert "function updateAlertNotificationSetting" in script
+    assert "gpu-user-summary" in script and "<details" in script
+    assert "alertNotifiedKeys" in script
     assert "function physicalDisks" in script
     assert "使用中" in script and "storage-list" in script
     assert "ResizeObserver" in script

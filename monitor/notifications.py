@@ -26,6 +26,8 @@ class NotificationService:
         if not row:
             return
         settings = self.config.all()
+        if not settings["toast_enabled"]:
+            return
         if not settings["serverchan_enabled"] or row["alert_type"] not in settings["serverchan_events"]:
             return
         encrypted = settings.get("serverchan_sendkey")

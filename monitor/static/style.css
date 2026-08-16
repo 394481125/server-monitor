@@ -293,7 +293,12 @@ button:focus-visible, .button-link:focus-visible { outline: 2px solid color-mix(
 .dashboard-filter-band label { min-width: 0; margin: 0; color: var(--muted); font-size: 10px; }
 .dashboard-filter-band select { min-width: 0; }
 .dashboard-filter-band select[multiple] { min-height: 52px; padding: 3px 6px; }
-.gpu-user-summary { margin: 0 0 16px; }
+.gpu-user-summary { margin: 0 0 12px; border: 1px solid var(--line); background: var(--surface); }
+.gpu-user-summary summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 12px; color: var(--text); cursor: pointer; list-style-position: inside; }
+.gpu-user-summary summary::marker { color: var(--primary); }
+.gpu-user-summary summary strong { font-size: 12px; }
+.gpu-user-summary summary span { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.gpu-user-summary-body { padding: 0 12px 10px; }
 .resource-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 7px -15px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--surface-2); }
 .resource-stat { min-width: 0; padding: 10px 8px; border-right: 1px solid var(--line); text-align: center; }
 .resource-stat:last-child { border-right: 0; }
