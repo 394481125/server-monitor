@@ -22,6 +22,18 @@ def _bash(script: str) -> str:
     return "bash -lc " + shlex.quote(script)
 
 
+def _bounded_scan_value(value: Any, label: str, default: int, minimum: int, maximum: int) -> int:
+    if value in {None, ""}:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise OperationError(f"{label}无效") from exc
+    if not minimum <= parsed <= maximum:
+        raise OperationError(f"{label}须在 {minimum}～{maximum} 之间")
+    return parsed
+
+
 class DevelopmentService:
     """Read-only inventory and narrowly generated development environment plans."""
 
@@ -273,22 +285,63 @@ fi
                     conda_packages_seen.add(package_key)
         return {"root": root, "items": environments, "tooling": stack}
 
-    def directory_usage(self, host: dict[str, Any], path: str) -> dict[str, Any]:
+    def directory_usage(self, host: dict[str, Any], path: str, timeout_seconds: int = 60) -> dict[str, Any]:
         path = _remote_path(path, "统计目录")
+        timeout_seconds = _bounded_scan_value(timeout_seconds, "扫描时限", 60, 10, 120)
+        script = f'''set +e
+path={shlex.quote(path)}
+if command -v timeout >/dev/null 2>&1; then
+  output=$(timeout --signal=TERM --kill-after=2s {timeout_seconds}s du -s -x -B1 --apparent-size -- "$path" 2>/dev/null)
+  scan_rc=$?
+else
+  output=$(du -s -x -B1 --apparent-size -- "$path" 2>/dev/null)
+  scan_rc=$?
+fi
+printf "%s\\n" "$output"
+printf "__SM_SCAN_STATUS__\\t%s\\n" "$scan_rc"
+'''
         result = self.operations.run(
             host,
-            f"du -sb -- {shlex.quote(path)} 2>/dev/null",
-            self.config.all()["collection_timeout"],
+            _bash(script),
+            timeout_seconds + 8,
             64 * 1024,
         )
-        first = result.stdout.strip().split(None, 1)
+        status = result.exit_code
+        output_lines: list[str] = []
+        for line in result.stdout.splitlines():
+            if line.startswith("__SM_SCAN_STATUS__\t"):
+                try:
+                    status = int(line.split("\t", 1)[1])
+                except ValueError:
+                    status = 1
+            elif line.strip():
+                output_lines.append(line)
+        first = output_lines[-1].strip().split(None, 1) if output_lines else []
+        timed_out = status in {124, 137}
         if not first or not first[0].isdigit():
+            if timed_out:
+                return {
+                    "path": path,
+                    "bytes": None,
+                    "partial": True,
+                    "timed_out": True,
+                    "timeout_seconds": timeout_seconds,
+                    "warning": f"目录在 {timeout_seconds} 秒内未统计完成，请缩小扫描目录或提高扫描时限",
+                }
             raise OperationError(redact(result.stderr) or "目录不存在、无权读取或远端未返回有效容量")
+        partial = status != 0 or result.stdout_truncated
+        warning = None
+        if timed_out:
+            warning = f"扫描达到 {timeout_seconds} 秒时限，容量为已完成部分"
+        elif partial:
+            warning = "部分子目录无权读取或输出被截断，容量可能不完整"
         return {
             "path": path,
             "bytes": int(first[0]),
-            "partial": result.exit_code != 0,
-            "warning": "部分子目录无权读取，容量可能不完整" if result.exit_code != 0 else None,
+            "partial": partial,
+            "timed_out": timed_out,
+            "timeout_seconds": timeout_seconds,
+            "warning": warning,
         }
 
     def large_files(
@@ -297,6 +350,8 @@ fi
         path: str,
         minimum_bytes: int = 1024 * 1024 * 1024,
         limit: int = 100,
+        max_depth: int = 8,
+        timeout_seconds: int = 60,
     ) -> dict[str, Any]:
         path = _remote_path(path, "扫描目录")
         try:
@@ -306,27 +361,53 @@ fi
             raise OperationError("扫描参数无效") from exc
         if not 1024 * 1024 <= minimum_bytes <= 10 * 1024 * 1024 * 1024 or not 1 <= limit <= 200:
             raise OperationError("最小大小须在 1 MiB～10 GiB，结果数须在 1～200")
-        command = (
-            f"find {shlex.quote(path)} -xdev -type f -size +{minimum_bytes - 1}c "
-            "-printf '%s\\t%T@\\t%p\\0' 2>/dev/null"
-        )
+        max_depth = _bounded_scan_value(max_depth, "扫描深度", 8, 1, 12)
+        timeout_seconds = _bounded_scan_value(timeout_seconds, "扫描时限", 60, 10, 120)
+        script = f'''set +e
+if command -v timeout >/dev/null 2>&1; then
+  timeout --signal=TERM --kill-after=2s {timeout_seconds}s find {shlex.quote(path)} -xdev -maxdepth {max_depth} -type f -size +{minimum_bytes - 1}c -printf '%s\\t%T@\\t%p\\0' 2>/dev/null
+  scan_rc=$?
+else
+  find {shlex.quote(path)} -xdev -maxdepth {max_depth} -type f -size +{minimum_bytes - 1}c -printf '%s\\t%T@\\t%p\\0' 2>/dev/null
+  scan_rc=$?
+fi
+printf '\\0__SM_SCAN_STATUS__\\t%s\\0' "$scan_rc"
+'''
         result = self.operations.run(
             host,
-            command,
-            self.config.all()["collection_timeout"],
+            _bash(script),
+            timeout_seconds + 8,
             min(self.config.all()["schedule_output_limit"], 2 * 1024 * 1024),
         )
         items: list[dict[str, Any]] = []
+        status = result.exit_code
         for record in result.stdout.split("\x00"):
             parts = record.split("\t", 2)
-            if len(parts) == 3 and parts[0].isdigit():
+            if record.startswith("__SM_SCAN_STATUS__\t"):
+                try:
+                    status = int(record.split("\t", 1)[1])
+                except ValueError:
+                    status = 1
+            elif len(parts) == 3 and parts[0].isdigit():
                 items.append({"bytes": int(parts[0]), "mtime": parts[1], "path": parts[2]})
         items.sort(key=lambda item: item["bytes"], reverse=True)
+        timed_out = status in {124, 137}
+        partial = status != 0 or result.stdout_truncated
+        warning = None
+        if timed_out:
+            warning = f"扫描达到 {timeout_seconds} 秒时限，以下为已发现的部分结果"
+        elif partial:
+            warning = "部分目录无权读取或输出达到上限，以下结果可能不完整"
         return {
             "path": path,
             "minimum_bytes": minimum_bytes,
             "items": items[:limit],
-            "truncated": len(items) > limit or result.stdout_truncated,
+            "max_depth": max_depth,
+            "timeout_seconds": timeout_seconds,
+            "partial": partial,
+            "timed_out": timed_out,
+            "warning": warning,
+            "truncated": len(items) > limit or result.stdout_truncated or timed_out,
         }
 
     def apt_packages(self, host: dict[str, Any], search: str = "") -> list[dict[str, str]]:

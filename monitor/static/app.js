@@ -532,6 +532,51 @@ function switchControl(name, label, checked) {
   return `<label class="switch-label"><input type="checkbox" name="${name}" ${checked ? "checked" : ""}><i aria-hidden="true"></i><span>${esc(label)}</span></label>`;
 }
 
+function tagMultiSelectMarkup(tags) {
+  const values = tags || [];
+  return `<div class="multi-select" data-tag-multi-select><div class="multi-select-control" data-tag-control><div class="multi-select-values" data-tag-values>${values.map((tag) => `<button type="button" class="multi-select-tag" data-tag-remove="${esc(tag)}"><span>${esc(tag)}</span><i aria-hidden="true">×</i></button>`).join("")}</div><input data-tag-query autocomplete="off" placeholder="输入后按回车添加"></div><input name="tags" type="hidden" value="${esc(values.join(","))}"><div class="multi-select-menu" data-tag-menu hidden></div></div>`;
+}
+
+function bindTagMultiSelect(form) {
+  const root = $("[data-tag-multi-select]", form);
+  if (!root) return;
+  const hidden = form.tags;
+  const input = $("[data-tag-query]", root);
+  const valuesRoot = $("[data-tag-values]", root);
+  const menu = $("[data-tag-menu]", root);
+  const suggestions = [...new Set(state.hostsCache.flatMap((item) => item.tags || []))].sort((left, right) => left.localeCompare(right, "zh-CN"));
+  let values = hidden.value.split(",").map((item) => item.trim()).filter(Boolean);
+  const sync = () => {
+    hidden.value = values.join(",");
+    valuesRoot.innerHTML = values.map((tag) => `<button type="button" class="multi-select-tag" data-tag-remove="${esc(tag)}"><span>${esc(tag)}</span><i aria-hidden="true">×</i></button>`).join("");
+    const query = input.value.trim().toLowerCase();
+    const available = suggestions.filter((tag) => !values.includes(tag) && (!query || tag.toLowerCase().includes(query))).slice(0, 8);
+    menu.innerHTML = available.map((tag) => `<button type="button" data-tag-add="${esc(tag)}">${esc(tag)}</button>`).join("") || '<span class="hint">输入新标签后按回车</span>';
+    menu.hidden = document.activeElement !== input;
+  };
+  const add = (raw) => {
+    const tag = raw.trim().replace(/^,+|,+$/g, "");
+    if (!tag || values.includes(tag)) return;
+    values.push(tag);
+    input.value = "";
+    sync();
+  };
+  input.addEventListener("focus", sync);
+  input.addEventListener("input", sync);
+  input.addEventListener("blur", () => setTimeout(() => { menu.hidden = true; }, 120));
+  input.addEventListener("keydown", (event) => {
+    if (["Enter", ","].includes(event.key)) { event.preventDefault(); add(input.value); }
+    else if (event.key === "Backspace" && !input.value && values.length) { values.pop(); sync(); }
+  });
+  root.addEventListener("click", (event) => {
+    const remove = event.target.closest("[data-tag-remove]");
+    const addButton = event.target.closest("[data-tag-add]");
+    if (remove) { values = values.filter((tag) => tag !== remove.dataset.tagRemove); sync(); input.focus(); }
+    if (addButton) { add(addButton.dataset.tagAdd); input.focus(); }
+  });
+  sync();
+}
+
 function hostFormMarkup(host) {
   const edit = Boolean(host);
   const value = (key, fallback = "") => esc(host?.[key] ?? fallback);
@@ -541,7 +586,7 @@ function hostFormMarkup(host) {
   const connectionSecretPlaceholder = edit ? (connectionSecretConfigured ? "已配置，留空保持不变" : "未配置，请填写") : "";
   const connectionSecretRequired = !edit || !connectionSecretConfigured ? "required" : "";
   return `<form id="host-form"><div class="dialog-heading"><span class="dialog-icon" aria-hidden="true">▦</span><div><h2>${edit ? "编辑主机" : "添加 SSH 主机"}</h2><p>${edit ? "连接信息变更会先重新测试 SSH 身份。" : "测试连通性和物理身份后纳入统一管理。"}</p></div></div>
-    <fieldset><legend>基础连接</legend><div class="form-grid two"><label>显示名称<input name="name" value="${value("name")}" maxlength="255" required></label><label>地址<input name="address" value="${value("address")}" required></label><label>SSH 端口<input name="port" type="number" value="${value("port", 22)}" min="1" max="65535" required></label><label>SSH 用户<input name="username" value="${value("username")}" required></label><label>认证方式<select name="auth_type"><option value="password" ${host?.auth_type !== "key" ? "selected" : ""}>密码</option><option value="key" ${host?.auth_type === "key" ? "selected" : ""}>私钥</option></select></label><label data-secret-label>${keyAuth ? "私钥" : "SSH 密码"}<textarea data-secret name="${keyAuth ? "private_key" : "auth_secret"}" ${connectionSecretRequired} placeholder="${connectionSecretPlaceholder}"></textarea></label><label data-key-passphrase-row ${keyAuth ? "" : "hidden"}>私钥口令（可选）<input data-key-passphrase name="private_key_passphrase" type="password" autocomplete="new-password" placeholder="${host?.private_key_passphrase_configured ? "已配置，留空保持不变" : "未配置"}"></label><label>标签<input name="tags" value="${esc((host?.tags || []).join(", "))}" placeholder="GPU, 生产"></label><label>采集超时覆盖（秒）<input name="timeout_seconds" type="number" value="${value("timeout_seconds")}" min="5" max="60" placeholder="使用系统设置"></label></div><label>备注<textarea name="notes" maxlength="4000">${value("notes")}</textarea></label></fieldset>
+    <fieldset><legend>基础连接</legend><div class="form-grid two"><label>显示名称<input name="name" value="${value("name")}" maxlength="255" required></label><label>地址<input name="address" value="${value("address")}" required></label><label>SSH 端口<input name="port" type="number" value="${value("port", 22)}" min="1" max="65535" required></label><label>SSH 用户<input name="username" value="${value("username")}" required></label><label>认证方式<select name="auth_type"><option value="password" ${host?.auth_type !== "key" ? "selected" : ""}>密码</option><option value="key" ${host?.auth_type === "key" ? "selected" : ""}>私钥</option></select></label><label data-secret-label>${keyAuth ? "私钥" : "SSH 密码"}<textarea data-secret name="${keyAuth ? "private_key" : "auth_secret"}" ${connectionSecretRequired} placeholder="${connectionSecretPlaceholder}"></textarea></label><label data-key-passphrase-row ${keyAuth ? "" : "hidden"}>私钥口令（可选）<input data-key-passphrase name="private_key_passphrase" type="password" autocomplete="new-password" placeholder="${host?.private_key_passphrase_configured ? "已配置，留空保持不变" : "未配置"}"></label><label>标签（可多选）${tagMultiSelectMarkup(host?.tags || [])}</label><label>采集超时覆盖（秒）<input name="timeout_seconds" type="number" value="${value("timeout_seconds")}" min="5" max="60" placeholder="使用系统设置"></label></div><label>备注<textarea name="notes" maxlength="4000">${value("notes")}</textarea></label></fieldset>
     <fieldset><legend>远端 sudo 授权</legend><div class="form-grid two"><label>远端 sudo 密码（可选）<input data-sudo-password name="sudo_password" type="password" autocomplete="new-password" placeholder="${host?.sudo_password_configured ? "已配置，留空保持不变" : "未配置"}"><span class="hint">仅在精确 NOPASSWD 授权不可用时用于工具安装。</span></label>${host?.sudo_password_configured ? '<label class="check-label"><input data-clear-sudo-password type="checkbox">移除已保存的远端 sudo 密码</label>' : ""}</div></fieldset>
     <fieldset><legend>功能权限</legend><div class="form-grid two">${switchControl("enabled", "启用定时采集", checked("enabled"))}${switchControl("docker_enabled", "采集 Docker 指标", checked("docker_enabled"))}${switchControl("allow_tmux", "允许 Tmux 管理", checked("allow_tmux"))}${switchControl("allow_terminal", "允许 Web 终端", checked("allow_terminal"))}${switchControl("allow_process", "允许进程操作", checked("allow_process"))}${switchControl("allow_install", "允许工具安装", checked("allow_install"))}${switchControl("allow_stress", "允许压力测试", checked("allow_stress"))}</div></fieldset>
     <fieldset><legend>GPU 调度</legend><div class="form-grid two">${switchControl("scheduler_enabled", "启用主机级调度", checked("scheduler_enabled", false))}<label>执行模式<select name="schedule_mode"><option value="tmux" ${host?.schedule_mode !== "direct" ? "selected" : ""}>Tmux 后台提交</option><option value="direct" ${host?.schedule_mode === "direct" ? "selected" : ""}>直接 Shell</option></select></label><label>空闲时长覆盖（秒）<input name="scheduler_idle_seconds" type="number" min="60" max="86400" value="${value("scheduler_idle_seconds")}" placeholder="使用系统设置"></label><label>计算进程保护<select name="scheduler_process_guard"><option value="inherit" ${host?.scheduler_process_guard == null ? "selected" : ""}>继承系统设置</option><option value="true" ${host?.scheduler_process_guard === true ? "selected" : ""}>启用</option><option value="false" ${host?.scheduler_process_guard === false ? "selected" : ""}>禁用</option></select></label><label>工作目录<input name="schedule_cwd" value="${value("schedule_cwd")}" placeholder="可选"></label><label>Shell<input name="schedule_shell" value="${value("schedule_shell", "/bin/bash")}" required></label></div><label>默认调度命令<textarea name="schedule_command" maxlength="500" placeholder="启用自动调度前必须配置">${value("schedule_command")}</textarea></label><label>环境变量（JSON 对象）<textarea name="schedule_env" placeholder='{"KEY":"VALUE"}'>${esc(JSON.stringify(host?.schedule_env || {}, null, 2))}</textarea></label></fieldset>
@@ -599,6 +644,7 @@ async function confirmFingerprintChange(host, payload, error) {
 function showHostForm(host = null) {
   const dialog = createDialog(hostFormMarkup(host), "wide-dialog");
   const form = $("#host-form", dialog);
+  bindTagMultiSelect(form);
   $('[data-cancel]', dialog).onclick = () => dialog.close("cancel");
   form.auth_type.onchange = () => {
     const key = form.auth_type.value === "key";
@@ -694,6 +740,48 @@ function developmentOutput(root, title, value, isError = false) {
   output.hidden = false;
 }
 
+function scanStatusLabel(result) {
+  if (result?.timed_out) return '<span class="status degraded">已超时，返回部分结果</span>';
+  if (result?.partial) return '<span class="status degraded">部分结果</span>';
+  return '<span class="status online">扫描完成</span>';
+}
+
+function scanResultMarkup(result, mode = "large") {
+  const title = mode === "usage" ? "目录容量" : "大文件扫描";
+  const warning = result?.warning ? `<div class="notice-panel scan-warning">${esc(result.warning)}</div>` : "";
+  if (mode === "usage") {
+    return `<div class="scan-result"><div class="scan-result-head"><div><strong>${title}</strong><span class="hint mono">${esc(result?.path || "")}</span></div>${scanStatusLabel(result)}</div><div class="scan-stat"><strong>${fmtBytes(result?.bytes)}</strong><span>已统计容量${result?.partial ? "（可能不完整）" : ""}</span></div>${warning}</div>`;
+  }
+  const items = result?.items || [];
+  const rows = items.map((item) => { const mtime = Number(item.mtime); return `<tr><td class="mono">${esc(fmtBytes(item.bytes))}</td><td class="mono">${esc(item.path)}</td><td>${Number.isFinite(mtime) ? esc(fmtTime(mtime * 1000)) : "-"}</td></tr>`; }).join("");
+  return `<div class="scan-result"><div class="scan-result-head"><div><strong>${title}</strong><span class="hint mono">${esc(result?.path || "")}</span></div>${scanStatusLabel(result)}</div><div class="scan-meta"><span>阈值 ${esc(fmtBytes(result?.minimum_bytes))}</span><span>深度 ${esc(result?.max_depth ?? "-")}</span><span>超时 ${esc(result?.timeout_seconds ?? "-")} 秒</span><span>返回 ${items.length} 条${result?.truncated ? "（已截断）" : ""}</span></div>${items.length ? `<div class="table-wrap scan-table"><table><thead><tr><th>大小</th><th>路径</th><th>修改时间</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="scan-empty">没有超过阈值的文件</div>'}${warning}</div>`;
+}
+
+function scanParams(root) {
+  const path = $("[data-dev-scan-path]", root).value.trim();
+  const minimumMiB = Number($("[data-dev-scan-min]", root).value);
+  return {
+    path,
+    minimumBytes: Math.round(minimumMiB * 1024 * 1024),
+    limit: Number($("[data-dev-scan-limit]", root).value),
+    maxDepth: Number($("[data-dev-scan-depth]", root).value),
+    timeoutSeconds: Number($("[data-dev-scan-timeout]", root).value),
+  };
+}
+
+function bindSystemPlanFields(form) {
+  const update = () => {
+    const kind = form.kind.value;
+    $$('[data-system-field]', form).forEach((field) => {
+      const visible = (field.dataset.systemField || "").split(",").includes(kind);
+      field.hidden = !visible;
+      field.querySelectorAll("input, select").forEach((input) => { input.disabled = !visible; });
+    });
+  };
+  form.kind.addEventListener("change", update);
+  update();
+}
+
 async function renderDevelopmentPanel(host, root) {
   if (!root) return;
   root.innerHTML = '<div class="loading">正在盘点远端 GPU 软件栈</div>';
@@ -703,9 +791,9 @@ async function renderDevelopmentPanel(host, root) {
     const scanRoot = developmentRootFor(host);
     root.innerHTML = `<section class="section"><div class="section-title"><div><h3>GPU 软件栈现状</h3><p class="hint">当前目标：${esc(host.username)}@${esc(host.address)} · 驱动、CUDA、cuDNN 只生成可审阅方案，不直接修改系统。</p></div><div class="toolbar-group">${can("development.view") ? '<button data-dev-refresh>刷新盘点</button>' : ""}${can("diagnostics.view") ? '<button data-dev-gpu>GPU 健康自检</button>' : ""}</div></div>${developmentStackSummary(stack)}<pre class="diagnostic-output" data-dev-output hidden></pre></section>
       ${can("development.view") ? `<section class="section"><div class="section-title"><div><h3>虚拟环境</h3><p class="hint">支持 venv、conda、uv；网页执行仅对创建和依赖安装开放，删除环境只生成脚本。</p></div><button data-dev-inventory>刷新环境列表</button></div><div class="toolbar-group"><label class="compact-field">扫描根目录<input data-dev-root value="${esc(scanRoot)}" placeholder="例如 /home/ops/projects"></label></div><div class="table-wrap"><table><thead><tr><th>后端</th><th>路径</th><th>Python / 主要包</th><th>操作</th></tr></thead><tbody data-dev-environments><tr><td colspan="4" class="hint">点击刷新环境列表</td></tr></tbody></table></div><form data-dev-environment-form class="settings-section"><h4>创建或管理环境</h4><div class="form-grid two"><label>后端<select name="backend"><option value="venv" ${stack.python_versions?.length ? "" : "disabled"}>venv（Python 自带）${stack.python_versions?.length ? "" : "（未检测到 Python 3）"}</option><option value="conda" ${stack.tools?.conda?.available ? "" : "disabled"}>conda${stack.tools?.conda?.available ? "" : "（未安装）"}</option><option value="uv" ${stack.tools?.uv?.available ? "" : "disabled"}>uv${stack.tools?.uv?.available ? "" : "（未安装）"}</option></select></label><label>操作<select name="action"><option value="create">创建环境</option><option value="install">安装依赖</option><option value="remove">删除环境（仅脚本）</option></select></label><label>目标路径<input name="path" value="${esc(`${scanRoot.replace(/\/$/, "")}/.venv`)}" required></label><label>Python 版本<select name="python">${developmentPythonOptions(stack)}<option value="">conda 默认</option></select></label><label>PyTorch 预设<select name="pytorch"><option value="none">不安装</option><option value="cpu">CPU</option><option value="cu118">CUDA 11.8</option><option value="cu121">CUDA 12.1</option><option value="cu124">CUDA 12.4</option></select></label><label>额外依赖（空格或逗号分隔）<input name="packages" placeholder="numpy pandas==2.2"></label></div><div class="action-strip">${can("development.plan") ? '<button type="button" data-dev-environment-plan>仅生成脚本</button>' : '<span class="hint">当前账号没有生成环境方案的权限</span>'}${can("development.execute") && host.allow_install ? '<button type="button" class="primary" data-dev-environment-execute>复核后网页执行</button>' : ""}</div><div class="form-error" data-dev-env-error></div></form>${can("development.plan") && host.allow_install ? '<form data-dev-conda-yaml-form class="settings-section"><h4>conda YAML 导入重建</h4><div class="form-grid two"><label>YAML 文件<input name="file" type="file" accept=".yml,.yaml,text/yaml,text/x-yaml" required></label><label>目标环境路径<input name="path" value="/home/' + esc(host.username) + '/conda-env" required></label></div><div class="action-strip"><button type="button" data-dev-conda-plan>仅生成脚本</button>' + (can("development.execute") ? '<button type="button" class="primary" data-dev-conda-execute>复核后网页执行</button>' : "") + '</div><div class="form-error" data-dev-conda-error></div></form>' : ""}</section>` : '<div class="notice-panel">当前账号只有 GPU 自检权限，开发环境盘点需管理员授权。</div>'}
-      ${can("development.plan") && host.allow_install ? `<section class="section"><div class="section-title"><div><h3>GPU 驱动、CUDA、cuDNN 与 APT 方案</h3><p class="hint">每次只生成固定模板脚本，页面不会自动执行系统级安装。</p></div></div><form data-dev-system-form><div class="form-grid two"><label>方案类型<select name="kind"><option value="gpu-driver">NVIDIA 驱动（推荐）</option><option value="cuda">CUDA Toolkit</option><option value="cudnn">cuDNN</option><option value="uv-install">安装 uv</option><option value="conda-install">安装 Miniconda</option><option value="apt">APT 常用操作</option></select></label><label>驱动包（推荐值）<input name="package" value="${esc(stack.gpu?.recommended_driver || "")}" placeholder="由 ubuntu-drivers 提供"></label><label>CUDA 版本<select name="cuda_version"><option value="11.8">11.8</option><option value="12.1">12.1</option><option value="12.4">12.4</option></select></label><label>cuDNN 版本<select name="cudnn_version"><option value="9-cuda12">9 / CUDA 12</option><option value="8">8</option></select></label><label>APT 操作<select name="apt_action"><option value="update">update</option><option value="upgrade">upgrade</option><option value="autofix">autofix</option><option value="install">install</option><option value="remove">remove</option><option value="purge">purge</option></select></label><label>APT 包名<input name="apt_package" placeholder="例如 build-essential"></label></div><button class="primary" type="submit">生成方案脚本</button><div class="form-error" data-dev-system-error></div></form></section>` : ""}
+      ${can("development.plan") && host.allow_install ? `<section class="section"><div class="section-title"><div><h3>GPU 驱动、CUDA、cuDNN 与 APT 方案</h3><p class="hint">先选方案类型，再填写对应参数；页面只生成可复核脚本，不直接执行系统级安装。</p></div></div><form data-dev-system-form><div class="form-grid two"><label>方案类型<select name="kind"><optgroup label="GPU 软件栈"><option value="gpu-driver">NVIDIA 驱动（推荐）</option><option value="cuda">CUDA Toolkit</option><option value="cudnn">cuDNN</option></optgroup><optgroup label="开发工具"><option value="uv-install">安装 uv</option><option value="conda-install">安装 Miniconda</option></optgroup><optgroup label="系统包管理"><option value="apt">APT 常用操作</option></optgroup></select></label><label data-system-field="gpu-driver">驱动包（推荐值）<input name="package" value="${esc(stack.gpu?.recommended_driver || "")}" placeholder="由 ubuntu-drivers 提供"></label><label data-system-field="cuda">CUDA 版本<select name="cuda_version"><option value="11.8">11.8</option><option value="12.1">12.1</option><option value="12.4">12.4</option></select></label><label data-system-field="cudnn">cuDNN 版本<select name="cudnn_version"><option value="9-cuda12">9 / CUDA 12</option><option value="8">8</option></select></label><label data-system-field="apt">APT 操作<select name="apt_action"><option value="update">update</option><option value="upgrade">upgrade</option><option value="autofix">autofix</option><option value="install">install</option><option value="remove">remove</option><option value="purge">purge</option></select></label><label data-system-field="apt">APT 包名<input name="apt_package" placeholder="例如 build-essential"></label></div><button class="primary" type="submit">生成方案脚本</button><div class="form-error" data-dev-system-error></div></form></section>` : ""}
       ${can("development.view") ? `<section class="section"><div class="section-title"><h3>APT 已安装包</h3><form data-dev-apt-search class="toolbar-group"><input name="search" placeholder="按包名筛选"><button>查询</button></form></div><div class="table-wrap"><table><thead><tr><th>包</th><th>版本</th><th>状态</th></tr></thead><tbody data-dev-packages><tr><td colspan="3" class="hint">输入条件查询，最多返回 200 项</td></tr></tbody></table></div></section>` : ""}
-      ${can("storage.scan") ? `<section class="section"><div class="section-title"><div><h3>目录容量与大文件扫描</h3><p class="hint">仅扫描指定目录并限制跨文件系统、最小大小和返回条数。</p></div></div><div class="toolbar-group"><label class="compact-field">目录<input data-dev-scan-path value="${esc(scanRoot)}"></label><label class="compact-field">最小大小（MiB）<input data-dev-scan-min type="number" min="1" max="10240" value="1024"></label><button data-dev-usage>统计容量</button><button data-dev-large>扫描大文件</button></div><pre class="diagnostic-output" data-dev-scan-output hidden></pre></section>` : ""}
+      ${can("storage.scan") ? `<section class="section scan-workbench"><div class="section-title"><div><h3>目录容量与大文件扫描</h3><p class="hint">限制跨文件系统、扫描深度和运行时限；超时会保留已发现的部分结果。</p></div></div><div class="scan-options"><label class="scan-path-field">目录<input data-dev-scan-path value="${esc(scanRoot)}"></label><label>最小大小<select data-dev-scan-min><option value="64">64 MiB</option><option value="256">256 MiB</option><option value="1024" selected>1 GiB</option><option value="4096">4 GiB</option><option value="10240">10 GiB</option></select></label><label>扫描深度<select data-dev-scan-depth><optgroup label="快速"><option value="3">3 层</option><option value="5" selected>5 层</option></optgroup><optgroup label="完整"><option value="8">8 层</option><option value="12">12 层</option></optgroup></select></label><label>超时<select data-dev-scan-timeout><option value="30">30 秒</option><option value="60" selected>60 秒</option><option value="120">120 秒</option></select></label><label>返回条数<select data-dev-scan-limit><option value="50">50 条</option><option value="100" selected>100 条</option><option value="200">200 条</option></select></label><div class="split-button"><button type="button" class="primary" data-dev-large>扫描大文件</button><button type="button" class="primary split-toggle" aria-expanded="false" aria-label="展开扫描操作">⌄</button><div class="split-menu-panel" hidden><button type="button" data-dev-usage>统计目录容量</button></div></div></div><div class="scan-result-host" data-dev-scan-output hidden></div></section>` : ""}
     `;
     $("[data-dev-refresh]", root)?.addEventListener("click", () => renderDevelopmentPanel(host, root));
     $("[data-dev-gpu]", root)?.addEventListener("click", async () => { try { developmentOutput(root, "GPU 健康自检", (await api(`/api/hosts/${host.id}/development/gpu-diagnostics`)).diagnostics); } catch (error) { developmentOutput(root, "GPU 自检失败", error.message, true); } });
@@ -718,10 +806,75 @@ async function renderDevelopmentPanel(host, root) {
     const submitCondaYaml = async (mode) => { const form = $("[data-dev-conda-yaml-form]", root); if (!form) return; const errorNode = $("[data-dev-conda-error]", root); errorNode.textContent = ""; try { const file = form.file.files[0]; if (!file) throw new Error("请选择 conda YAML 文件"); if (file.size > 512 * 1024) throw new Error("conda YAML 不能超过 512 KiB"); const payload = {path:form.path.value.trim(), yaml:await file.text()}; if (mode === "execute") { await ensureElevated(); if (!confirm(`确认通过 SSH 在 ${host.name} 重建 conda 环境？已有同路径环境不会被自动删除。`)) return; } const result = await api(`/api/hosts/${host.id}/development/conda-yaml-${mode === "execute" ? "execute" : "plan"}`, {method:"POST", body:payload}); if (mode === "execute") developmentOutput(root, result.ok ? "conda YAML 重建完成" : "conda YAML 重建失败", `${result.stdout || ""}\n${result.stderr || ""}`, !result.ok); else developmentOutput(root, "conda YAML 重建脚本", result.plan.script); } catch (error) { errorNode.textContent = error.message; } };
     $("[data-dev-conda-plan]", root)?.addEventListener("click", () => submitCondaYaml("plan"));
     $("[data-dev-conda-execute]", root)?.addEventListener("click", () => submitCondaYaml("execute"));
-    $("[data-dev-system-form]", root)?.addEventListener("submit", async (event) => { event.preventDefault(); const form = event.target; const kind = form.kind.value; const payload = {kind, package:form.package.value.trim(), version:kind === "cuda" ? form.cuda_version.value : kind === "cudnn" ? form.cudnn_version.value : undefined, action:form.apt_action.value, package:kind === "apt" ? form.apt_package.value.trim() : form.package.value.trim()}; try { const result = await api(`/api/hosts/${host.id}/development/system-plan`, {method:"POST", body:payload}); developmentOutput(root, result.plan.title, result.plan.script); } catch (error) { $("[data-dev-system-error]", root).textContent = error.message; } });
+    const systemForm = $("[data-dev-system-form]", root);
+    if (systemForm) {
+      bindSystemPlanFields(systemForm);
+      systemForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const form = event.target;
+        const kind = form.kind.value;
+        const payload = {kind};
+        if (kind === "gpu-driver") payload.package = form.package.value.trim();
+        if (kind === "cuda") payload.version = form.cuda_version.value;
+        if (kind === "cudnn") payload.version = form.cudnn_version.value;
+        if (kind === "apt") { payload.action = form.apt_action.value; payload.package = form.apt_package.value.trim(); }
+        try {
+          const result = await api(`/api/hosts/${host.id}/development/system-plan`, {method:"POST", body:payload});
+          developmentOutput(root, result.plan.title, result.plan.script);
+        } catch (error) { $("[data-dev-system-error]", root).textContent = error.message; }
+      });
+    }
     $("[data-dev-apt-search]", root)?.addEventListener("submit", async (event) => { event.preventDefault(); try { const result = await api(`/api/hosts/${host.id}/development/apt-packages?search=${encodeURIComponent(event.target.search.value)}`); $("[data-dev-packages]", root).innerHTML = result.items.length ? result.items.map((item) => `<tr><td class="mono">${esc(item.package)}</td><td>${esc(item.version)}</td><td>${esc(item.status)}</td></tr>`).join("") : '<tr><td colspan="3" class="hint">没有匹配包</td></tr>'; } catch (error) { developmentOutput(root, "APT 查询失败", error.message, true); } });
-    $("[data-dev-usage]", root)?.addEventListener("click", async () => { try { const path = $("[data-dev-scan-path]", root).value.trim(); const result = await api(`/api/hosts/${host.id}/files/usage?path=${encodeURIComponent(path)}`); $("[data-dev-scan-output]", root).textContent = `${result.path}\n目录容量：${fmtBytes(result.bytes)}${result.partial ? `\n注意：${result.warning}` : ""}`; $("[data-dev-scan-output]", root).hidden = false; } catch (error) { developmentOutput(root, "目录容量失败", error.message, true); } });
-    $("[data-dev-large]", root)?.addEventListener("click", async () => { try { const path = $("[data-dev-scan-path]", root).value.trim(); const min = Number($("[data-dev-scan-min]", root).value) * 1024 * 1024; const result = await api(`/api/hosts/${host.id}/files/large-files?path=${encodeURIComponent(path)}&minimum_bytes=${min}&limit=100`); $("[data-dev-scan-output]", root).textContent = result.items.length ? result.items.map((item) => `${fmtBytes(item.bytes)}\t${item.path}`).join("\n") : "没有超过阈值的文件"; $("[data-dev-scan-output]", root).hidden = false; } catch (error) { developmentOutput(root, "大文件扫描失败", error.message, true); } });
+    $(".split-toggle", root)?.addEventListener("click", (event) => {
+      const menu = $(".split-menu-panel", root);
+      const open = menu.hidden;
+      menu.hidden = !open;
+      event.currentTarget.setAttribute("aria-expanded", String(open));
+    });
+    root.addEventListener("click", (event) => {
+      if (event.target.closest(".split-button")) return;
+      const menu = $(".split-menu-panel", root);
+      if (menu) menu.hidden = true;
+      $(".split-toggle", root)?.setAttribute("aria-expanded", "false");
+    });
+    $("[data-dev-usage]", root)?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      const originalText = button.textContent;
+      try {
+        button.disabled = true;
+        button.textContent = "统计中";
+        const params = scanParams(root);
+        const query = new URLSearchParams({path:params.path, timeout_seconds:String(params.timeoutSeconds)});
+        const result = await api(`/api/hosts/${host.id}/files/usage?${query}`);
+        const output = $("[data-dev-scan-output]", root);
+        output.innerHTML = scanResultMarkup(result, "usage");
+        output.hidden = false;
+        $(".split-menu-panel", root).hidden = true;
+        $(".split-toggle", root).setAttribute("aria-expanded", "false");
+      } catch (error) {
+        const output = $("[data-dev-scan-output]", root);
+        output.innerHTML = `<div class="error-panel">目录容量统计失败：${esc(error.message)}</div>`;
+        output.hidden = false;
+      } finally { button.disabled = false; button.textContent = originalText; }
+    });
+    $("[data-dev-large]", root)?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      const originalText = button.textContent;
+      try {
+        button.disabled = true;
+        button.textContent = "扫描中";
+        const params = scanParams(root);
+        const query = new URLSearchParams({path:params.path, minimum_bytes:String(params.minimumBytes), limit:String(params.limit), max_depth:String(params.maxDepth), timeout_seconds:String(params.timeoutSeconds)});
+        const result = await api(`/api/hosts/${host.id}/files/large-files?${query}`);
+        const output = $("[data-dev-scan-output]", root);
+        output.innerHTML = scanResultMarkup(result, "large");
+        output.hidden = false;
+      } catch (error) {
+        const output = $("[data-dev-scan-output]", root);
+        output.innerHTML = `<div class="error-panel">大文件扫描失败：${esc(error.message)}</div>`;
+        output.hidden = false;
+      } finally { button.disabled = false; button.textContent = originalText; }
+    });
   } catch (error) {
     root.innerHTML = `<div class="error-panel">${esc(error.message)}</div>`;
   }
@@ -1237,7 +1390,7 @@ async function renderAlerts(page = 1, filters = null) {
   if (state.page !== "alerts") return;
   const exportQuery = new URLSearchParams(query); exportQuery.delete("page"); exportQuery.delete("page_size");
   $("#page-content").innerHTML = `<section class="section fault-summary"><div class="section-title"><h3>故障主机聚合</h3><strong>${faults.total} 台需处理</strong></div>${faults.items.length ? `<div class="table-wrap"><table><thead><tr><th>主机</th><th>状态</th><th>活动问题</th><th>操作</th></tr></thead><tbody>${faults.items.map((item) => `<tr><td><strong>${esc(item.host.name)}</strong><div class="hint">${esc(item.host.address)}</div></td><td><span class="status ${esc(item.host.status || "unknown")}">${statusName(item.host)}</span></td><td>${item.issues.map((issue) => esc(alertNames[issue.alert_type] || issue.summary)).join(" / ")}</td><td><button class="text-button" data-detail="${item.host.id}">查看主机</button></td></tr>`).join("")}</tbody></table></div>` : '<div class="notice-panel">当前没有离线、指纹异常、采集降级或活动资源告警主机。</div>'}</section>
-    <form id="alert-filters" class="toolbar"><div class="toolbar-group"><div class="toolbar-search"><input name="search" placeholder="搜索事件、主机或摘要" value="${esc(current.search)}"></div><input name="host_id" type="number" min="1" placeholder="主机 ID" value="${esc(current.host_id)}"><input name="alert_type" placeholder="事件类型" value="${esc(current.alert_type)}"><select name="state"><option value="">全部状态</option><option value="active" ${current.state === "active" ? "selected" : ""}>活动中</option><option value="recovered" ${current.state === "recovered" ? "selected" : ""}>已恢复</option></select><select name="severity"><option value="">全部级别</option><option value="critical" ${current.severity === "critical" ? "selected" : ""}>严重</option><option value="warning" ${current.severity === "warning" ? "selected" : ""}>警告</option><option value="info" ${current.severity === "info" ? "selected" : ""}>信息</option></select><label class="compact-field">开始<input name="start" type="datetime-local" value="${esc(localDateTimeValue(current.start))}"></label><label class="compact-field">结束<input name="end" type="datetime-local" value="${esc(localDateTimeValue(current.end))}"></label><label class="check-label"><input name="include_cleared" type="checkbox" value="1" ${current.include_cleared === "1" ? "checked" : ""}>包含已清理</label><button type="submit">筛选</button></div><a class="button-link" href="/api/alerts/export?${exportQuery}">导出 CSV</a></form>
+    <form id="alert-filters" class="toolbar"><div class="toolbar-group"><div class="toolbar-search"><input name="search" placeholder="搜索事件、主机或摘要" value="${esc(current.search)}"></div><input name="host_id" type="number" min="1" placeholder="主机 ID" value="${esc(current.host_id)}"><input name="alert_type" placeholder="事件类型" value="${esc(current.alert_type)}"><select name="state"><option value="">全部状态</option><option value="active" ${current.state === "active" ? "selected" : ""}>活动中</option><option value="recovered" ${current.state === "recovered" ? "selected" : ""}>已恢复</option></select><select name="severity"><option value="">全部级别</option><option value="critical" ${current.severity === "critical" ? "selected" : ""}>严重</option><option value="warning" ${current.severity === "warning" ? "selected" : ""}>警告</option><option value="info" ${current.severity === "info" ? "selected" : ""}>信息</option></select><div class="date-range-picker" role="group" aria-label="告警时间范围"><label>开始<input name="start" type="datetime-local" value="${esc(localDateTimeValue(current.start))}"></label><span aria-hidden="true">至</span><label>结束<input name="end" type="datetime-local" value="${esc(localDateTimeValue(current.end))}"></label></div><label class="check-label"><input name="include_cleared" type="checkbox" value="1" ${current.include_cleared === "1" ? "checked" : ""}>包含已清理</label><button type="submit">筛选</button></div><a class="button-link" href="/api/alerts/export?${exportQuery}">导出 CSV</a></form>
     ${result.items.length ? `<div class="table-wrap"><table id="alerts-table"><thead><tr><th>发生时间</th><th>事件</th><th>主机</th><th>级别</th><th>状态</th><th>摘要</th><th>恢复时间</th><th>操作</th></tr></thead><tbody>${result.items.map((item) => `<tr><td>${fmtTime(item.created_at)}</td><td>${esc(alertNames[item.alert_type] || item.alert_type)}</td><td>${esc(item.host_name || item.host_id || "平台")}${item.host_name ? `<div class="hint">ID ${item.host_id}</div>` : ""}</td><td>${esc(({critical:"严重",warning:"警告",info:"信息"})[item.severity] || item.severity)}</td><td><span class="status ${item.cleared_at ? "disabled" : item.state === "active" ? (item.severity === "critical" ? "offline" : "degraded") : "online"}">${item.cleared_at ? "已清理" : item.acknowledged_at ? "已忽略提示" : item.state === "active" ? "活动中" : "已恢复"}</span></td><td>${esc(item.summary)}</td><td>${fmtTime(item.recovered_at)}</td><td class="nowrap">${can("alerts.manage") && !item.acknowledged_at && !item.cleared_at ? `<button class="text-button" data-alert-ack="${item.id}">忽略提示</button>` : ""}${can("alerts.manage") && !item.cleared_at ? `<button class="text-button danger-quiet" data-alert-clear="${item.id}">清理</button>` : "-"}</td></tr>`).join("")}</tbody></table></div>` : '<div class="empty"><div><strong>没有符合条件的告警</strong>调整筛选条件后重试。</div></div>'}${pageControls(result)}`;
   bindHostLinks($("#page-content"));
   $("#alert-filters").onsubmit = (event) => {
@@ -1404,8 +1557,8 @@ async function renderFiles() {
   $("#file-host-select")?.addEventListener("change", (event) => { state.fileHostId = Number(event.target.value); state.filePath = "/"; renderFiles(); });
   $("#file-go")?.addEventListener("click", () => { state.filePath = $("#file-path").value || "/"; renderFiles(); });
   $("#file-up")?.addEventListener("click", () => { state.filePath = activeListing.parent || "/"; renderFiles(); });
-  $("#file-directory-usage")?.addEventListener("click", async () => { try { const result = await api(`/api/hosts/${state.fileHostId}/files/usage?path=${encodeURIComponent(activeListing.path)}`); const output = $("#file-scan-output"); output.textContent = `${result.path}\n目录容量：${fmtBytes(result.bytes)}${result.partial ? `\n注意：${result.warning}` : ""}`; output.hidden = false; } catch (error) { toast(error.message, "error"); } });
-  $("#file-large-scan")?.addEventListener("click", async () => { try { const result = await api(`/api/hosts/${state.fileHostId}/files/large-files?path=${encodeURIComponent(activeListing.path)}&minimum_bytes=${1024 * 1024 * 1024}&limit=100`); const output = $("#file-scan-output"); output.textContent = result.items.length ? result.items.map((item) => `${fmtBytes(item.bytes)}\t${item.path}`).join("\n") : "当前目录没有超过 1 GiB 的文件"; output.hidden = false; } catch (error) { toast(error.message, "error"); } });
+  $("#file-directory-usage")?.addEventListener("click", async () => { try { const query = new URLSearchParams({path:activeListing.path, timeout_seconds:"60"}); const result = await api(`/api/hosts/${state.fileHostId}/files/usage?${query}`); const output = $("#file-scan-output"); output.className = "scan-result-host"; output.innerHTML = scanResultMarkup(result, "usage"); output.hidden = false; } catch (error) { toast(error.message, "error"); } });
+  $("#file-large-scan")?.addEventListener("click", async () => { try { const query = new URLSearchParams({path:activeListing.path, minimum_bytes:String(1024 * 1024 * 1024), limit:"100", max_depth:"8", timeout_seconds:"60"}); const result = await api(`/api/hosts/${state.fileHostId}/files/large-files?${query}`); const output = $("#file-scan-output"); output.className = "scan-result-host"; output.innerHTML = scanResultMarkup(result, "large"); output.hidden = false; } catch (error) { toast(error.message, "error"); } });
   $$('[data-file-open]').forEach((button) => { button.onclick = () => {
     const row = button.closest("tr");
     if (row?.dataset.fileType === "directory") { state.filePath = button.dataset.fileOpen; renderFiles(); }

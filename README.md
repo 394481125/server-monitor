@@ -42,6 +42,45 @@ docker compose logs -f server-monitor
 
 健康状态变为 `healthy` 后访问 `http://服务器地址:8000`，用户名是 `admin`。首次登录会要求修改密码；改密完成后应删除 `.env` 中的 `SERVER_MONITOR_INITIAL_PASSWORD`，再执行 `docker compose up -d`。数据库和 `master.key` 保存在 Docker 命名卷 `server-monitor-data` 中，删除容器不会丢失，禁止使用 `docker compose down -v`，除非明确要删除全部业务数据。
 
+### 二次启动与异常恢复
+
+以后每次都先进入项目目录。服务器重启、Docker 重启、程序异常退出或容器停止后，统一执行：
+
+```bash
+cd <仓库名>
+docker compose up -d
+docker compose ps
+```
+
+`docker compose up -d` 是推荐的通用恢复命令：容器不存在时会重新创建，容器已停止时会重新启动，容器正在运行时不会清空数据。Compose 已配置 `restart: unless-stopped`，正常情况下服务器或 Docker 服务重启后容器会自动恢复；没有自动恢复时仍执行上面的命令。
+
+常用运维命令：
+
+```bash
+# 查看运行状态
+docker compose ps
+
+# 查看最近日志并持续跟踪，按 Ctrl+C 只退出日志界面，不会停止服务
+docker compose logs --tail=100 -f server-monitor
+
+# 重启应用
+docker compose restart server-monitor
+
+# 手动停止
+docker compose stop
+
+# 停止后再次启动
+docker compose up -d
+```
+
+只有拉取了新代码、修改了依赖或 Dockerfile 时才需要重新构建：
+
+```bash
+docker compose up -d --build
+```
+
+数据库和主密钥保存在命名卷中。普通的 `stop`、`restart`、`down` 和 `up` 不会删除它们；不要执行 `docker compose down -v`，该命令会删除全部持久化业务数据。
+
 升级代码：
 
 ```bash
@@ -62,10 +101,8 @@ python3 -m venv --copies .venv
 .venv/bin/python -m pip install -r requirements.lock
 .venv/bin/python -m pip check
 
-export SERVER_MONITOR_DATA_DIR="$PWD/data"
-export SERVER_MONITOR_INITIAL_PASSWORD='Replace-With-A-Long-Initial-Password'
-export SERVER_MONITOR_BIND=127.0.0.1:8000
-.venv/bin/python -m gunicorn -c gunicorn.conf.py monitor.wsgi:app
+# 第一次启动需要设置一次性管理员初始密码
+SERVER_MONITOR_INITIAL_PASSWORD='Replace-With-A-Long-Initial-Password' bash scripts/start_ubuntu.sh
 ```
 
 另开终端确认：
@@ -75,6 +112,39 @@ curl http://127.0.0.1:8000/health
 ```
 
 返回 `{"background":true,"status":"ok"}` 后访问 `http://127.0.0.1:8000`。首次登录用户是 `admin`，首次登录必须改密码。`SERVER_MONITOR_INITIAL_PASSWORD` 只在第一次创建管理员时读取，不会覆盖已有密码。
+
+### Ubuntu 二次启动与异常恢复
+
+上面的脚本以前台方式运行，按 `Ctrl+C`、关闭终端或进程异常会停止服务。首次管理员已经创建后，不再需要提供初始密码；以后在项目根目录直接执行：
+
+```bash
+bash scripts/start_ubuntu.sh
+```
+
+脚本会继续使用项目下的 `data/` 数据库和 `master.key`，不会重建管理员或清空数据。默认监听 `127.0.0.1:8000`；需要临时修改监听地址时可以执行：
+
+```bash
+SERVER_MONITOR_BIND=0.0.0.0:8000 bash scripts/start_ubuntu.sh
+```
+
+正式长期运行建议按 [部署文档](docs/DEPLOYMENT.md) 配置 systemd。配置完成后，服务器重启会自动启动；日常只使用：
+
+```bash
+# 启动
+sudo systemctl start server-monitor
+
+# 停止
+sudo systemctl stop server-monitor
+
+# 重启
+sudo systemctl restart server-monitor
+
+# 查看状态
+sudo systemctl status server-monitor --no-pager
+
+# 查看日志
+sudo journalctl -u server-monitor -n 100 -f
+```
 
 忘记已改过的管理员密码时，停止服务后运行：
 

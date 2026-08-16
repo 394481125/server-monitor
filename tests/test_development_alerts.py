@@ -168,8 +168,26 @@ def test_directory_scans_quote_path_and_sort_results():
     assert service.directory_usage({}, "/srv/data")["bytes"] == 4096
     result = service.large_files({}, "/srv/data", 1024 * 1024, 10)
     assert [item["path"] for item in result["items"]] == ["/srv/data/b", "/srv/data/a"]
+    assert "du -s -x -B1 --apparent-size" in runs.commands[0]
+    assert "timeout --signal=TERM --kill-after=2s 60s" in runs.commands[0]
+    assert "-xdev -maxdepth 8" in runs.commands[1]
     with pytest.raises(OperationError):
         service.large_files({}, "/srv/data\nreboot", 1024 * 1024, 10)
+
+
+def test_directory_scans_return_partial_results_after_remote_soft_timeout():
+    runs = FakeRuns([
+        "__SM_SCAN_STATUS__\t124\n",
+        "104857600\t1.0\t/srv/data/model.bin\x00__SM_SCAN_STATUS__\t124\x00",
+    ])
+    service = DevelopmentService(runs, FakeConfig())
+    usage = service.directory_usage({}, "/srv/data", 30)
+    assert usage["bytes"] is None
+    assert usage["partial"] is True and usage["timed_out"] is True
+    result = service.large_files({}, "/srv/data", 1024 * 1024, 25, 4, 30)
+    assert result["items"][0]["path"] == "/srv/data/model.bin"
+    assert result["partial"] is True and result["timed_out"] is True
+    assert result["max_depth"] == 4 and result["timeout_seconds"] == 30
 
 
 def test_conda_yaml_export_and_rebuild_plan_are_bounded():
@@ -226,8 +244,8 @@ def test_development_and_storage_routes_enforce_elevation(client, app, admin, mo
     service = app.extensions["development"]
     monkeypatch.setattr(service, "development_stack", lambda _host: {"os": {"id": "ubuntu"}})
     monkeypatch.setattr(service, "gpu_diagnostics", lambda _host: {"available": True, "gpus": []})
-    monkeypatch.setattr(service, "directory_usage", lambda _host, path: {"path": path, "bytes": 123})
-    monkeypatch.setattr(service, "large_files", lambda _host, path, minimum, limit: {"path": path, "minimum_bytes": int(minimum), "items": []})
+    monkeypatch.setattr(service, "directory_usage", lambda _host, path, timeout: {"path": path, "bytes": 123, "timeout_seconds": int(timeout)})
+    monkeypatch.setattr(service, "large_files", lambda _host, path, minimum, limit, depth, timeout: {"path": path, "minimum_bytes": int(minimum), "items": [], "max_depth": int(depth), "timeout_seconds": int(timeout)})
     monkeypatch.setattr(service, "execute_environment_plan", lambda _host, payload: {"ok": True, "stdout": "done", "stderr": "", "plan": {"backend": "venv", "action": payload["action"]}})
 
     assert client.get(f"/api/hosts/{host['id']}/development/stack").status_code == 200

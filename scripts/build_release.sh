@@ -59,6 +59,7 @@ deploy_files=(
     docs/DEPLOYMENT.md
     scripts/reset_admin_password.py
     scripts/quick_start.sh
+    scripts/start_ubuntu.sh
 )
 if [[ -f "${project_root}/LICENSE" ]]; then
     source_files+=(LICENSE)

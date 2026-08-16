@@ -1076,7 +1076,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @app.get("/api/hosts/<int:host_id>/files/usage")
     @login_required(permission="storage.scan")
     def directory_usage(host_id: int):
-        return jsonify(development.directory_usage(file_host(host_id), request.args.get("path", "")))
+        return jsonify(development.directory_usage(
+            file_host(host_id), request.args.get("path", ""), request.args.get("timeout_seconds", 60),
+        ))
 
     @app.get("/api/hosts/<int:host_id>/files/large-files")
     @login_required(permission="storage.scan")
@@ -1084,6 +1086,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         return jsonify(development.large_files(
             file_host(host_id), request.args.get("path", ""),
             request.args.get("minimum_bytes", 1024 * 1024 * 1024), request.args.get("limit", 100),
+            request.args.get("max_depth", 8), request.args.get("timeout_seconds", 60),
         ))
 
     @app.post("/api/hosts/<int:host_id>/tools/<tool>/install")
