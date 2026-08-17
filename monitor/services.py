@@ -611,9 +611,11 @@ class HistoryService:
         metric_before = utc_iso(now - timedelta(days=metric_retention_days))
         log_before = utc_iso(now - timedelta(days=log_retention_days))
         collection_before = utc_iso(now - timedelta(minutes=collection_task_retention_minutes))
+        session_before = utc_iso(now)
         with self.database.transaction() as connection:
             metrics = connection.execute("DELETE FROM metric_points WHERE ts<?", (metric_before,)).rowcount
             logs = connection.execute("DELETE FROM audit_logs WHERE ts<?", (log_before,)).rowcount
+            sessions = connection.execute("DELETE FROM sessions WHERE expires_at<?", (session_before,)).rowcount
             collection_tasks = connection.execute("DELETE FROM tasks WHERE task_type='collection' AND created_at<?", (collection_before,)).rowcount
             schedule_jobs = connection.execute(
                 "DELETE FROM schedule_jobs WHERE state NOT IN ('running','retry_wait') AND COALESCE(finished_at,started_at)<?",
@@ -625,6 +627,7 @@ class HistoryService:
         return {
             "metrics": metrics,
             "logs": logs,
+            "sessions": sessions,
             "collection_tasks": collection_tasks,
             "schedule_jobs": schedule_jobs,
             "notifications": notifications,

@@ -10,6 +10,7 @@ services:
       SERVER_MONITOR_DATA_DIR: /var/lib/server-monitor
       SERVER_MONITOR_INITIAL_PASSWORD: "${SERVER_MONITOR_INITIAL_PASSWORD:-}"
       SERVER_MONITOR_HTTPS: "${SERVER_MONITOR_HTTPS:-0}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     volumes:
       - server-monitor-data:/var/lib/server-monitor
     healthcheck:

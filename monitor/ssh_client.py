@@ -5,8 +5,10 @@ import base64
 import hashlib
 import socket
 import threading
+import time
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import paramiko
 
@@ -216,3 +218,149 @@ class SSHClient:
         if self.client:
             self.client.close()
             self.client = None
+
+    def is_reusable(self) -> bool:
+        if not self.client:
+            return False
+        transport = self.client.get_transport()
+        return bool(transport and transport.is_active())
+
+
+@dataclass
+class _IdleConnection:
+    key: tuple[Any, ...]
+    host_id: Any
+    client: SSHClient
+    released_at: float
+
+
+class SSHConnectionLease(AbstractContextManager[SSHClient]):
+    def __init__(self, pool: "SSHConnectionPool", key: tuple[Any, ...], host_id: Any, client: SSHClient):
+        self.pool = pool
+        self.key = key
+        self.host_id = host_id
+        self.client = client
+        self.closed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.client, name)
+
+    def __enter__(self) -> SSHClient:
+        return self.client
+
+    def __exit__(self, exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.close(discard=exc_type is not None)
+
+    def close(self, *, discard: bool = False) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.pool.release(self.key, self.host_id, self.client, discard=discard)
+
+
+class SSHConnectionPool:
+    """Thread-safe pool for idle Paramiko transports; a lease is never shared concurrently."""
+
+    def __init__(
+        self,
+        secret_box: Any,
+        settings_provider: Callable[[], dict[str, Any]],
+        *,
+        client_factory: Callable[[dict[str, Any], Any, dict[str, Any]], SSHClient] = SSHClient,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.secret_box = secret_box
+        self.settings_provider = settings_provider
+        self.client_factory = client_factory
+        self.clock = clock
+        self._idle: list[_IdleConnection] = []
+        self._lock = threading.RLock()
+        self._closed = False
+
+    @staticmethod
+    def _key(host: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            host.get("id"),
+            host.get("address"),
+            int(host.get("port") or 22),
+            host.get("username"),
+            host.get("auth_type"),
+            host.get("auth_secret"),
+            host.get("private_key"),
+            host.get("private_key_passphrase"),
+            host.get("fingerprint"),
+        )
+
+    def _prune_locked(self, settings: dict[str, Any], now: float) -> None:
+        idle_seconds = int(settings.get("ssh_idle_close", 60))
+        keep: list[_IdleConnection] = []
+        for entry in self._idle:
+            if now - entry.released_at >= idle_seconds or not entry.client.is_reusable():
+                entry.client.close()
+            else:
+                keep.append(entry)
+        self._idle = keep
+
+    def client(self, host: dict[str, Any]) -> SSHClient | SSHConnectionLease:
+        settings = self.settings_provider()
+        if not settings.get("ssh_reuse", True):
+            return self.client_factory(host, self.secret_box, settings)
+        key = self._key(host)
+        host_id = host.get("id")
+        now = self.clock()
+        with self._lock:
+            if self._closed:
+                return self.client_factory(host, self.secret_box, settings)
+            self._prune_locked(settings, now)
+            reusable: SSHClient | None = None
+            retained: list[_IdleConnection] = []
+            for entry in self._idle:
+                if entry.host_id == host_id and entry.key != key:
+                    entry.client.close()
+                elif reusable is None and entry.key == key:
+                    reusable = entry.client
+                else:
+                    retained.append(entry)
+            self._idle = retained
+        client = reusable or self.client_factory(host, self.secret_box, settings)
+        return SSHConnectionLease(self, key, host_id, client)
+
+    def release(
+        self,
+        key: tuple[Any, ...],
+        host_id: Any,
+        client: SSHClient,
+        *,
+        discard: bool = False,
+    ) -> None:
+        settings = self.settings_provider()
+        with self._lock:
+            if self._closed or discard or not settings.get("ssh_reuse", True) or not client.is_reusable():
+                client.close()
+                return
+            self._prune_locked(settings, self.clock())
+            self._idle.append(_IdleConnection(key, host_id, client, self.clock()))
+            maximum = max(1, int(settings.get("ssh_concurrency", 10)))
+            while len(self._idle) > maximum:
+                self._idle.pop(0).client.close()
+
+    def close_host(self, host_id: Any) -> None:
+        with self._lock:
+            retained: list[_IdleConnection] = []
+            for entry in self._idle:
+                if entry.host_id == host_id:
+                    entry.client.close()
+                else:
+                    retained.append(entry)
+            self._idle = retained
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            idle, self._idle = self._idle, []
+        for entry in idle:
+            entry.client.close()
+
+    def idle_count(self) -> int:
+        with self._lock:
+            return len(self._idle)

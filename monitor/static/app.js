@@ -8,6 +8,8 @@ const state = {
   alertTimer: null,
   platformTimer: null,
   lastAlertId: null,
+  alertNotifiedKeys: new Set(),
+  openGpuDetail: null,
   refreshMs: 5000,
   timeZone: "Asia/Shanghai",
   dashboardFilters: {search: "", status: "", tags: [], gpu_user: ""},
@@ -40,7 +42,7 @@ const pagePermissions = {dashboard:"page.dashboard", hosts:"page.hosts", files:"
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-const esc = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
+const {escapeHtml:esc, formatBytes:fmtBytes, formatPercentage:percentage, formatDuration:duration, formatShortDuration:shortDuration, dashboardMatches, normalizeBenchmark} = window.ServerMonitorLogic;
 const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 const isAdmin = () => state.user?.role === "admin";
 const can = (permission) => isAdmin() || Boolean(state.user?.permissions?.includes(permission));
@@ -57,28 +59,6 @@ function fmtTime(value) {
   } catch (_) {
     return new Date(value).toLocaleString("zh-CN");
   }
-}
-
-function fmtBytes(value, suffix = "") {
-  if (value == null || Number.isNaN(Number(value))) return "未知";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let index = 0;
-  let current = Number(value);
-  while (Math.abs(current) >= 1024 && index < units.length - 1) { current /= 1024; index += 1; }
-  return `${current.toFixed(index ? 1 : 0)} ${units[index]}${suffix}`;
-}
-
-function percentage(value, waiting = "未知") {
-  return value == null ? waiting : `${Number(value).toFixed(1)}%`;
-}
-
-function duration(seconds) {
-  if (seconds == null) return "未知";
-  const total = Math.max(0, Math.floor(Number(seconds)));
-  const days = Math.floor(total / 86400);
-  const hours = Math.floor((total % 86400) / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  return days ? `${days} 天 ${hours} 小时` : hours ? `${hours} 小时 ${minutes} 分钟` : `${minutes} 分钟`;
 }
 
 async function api(path, options = {}) {
@@ -102,17 +82,6 @@ async function api(path, options = {}) {
     throw error;
   }
   return result;
-}
-
-function shortDuration(seconds) {
-  const total = Math.max(0, Math.floor(Number(seconds) || 0));
-  const days = Math.floor(total / 86400);
-  const hours = Math.floor((total % 86400) / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  if (days) return `${days}天${hours}小时`;
-  if (hours) return `${hours}小时${minutes}分`;
-  if (minutes) return `${minutes}分${total % 60}秒`;
-  return `${total}秒`;
 }
 
 function startOperationProgress(label, {target = null, timeoutSeconds = null} = {}) {
@@ -289,6 +258,7 @@ function acceptUser(user) {
   $("#login-view").hidden = true;
   $("#app-view").hidden = false;
   state.lastAlertId = null;
+  state.alertNotifiedKeys.clear();
   const firstPage = ["dashboard", "hosts", "files", "environments", "jobs", "alerts", "logs", "settings", "permissions"].find(canShowPage) || "permissions";
   navigate(firstPage);
   if (can("page.alerts")) {
@@ -304,14 +274,19 @@ function acceptUser(user) {
 async function pollAlerts() {
   try {
     const result = await api("/api/alerts?page_size=20");
-    const active = result.items.filter((item) => item.state === "active" && !item.acknowledged_at);
+    const notificationsEnabled = result.toast_enabled !== false;
+    const active = notificationsEnabled ? result.items.filter((item) => item.state === "active" && !item.acknowledged_at && !item.cleared_at) : [];
     const badge = $("#alert-count");
     badge.textContent = String(Math.min(active.length, 99));
     badge.hidden = active.length === 0;
     const newest = Math.max(0, ...result.items.map((item) => item.id));
+    result.items.filter((item) => item.state === "recovered").forEach((item) => state.alertNotifiedKeys.delete(item.alert_key || `${item.host_id || "platform"}:${item.alert_type}`));
     if (state.lastAlertId != null) {
-      result.items.filter((item) => item.id > state.lastAlertId && item.state === "active" && !item.acknowledged_at).reverse().forEach((item) => {
-        if (result.toast_enabled) toast(item.summary, item.severity === "critical" ? "error" : "warning");
+      result.items.filter((item) => item.id > state.lastAlertId && item.state === "active" && !item.acknowledged_at && !item.cleared_at).reverse().forEach((item) => {
+        const alertKey = item.alert_key || `${item.host_id || "platform"}:${item.alert_type}`;
+        if (!notificationsEnabled || state.alertNotifiedKeys.has(alertKey)) return;
+        state.alertNotifiedKeys.add(alertKey);
+        toast(item.summary, item.severity === "critical" ? "error" : "warning");
         if ("Notification" in window && Notification.permission === "granted") {
           const notification = new Notification(item.severity === "critical" ? "Server Monitor 严重告警" : "Server Monitor 告警", {
             body: item.summary,
@@ -325,6 +300,16 @@ async function pollAlerts() {
     state.lastAlertId = Math.max(state.lastAlertId || 0, newest);
   } catch (error) {
     if (error.status === 401) showLogin();
+  }
+}
+
+async function updateAlertNotificationSetting(enabled) {
+  try {
+    return await api("/api/alerts/notification-setting", {method:"PATCH", body:{enabled}});
+  } catch (error) {
+    // Older deployments may still expose only the general settings endpoint.
+    if (error.status !== 404) throw error;
+    return api("/api/settings", {method:"PATCH", body:{toast_enabled:enabled}});
   }
 }
 
@@ -404,26 +389,33 @@ function gpuCardSummary(gpus, settings) {
     const hasProcesses = Array.isArray(gpu.processes) && gpu.processes.length > 0;
     const busy = hasProcesses || (utilization != null && utilization >= utilThreshold) || (memory != null && memory >= memoryThreshold);
     const state = busy ? "busy" : utilization != null && memory != null ? "idle" : "unknown";
-    const processLines = (gpu.processes || []).flatMap((process, position) => [
-      `进程 ${position + 1}：PID ${process.pid ?? "?"}${process.pid_exists === false ? "（PID 已不存在）" : ""}`,
-      `用户：${process.user || "unknown"} · 显存：${process.memory_mib ?? "?"} MiB`,
-      `工作目录：${process.cwd || "无权限/不可用"}`,
-      `命令：${process.command || process.name || "未知"}`,
-    ]);
-    const title = [
-      `GPU ${gpu.index ?? "?"} · ${gpu.name || "未知型号"}`,
-      `利用率：${percentage(utilization)} · 显存：${gpu.memory_used_mib ?? "?"} / ${gpu.memory_total_mib ?? "?"} MiB（${percentage(memory)}）`,
-      hasProcesses ? `${gpu.processes.length} 个计算进程` : "暂无可归属的计算进程",
-      ...processLines,
-    ].join("\n");
     summary[state] += 1;
     summary.devices.push({
       index: gpu.index ?? "?",
       state,
-      title,
+      name: gpu.name || "未知型号",
+      utilization,
+      memory,
+      memoryUsedMib: gpu.memory_used_mib,
+      memoryTotalMib: gpu.memory_total_mib,
+      processes: Array.isArray(gpu.processes) ? gpu.processes : [],
     });
   }
   return summary;
+}
+
+function gpuDetailMarkup(hostId, gpu, position) {
+  const detailKey = `${hostId}:${position}`;
+  const detailId = `gpu-detail-${hostId}-${position}`;
+  const expanded = state.openGpuDetail === detailKey;
+  const processRows = gpu.processes.length ? gpu.processes.map((process) => `<div class="gpu-card-process">
+      <div><strong>PID ${esc(process.pid ?? "?")}${process.pid_exists === false ? "（已不存在）" : ""}</strong><span>${esc(process.user || "unknown")} · ${esc(process.memory_mib ?? "?")} MiB</span></div>
+      <dl><div><dt>工作目录</dt><dd class="mono">${esc(process.cwd || "无权限/不可用")}</dd></div><div><dt>命令</dt><dd class="mono">${esc(process.command || process.name || "未知")}</dd></div></dl>
+    </div>`).join("") : '<div class="card-section-empty">暂无可归属的 GPU 计算进程</div>';
+  return {
+    button: `<button type="button" class="gpu-device ${gpu.state}" data-gpu-detail-toggle="${esc(detailKey)}" aria-controls="${esc(detailId)}" aria-expanded="${expanded}">GPU ${esc(gpu.index)}</button>`,
+    panel: `<div class="gpu-card-detail" id="${esc(detailId)}" data-gpu-detail="${esc(detailKey)}" ${expanded ? "" : "hidden"}><header><div><strong>GPU ${esc(gpu.index)} · ${esc(gpu.name)}</strong><span>利用率 ${percentage(gpu.utilization)} · 显存 ${esc(gpu.memoryUsedMib ?? "?")} / ${esc(gpu.memoryTotalMib ?? "?")} MiB（${percentage(gpu.memory)}）</span></div><span>${gpu.processes.length} 个进程</span></header>${processRows}</div>`,
+  };
 }
 
 function physicalDisks(data) {
@@ -456,6 +448,7 @@ function hostCard(item, settings) {
   const memory = data.memory || {};
   const gpuUsers = [...new Set(gpus.flatMap((gpu) => (gpu.processes || []).map((process) => String(process.user || "unknown"))))];
   const gpuFallback = data.tools?.["nvidia-smi"] === "未安装" ? "未安装" : "无 GPU";
+  const gpuDetails = gpuSummary.devices.map((gpu, position) => gpuDetailMarkup(host.id, gpu, position));
   return `<article class="host-card" data-host-status="${esc(host.status || "unknown")}" data-host-search="${esc([host.name, host.address, ...(host.tags || [])].join(" ").toLowerCase())}" data-host-tags="${esc(JSON.stringify(host.tags || []))}" data-gpu-users="${esc(JSON.stringify(gpuUsers))}">
     <div class="host-head"><div><h3>${esc(host.name)}</h3><p title="${esc(`${host.address}:${host.port} · ${host.username}`)}">${esc(host.address)}:${host.port} · ${esc(host.username)}</p></div><span class="status ${esc(host.status || "unknown")}" title="${esc(host.last_error || statusName(host))}">${statusName(host)}</span></div>
     <div class="tag-line">${(host.tags || []).map((tag) => `<span class="tag">${esc(tag)}</span>`).join("") || '<span class="hint">无标签</span>'}</div>
@@ -466,7 +459,7 @@ function hostCard(item, settings) {
       <div class="resource-stat"><span>硬盘</span><strong>${disks.length ? `${disks.length} 块` : "待采样"}</strong><small>${diskCapacity ? fmtBytes(diskCapacity) : `${filesystems.length || 0} 挂载点`}</small></div>
     </div>
     <div class="metrics">${metricBar(`CPU 使用率${cpuCores == null ? "" : ` · ${cpuCores} 逻辑核`}`, data.cpu?.usage_percent, settings, "待采样")}${metricBar(`内存 · ${memory.used == null || memory.total == null ? "容量待采样" : `${fmtBytes(memory.used)} / ${fmtBytes(memory.total)}`}`, memory.usage_percent, settings, "待采样")}</div>
-    <section class="card-section gpu-overview"><header><span>GPU 状态</span><strong>${gpus.length ? `${gpuSummary.busy} 使用中 · ${gpuSummary.idle} 空闲${gpuSummary.unknown ? ` · ${gpuSummary.unknown} 未知` : ""}` : gpuFallback}</strong></header>${gpus.length ? `<div class="gpu-device-list">${gpuSummary.devices.map((gpu) => `<span class="gpu-device ${gpu.state}" title="${esc(gpu.title)}" aria-label="${esc(gpu.title)}" tabindex="0">GPU ${esc(gpu.index)}</span>`).join("")}</div>` : '<div class="card-section-empty">NVIDIA 指标将在采样后显示</div>'}</section>
+    <section class="card-section gpu-overview"><header><span>GPU 状态</span><strong>${gpus.length ? `${gpuSummary.busy} 使用中 · ${gpuSummary.idle} 空闲${gpuSummary.unknown ? ` · ${gpuSummary.unknown} 未知` : ""}` : gpuFallback}</strong></header>${gpus.length ? `<div class="gpu-device-list">${gpuDetails.map((item) => item.button).join("")}</div><div class="gpu-detail-list">${gpuDetails.map((item) => item.panel).join("")}</div>` : '<div class="card-section-empty">NVIDIA 指标将在采样后显示</div>'}</section>
     <section class="card-section storage-overview"><header><span>存储容量</span><strong>${disks.length ? `${disks.length} 块盘 · ${filesystems.length} 挂载点` : `${filesystems.length || 0} 个挂载点`}</strong></header>${storageUsageRows(filesystems, settings)}</section>
     <div class="host-foot"><span>最后成功 ${fmtTime(host.last_success_at)}</span><span>${can("host.refresh") && host.enabled ? `<button data-refresh="${host.id}" title="提交一次采集任务">刷新</button>` : ""}<button data-detail="${host.id}">详情</button></span></div>
   </article>`;
@@ -474,13 +467,12 @@ function hostCard(item, settings) {
 
 function applyDashboardFilters() {
   $$(".host-card").forEach((card) => {
-    const matchesText = !state.dashboardFilters.search || card.dataset.hostSearch.includes(state.dashboardFilters.search);
-    const matchesStatus = !state.dashboardFilters.status || card.dataset.hostStatus === state.dashboardFilters.status;
-    const tags = JSON.parse(card.dataset.hostTags || "[]");
-    const users = JSON.parse(card.dataset.gpuUsers || "[]");
-    const matchesTags = !state.dashboardFilters.tags.length || state.dashboardFilters.tags.every((tag) => tags.includes(tag));
-    const matchesGpuUser = !state.dashboardFilters.gpu_user || users.includes(state.dashboardFilters.gpu_user);
-    card.hidden = !(matchesText && matchesStatus && matchesTags && matchesGpuUser);
+    card.hidden = !dashboardMatches(state.dashboardFilters, {
+      search: card.dataset.hostSearch,
+      status: card.dataset.hostStatus,
+      tags: JSON.parse(card.dataset.hostTags || "[]"),
+      gpuUsers: JSON.parse(card.dataset.gpuUsers || "[]"),
+    });
   });
 }
 
@@ -533,7 +525,7 @@ async function renderDashboard(backgroundRefresh = false) {
       <label>快捷视图<select id="dashboard-saved-view"><option value="">选择视图</option>${views.map((view) => `<option value="${view.id}">${esc(view.name)}</option>`).join("")}</select></label>
       <div class="toolbar-group"><button id="save-dashboard-view" title="保存当前筛选条件">保存视图</button><button id="delete-dashboard-view" class="danger-quiet" ${views.length ? "" : "disabled"}>删除视图</button>${can("host.manage") ? '<button id="add-host" class="primary"><span aria-hidden="true">+</span> 添加主机</button>' : ""}</div>
     </div>
-    ${(result.gpu_users || []).length ? `<section class="section gpu-user-summary"><div class="section-title"><div><h3>GPU 用户占用</h3><p class="hint">卡数按用户出现计算进程的唯一 GPU 统计，同卡多个进程不会重复计卡。</p></div></div>${textTable(["Linux 用户","占用 GPU","进程数","显存合计","涉及主机"], result.gpu_users.map((item) => [item.username,`${item.gpu_count} 张`,item.process_count,`${Number(item.memory_mib).toFixed(1)} MiB`,item.hosts.join("、")]))}</section>` : ""}
+    ${(result.gpu_users || []).length ? `<details class="gpu-user-summary"><summary><strong>GPU 用户占用</strong><span>${result.gpu_users.length} 个用户 · ${result.gpu_users.reduce((total, item) => total + Number(item.process_count || 0), 0)} 个进程 · 点击查看汇总</span></summary><div class="gpu-user-summary-body">${textTable(["Linux 用户","占用 GPU","进程数","显存合计","涉及主机"], result.gpu_users.map((item) => [item.username,`${item.gpu_count} 张`,item.process_count,`${Number(item.memory_mib).toFixed(1)} MiB`,item.hosts.join("、")]))}</div></details>` : ""}
     ${items.length ? `<div class="host-grid">${items.map((item) => hostCard(item, result.settings)).join("")}</div>` : '<div class="empty"><div><strong>尚未添加主机</strong>添加第一台 Linux 服务器后，采集状态会显示在这里。</div></div>'}`;
   $("#dashboard-status").value = state.dashboardFilters.status;
   bindHostLinks();
@@ -550,6 +542,12 @@ async function renderDashboard(backgroundRefresh = false) {
   });
   $("#save-dashboard-view")?.addEventListener("click", () => saveDashboardView().catch((error) => toast(error.message, "error")));
   $("#delete-dashboard-view")?.addEventListener("click", () => deleteDashboardView(views).catch((error) => toast(error.message, "error")));
+  $$('[data-gpu-detail-toggle]').forEach((button) => button.addEventListener("click", () => {
+    const detailKey = button.dataset.gpuDetailToggle;
+    state.openGpuDetail = state.openGpuDetail === detailKey ? null : detailKey;
+    $$('[data-gpu-detail-toggle]').forEach((item) => item.setAttribute("aria-expanded", String(item.dataset.gpuDetailToggle === state.openGpuDetail)));
+    $$('[data-gpu-detail]').forEach((panel) => { panel.hidden = panel.dataset.gpuDetail !== state.openGpuDetail; });
+  }));
   $$('[data-summary-status]').forEach((button) => button.addEventListener("click", () => {
     const selected = button.dataset.summaryStatus;
     state.dashboardFilters.status = ["attention", "failed"].includes(selected) ? "" : selected;
@@ -1003,6 +1001,28 @@ function developmentOutput(root, title, value, isError = false) {
   output.hidden = false;
 }
 
+function gpuBenchmarkMarkup(record) {
+  const result = record?.result || record || {};
+  const normalized = normalizeBenchmark(result);
+  const training = result.training || {};
+  const collective = result.collective;
+  const matrixRows = normalized.matrix.map((item) => `<tr><td>${esc(item.precision)}</td><td>${esc(item.aggregate ?? "-")} ${esc(item.unit)}</td><td>${item.perGpu.map((gpu) => `GPU ${esc(gpu.device)}: ${esc(gpu.value)} ${esc(item.unit)}`).join(" · ")}</td></tr>`).join("");
+  const memoryRows = (result.memory_bandwidth || []).map((item) => `<tr><td>GPU ${esc(item.device)}</td><td>${esc(item.gbps)} GB/s</td><td>${fmtBytes(item.bytes)}</td></tr>`).join("");
+  const warnings = result.warnings || [];
+  return `<div class="benchmark-result"><div class="kv-grid"><div class="kv"><small>模式 / GPU</small><strong>${normalized.mode === "multi" ? "多卡" : "单卡"} · ${esc(normalized.gpuCount || "-")} 张</strong></div><div class="kv"><small>训练模型</small><strong>${esc(normalized.training.model || "-")}</strong><div class="hint">${esc(normalized.training.dataset)}</div></div><div class="kv"><small>训练吞吐</small><strong>${esc(normalized.training.iterationsPerSecond ?? "-")} it/s</strong><div class="hint">${esc(normalized.training.imagesPerSecond ?? "-")} images/s</div></div><div class="kv"><small>快速 loss / acc</small><strong>${esc(normalized.training.loss ?? "-")} / ${normalized.training.accuracy == null ? "-" : percentage(Number(normalized.training.accuracy) * 100)}</strong></div><div class="kv"><small>NCCL All-Reduce</small><strong>${collective?.available ? `${esc(collective.bus_gbps)} GB/s` : (normalized.mode === "multi" ? "不可用" : "单卡无需测试")}</strong><div class="hint">${collective?.available ? `算法带宽 ${esc(collective.algorithm_gbps)} GB/s` : esc(collective?.reason || "-")}</div></div><div class="kv"><small>Tensor Parallel</small><strong>TP=${esc(normalized.tpDegree || "-")}</strong><div class="hint">${normalized.tp8Ready ? "满足 TP=8 卡数条件" : "不足 8 张卡"}</div></div></div><div class="hint">${esc(training.accuracy_note || "短时结果只用于快速横向比较")}</div>${matrixRows ? `<div class="table-wrap"><table><thead><tr><th>精度</th><th>聚合吞吐</th><th>逐卡结果</th></tr></thead><tbody>${matrixRows}</tbody></table></div>` : '<div class="notice-panel">没有成功完成的矩阵精度项，请查看警告。</div>'}${memoryRows ? `<div class="table-wrap"><table><thead><tr><th>GPU</th><th>显存拷贝带宽</th><th>测试块</th></tr></thead><tbody>${memoryRows}</tbody></table></div>` : ""}${warnings.length ? `<div class="notice-panel">${warnings.map((warning) => `<div>${esc(warning)}</div>`).join("")}</div>` : ""}</div>`;
+}
+
+async function loadGpuBenchmarkHistory(host, root) {
+  const target = $("[data-gpu-benchmark-history]", root);
+  if (!target || !can("diagnostics.view")) return;
+  try {
+    const history = await api(`/api/hosts/${host.id}/development/gpu-benchmarks?limit=5`);
+    target.innerHTML = history.items.length ? history.items.map((item, index) => `<details ${index === 0 ? "open" : ""}><summary>${fmtTime(item.created_at)} · ${item.mode === "multi" ? "多卡" : "单卡"} · ${esc(item.result?.training?.model || "-")} · ${esc(item.gpu_count)} GPU</summary>${gpuBenchmarkMarkup(item)}</details>`).join("") : '<div class="hint">尚无 GPU 快速评估记录</div>';
+  } catch (error) {
+    target.innerHTML = `<div class="error-panel">${esc(error.message)}</div>`;
+  }
+}
+
 function scanStatusLabel(result) {
   if (result?.timed_out) return '<span class="status degraded">已超时，返回部分结果</span>';
   if (result?.partial) return '<span class="status degraded">部分结果</span>';
@@ -1068,6 +1088,7 @@ async function renderDevelopmentPanel(host, root) {
     const scanSettings = await scanSettingsRequest;
     const scanRoot = developmentRootFor(host);
     root.innerHTML = `<section class="section"><div class="section-title"><div><h3>GPU 软件栈现状</h3><p class="hint">当前目标：${esc(host.username)}@${esc(host.address)} · 驱动、CUDA、cuDNN 只生成可审阅方案，不直接修改系统。</p></div><div class="toolbar-group">${can("development.view") ? '<button data-dev-refresh>刷新盘点</button>' : ""}${can("diagnostics.view") ? '<button data-dev-gpu>GPU 健康自检</button>' : ""}</div></div>${developmentStackSummary(stack)}<pre class="diagnostic-output" data-dev-output hidden></pre></section>
+      ${can("diagnostics.view") ? `<section class="section"><div class="section-title"><div><h3>GPU 快速评估</h3><p class="hint">覆盖 FP32、TF32、FP16、BF16、可用时的 FP8 E4M3/E5M2 和 INT8；多卡额外测试 DataParallel 与 NCCL。</p></div></div><form data-gpu-benchmark-form><div class="form-grid two"><label>模式<select name="mode"><option value="single">单卡</option><option value="multi">多卡（最多 8 张）</option></select></label><label>训练模型<select name="model"><option value="resnet18">ResNet-18</option><option value="resnet34">ResNet-34</option><option value="resnet50">ResNet-50</option><option value="mobilenet_v3_small">MobileNetV3-Small</option><option value="vit_tiny_patch16_224">ViT-Tiny / 224（timm）</option></select></label><label>数据集<select name="dataset"><option value="synthetic">GPU 合成数据（纯吞吐）</option><option value="fake_cifar10">FakeData-CIFAR10（轻量链路）</option><option value="cifar10">真实 CIFAR-10</option></select></label><label>单项时间预算<select name="duration_seconds"><option value="3">3 秒</option><option value="5" selected>5 秒</option><option value="10">10 秒</option><option value="20">20 秒</option><option value="30">30 秒</option></select></label><label>PyTorch Python<input name="python" value="python3" list="gpu-python-options-${host.id}" placeholder="python3 或 /opt/conda/envs/torch/bin/python"><datalist id="gpu-python-options-${host.id}">${(stack.python_versions || []).map((item) => `<option value="${esc(item.path || item.command)}"></option>`).join("")}</datalist></label><label data-gpu-download hidden><span>数据准备</span><span class="switch-control"><input type="checkbox" name="download_dataset"><span>允许首次下载 CIFAR-10</span></span></label></div><div class="action-strip">${can("gpu.benchmark") && host.allow_stress ? '<button type="submit" class="primary">开始评估</button>' : '<span class="hint">运行需要“GPU 快速评估”权限，且主机必须允许压力任务。</span>'}</div><div class="form-error" data-gpu-benchmark-error></div></form><div data-gpu-benchmark-history><div class="loading">正在读取评估历史</div></div></section>` : ""}
       ${can("development.view") ? `<section class="section"><div class="section-title"><div><h3>虚拟环境</h3><p class="hint">支持 venv、conda、uv；网页执行仅对创建和依赖安装开放，删除环境只生成脚本。</p></div><button data-dev-inventory>刷新环境列表</button></div><div class="toolbar-group"><label class="compact-field">扫描根目录<input data-dev-root value="${esc(scanRoot)}" placeholder="例如 /home/ops/projects"></label></div><div class="table-wrap"><table><thead><tr><th>后端</th><th>路径</th><th>Python / 主要包</th><th>操作</th></tr></thead><tbody data-dev-environments><tr><td colspan="4" class="hint">点击刷新环境列表</td></tr></tbody></table></div><form data-dev-environment-form class="settings-section"><h4>创建或管理环境</h4><div class="form-grid two"><label>后端<select name="backend"><option value="venv" ${stack.python_versions?.length ? "" : "disabled"}>venv（Python 自带）${stack.python_versions?.length ? "" : "（未检测到 Python 3）"}</option><option value="conda" ${stack.tools?.conda?.available ? "" : "disabled"}>conda${stack.tools?.conda?.available ? "" : "（未安装）"}</option><option value="uv" ${stack.tools?.uv?.available ? "" : "disabled"}>uv${stack.tools?.uv?.available ? "" : "（未安装）"}</option></select></label><label>操作<select name="action"><option value="create">创建环境</option><option value="install">安装依赖</option><option value="remove">删除环境（仅脚本）</option></select></label><label>目标路径<input name="path" value="${esc(`${scanRoot.replace(/\/$/, "")}/.venv`)}" required></label><label>Python 版本<select name="python">${developmentPythonOptions(stack)}<option value="">conda 默认</option></select></label><label>PyTorch 预设<select name="pytorch"><option value="none">不安装</option><option value="cpu">CPU</option><option value="cu118">CUDA 11.8</option><option value="cu121">CUDA 12.1</option><option value="cu124">CUDA 12.4</option></select></label><label>额外依赖（空格或逗号分隔）<input name="packages" placeholder="numpy pandas==2.2"></label></div><div class="action-strip">${can("development.plan") ? '<button type="button" data-dev-environment-plan>仅生成脚本</button>' : '<span class="hint">当前账号没有生成环境方案的权限</span>'}${can("development.execute") && host.allow_install ? '<button type="button" class="primary" data-dev-environment-execute>复核后网页执行</button>' : ""}</div><div class="form-error" data-dev-env-error></div></form>${can("development.plan") && host.allow_install ? '<form data-dev-conda-yaml-form class="settings-section"><h4>conda YAML 导入重建</h4><div class="form-grid two"><label>YAML 文件<input name="file" type="file" accept=".yml,.yaml,text/yaml,text/x-yaml" required></label><label>目标环境路径<input name="path" value="/home/' + esc(host.username) + '/conda-env" required></label></div><div class="action-strip"><button type="button" data-dev-conda-plan>仅生成脚本</button>' + (can("development.execute") ? '<button type="button" class="primary" data-dev-conda-execute>复核后网页执行</button>' : "") + '</div><div class="form-error" data-dev-conda-error></div></form>' : ""}</section>` : '<div class="notice-panel">当前账号只有 GPU 自检权限，开发环境盘点需管理员授权。</div>'}
       ${can("development.plan") && host.allow_install ? `<section class="section"><div class="section-title"><div><h3>GPU 驱动、CUDA、cuDNN 与 APT 方案</h3><p class="hint">先选方案类型，再填写对应参数；页面只生成可复核脚本，不直接执行系统级安装。</p></div></div><form data-dev-system-form><div class="form-grid two"><label>方案类型<select name="kind"><optgroup label="GPU 软件栈"><option value="gpu-driver">NVIDIA 驱动（推荐）</option><option value="cuda">CUDA Toolkit</option><option value="cudnn">cuDNN</option></optgroup><optgroup label="开发工具"><option value="uv-install">安装 uv</option><option value="conda-install">安装 Miniconda</option></optgroup><optgroup label="系统包管理"><option value="apt">APT 常用操作</option></optgroup></select></label><label data-system-field="gpu-driver">驱动包（推荐值）<input name="package" value="${esc(stack.gpu?.recommended_driver || "")}" placeholder="由 ubuntu-drivers 提供"></label><label data-system-field="cuda">CUDA 版本<select name="cuda_version"><option value="11.8">11.8</option><option value="12.1">12.1</option><option value="12.4">12.4</option></select></label><label data-system-field="cudnn">cuDNN 版本<select name="cudnn_version"><option value="9-cuda12">9 / CUDA 12</option><option value="8">8</option></select></label><label data-system-field="apt">APT 操作<select name="apt_action"><option value="update">update</option><option value="upgrade">upgrade</option><option value="autofix">autofix</option><option value="install">install</option><option value="remove">remove</option><option value="purge">purge</option></select></label><label data-system-field="apt">APT 包名<input name="apt_package" placeholder="例如 build-essential"></label></div><button class="primary" type="submit">生成方案脚本</button><div class="form-error" data-dev-system-error></div></form></section>` : ""}
       ${can("development.view") ? `<section class="section"><div class="section-title"><h3>APT 已安装包</h3><form data-dev-apt-search class="toolbar-group"><input name="search" placeholder="按包名筛选"><button>查询</button></form></div><div class="table-wrap"><table><thead><tr><th>包</th><th>版本</th><th>状态</th></tr></thead><tbody data-dev-packages><tr><td colspan="3" class="hint">输入条件查询，最多返回 200 项</td></tr></tbody></table></div></section>` : ""}
@@ -1075,6 +1096,32 @@ async function renderDevelopmentPanel(host, root) {
     `;
     $("[data-dev-refresh]", root)?.addEventListener("click", () => renderDevelopmentPanel(host, root));
     $("[data-dev-gpu]", root)?.addEventListener("click", async () => { try { developmentOutput(root, "GPU 健康自检", (await withOperationProgress("正在执行 GPU 健康自检", () => api(`/api/hosts/${host.id}/development/gpu-diagnostics`))).diagnostics); } catch (error) { developmentOutput(root, "GPU 自检失败", error.message, true); } });
+    const benchmarkForm = $("[data-gpu-benchmark-form]", root);
+    if (benchmarkForm) {
+      const datasetSelect = benchmarkForm.elements.dataset;
+      const updateDatasetControls = () => { $("[data-gpu-download]", benchmarkForm).hidden = datasetSelect.value !== "cifar10"; };
+      datasetSelect.addEventListener("change", updateDatasetControls);
+      updateDatasetControls();
+      benchmarkForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const form = event.target;
+        const errorNode = $("[data-gpu-benchmark-error]", form);
+        errorNode.textContent = "";
+        try {
+          await ensureElevated();
+          if (!confirm(`确认在 ${host.name} 上运行 GPU 快速评估？评估期间会产生明显 GPU 负载。`)) return;
+          const payload = {
+            mode: form.mode.value, model: form.model.value, dataset: form.elements.dataset.value,
+            duration_seconds: Number(form.duration_seconds.value), python: form.python.value.trim(),
+            download_dataset: form.download_dataset.checked,
+          };
+          await withOperationProgress("正在运行 GPU 快速评估", () => api(`/api/hosts/${host.id}/development/gpu-benchmarks`, {method:"POST", body:payload}));
+          toast("GPU 快速评估完成");
+          await loadGpuBenchmarkHistory(host, root);
+        } catch (error) { errorNode.textContent = error.message; }
+      });
+    }
+    loadGpuBenchmarkHistory(host, root);
     $("[data-dev-inventory]", root)?.addEventListener("click", async () => { try { const path = $("[data-dev-root]", root).value.trim(); state.developmentRoots[host.id] = path; const result = await withOperationProgress("正在盘点虚拟环境", () => api(`/api/hosts/${host.id}/development/environments?root=${encodeURIComponent(path)}`), {timeoutSeconds:scanSettings.environment_inventory_timeout}); $("[data-dev-environments]", root).innerHTML = result.items.length ? result.items.map((item) => `<tr><td>${esc(item.backend)}</td><td class="mono">${esc(item.path)}</td><td>${esc(item.python || "未知")}${item.packages?.length ? `<div class="hint">${esc(item.packages.slice(0, 8).map((pkg) => `${pkg.name} ${pkg.version}`).join(" · "))}${item.packages.length > 8 ? " · …" : ""}</div>` : ""}</td><td><div class="toolbar-group">${item.backend === "conda" ? `<button class="text-button" data-conda-export="${esc(item.path)}">导出 yml</button>` : ""}${can("development.plan") ? `<button class="text-button" data-env-backup="${esc(item.path)}" data-env-backend="${item.backend === "conda" ? "conda" : "venv"}">备份脚本</button>` : ""}</div></td></tr>`).join("") : '<tr><td colspan="4" class="hint">未发现 pyvenv.cfg 或 conda 环境</td></tr>'; $$('[data-conda-export]', root).forEach((button) => { button.onclick = async () => { try { const content = await withOperationProgress("正在导出 conda YAML", () => api(`/api/hosts/${host.id}/development/conda-export?path=${encodeURIComponent(button.dataset.condaExport)}`)); const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([content], {type:"text/yaml;charset=utf-8"})); link.download = "environment.yml"; link.click(); URL.revokeObjectURL(link.href); } catch (error) { developmentOutput(root, "导出 conda YAML 失败", error.message, true); } }; }); $$('[data-env-backup]', root).forEach((button) => { button.onclick = async () => { try { const result = await withOperationProgress("正在生成环境备份脚本", () => api(`/api/hosts/${host.id}/development/environment-backup-plan`, {method:"POST", body:{backend:button.dataset.envBackend, path:button.dataset.envBackup}})); developmentOutput(root, "环境备份脚本", result.plan.script); } catch (error) { developmentOutput(root, "生成环境备份脚本失败", error.message, true); } }; }); } catch (error) { developmentOutput(root, "环境盘点失败", error.message, true); } });
     const environmentPayload = (form) => ({backend:form.backend.value, action:form.action.value, path:form.path.value.trim(), python:form.python.value, pytorch:form.pytorch.value, packages:form.packages.value});
     $("[data-dev-environment-form] [name='backend']", root)?.addEventListener("change", (event) => { const python = $("[data-dev-environment-form] [name='python']", root); if (!python) return; if (event.target.value === "conda") python.value = ""; else if (!python.value) python.selectedIndex = 0; });
@@ -1788,6 +1835,7 @@ async function renderAlerts(page = 1, filters = null) {
   if (state.page !== "alerts") return;
   const exportQuery = new URLSearchParams(query); exportQuery.delete("page"); exportQuery.delete("page_size");
   $("#page-content").innerHTML = `<section class="section fault-summary"><div class="section-title"><h3>故障主机聚合</h3><strong>${faults.total} 台需处理</strong></div>${faults.items.length ? `<div class="table-wrap"><table><thead><tr><th>主机</th><th>状态</th><th>活动问题</th><th>操作</th></tr></thead><tbody>${faults.items.map((item) => `<tr><td><strong>${esc(item.host.name)}</strong><div class="hint">${esc(item.host.address)}</div></td><td><span class="status ${esc(item.host.status || "unknown")}">${statusName(item.host)}</span></td><td>${item.issues.map((issue) => esc(alertNames[issue.alert_type] || issue.summary)).join(" / ")}</td><td><button class="text-button" data-detail="${item.host.id}">查看主机</button></td></tr>`).join("")}</tbody></table></div>` : '<div class="notice-panel">当前没有离线、指纹异常、采集降级或活动资源告警主机。</div>'}</section>
+    <div class="alert-notification-control"><div><strong>告警提醒 · ${result.toast_enabled ? "当前已开启" : "当前已关闭"}</strong><span>关闭后隐藏顶部红点，并停止网页弹窗、浏览器桌面通知和 Server 酱；告警历史仍会保留。</span></div>${can("alerts.manage") ? `<button type="button" data-alert-notification-toggle role="switch" aria-checked="${Boolean(result.toast_enabled)}" class="${result.toast_enabled ? "danger-quiet" : ""}">${result.toast_enabled ? "关闭告警提醒" : "开启告警提醒"}</button>` : `<span class="status ${result.toast_enabled ? "online" : "disabled"}">${result.toast_enabled ? "已开启" : "已关闭"}</span>`}</div>
     <form id="alert-filters" class="toolbar"><div class="toolbar-group"><div class="toolbar-search"><input name="search" placeholder="搜索事件、主机或摘要" value="${esc(current.search)}"></div><input name="host_id" type="number" min="1" placeholder="主机 ID" value="${esc(current.host_id)}"><input name="alert_type" placeholder="事件类型" value="${esc(current.alert_type)}"><select name="state"><option value="">全部状态</option><option value="active" ${current.state === "active" ? "selected" : ""}>活动中</option><option value="recovered" ${current.state === "recovered" ? "selected" : ""}>已恢复</option></select><select name="severity"><option value="">全部级别</option><option value="critical" ${current.severity === "critical" ? "selected" : ""}>严重</option><option value="warning" ${current.severity === "warning" ? "selected" : ""}>警告</option><option value="info" ${current.severity === "info" ? "selected" : ""}>信息</option></select><div class="date-range-picker" role="group" aria-label="告警时间范围"><label>开始<input name="start" type="datetime-local" value="${esc(localDateTimeValue(current.start))}"></label><span aria-hidden="true">至</span><label>结束<input name="end" type="datetime-local" value="${esc(localDateTimeValue(current.end))}"></label></div><label class="check-label"><input name="include_cleared" type="checkbox" value="1" ${current.include_cleared === "1" ? "checked" : ""}>包含已清理</label><button type="submit">筛选</button></div><div class="toolbar-group">${can("alerts.manage") ? `<button type="button" data-alert-bulk-ack ${result.total ? "" : "disabled"}>一键忽略当前结果</button><button type="button" class="danger-quiet" data-alert-bulk-clear ${result.total ? "" : "disabled"}>一键清理当前结果</button>` : ""}<a class="button-link" href="/api/alerts/export?${exportQuery}">导出 CSV</a></div></form>
     ${result.items.length ? `<div class="table-wrap"><table id="alerts-table"><thead><tr><th>发生时间</th><th>事件</th><th>主机</th><th>级别</th><th>状态</th><th>摘要</th><th>恢复时间</th><th>操作</th></tr></thead><tbody>${result.items.map((item) => `<tr><td>${fmtTime(item.created_at)}</td><td>${esc(alertNames[item.alert_type] || item.alert_type)}</td><td>${esc(item.host_name || item.host_id || "平台")}${item.host_name ? `<div class="hint">ID ${item.host_id}</div>` : ""}</td><td>${esc(({critical:"严重",warning:"警告",info:"信息"})[item.severity] || item.severity)}</td><td><span class="status ${item.cleared_at ? "disabled" : item.state === "active" ? (item.severity === "critical" ? "offline" : "degraded") : "online"}">${item.cleared_at ? "已清理" : item.acknowledged_at ? "已忽略提示" : item.state === "active" ? "活动中" : "已恢复"}</span></td><td>${esc(item.summary)}</td><td>${fmtTime(item.recovered_at)}</td><td class="nowrap">${can("alerts.manage") && !item.acknowledged_at && !item.cleared_at ? `<button class="text-button" data-alert-ack="${item.id}">忽略提示</button>` : ""}${can("alerts.manage") && !item.cleared_at ? `<button class="text-button danger-quiet" data-alert-clear="${item.id}">清理</button>` : "-"}</td></tr>`).join("")}</tbody></table></div>` : '<div class="empty"><div><strong>没有符合条件的告警</strong>调整筛选条件后重试。</div></div>'}${pageControls(result)}`;
   bindHostLinks($("#page-content"));
@@ -1798,11 +1846,23 @@ async function renderAlerts(page = 1, filters = null) {
     renderAlerts(1, next);
   };
   bindPageControls($("#page-content"), result, (nextPage) => renderAlerts(nextPage, current));
+  $("[data-alert-notification-toggle]")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const enabled = button.getAttribute("aria-checked") !== "true";
+    try {
+      button.disabled = true;
+      await updateAlertNotificationSetting(enabled);
+      toast(enabled ? "告警提醒已开启" : "告警提醒已关闭");
+      await pollAlerts();
+      renderAlerts(page, current);
+    } catch (error) { button.disabled = false; toast(error.message, "error"); }
+  });
   $("[data-alert-bulk-ack]")?.addEventListener("click", async () => {
     try {
       if (!confirm(`确认忽略当前筛选结果中的未处理告警提示？单次最多处理 1000 条。`)) return;
       const response = await api("/api/alerts/bulk-acknowledge", {method:"POST", body:{filters:current}});
       toast(`已忽略 ${response.count} 条告警提示`);
+      await pollAlerts();
       renderAlerts(1, current);
     } catch (error) { toast(error.message, "error"); }
   });
@@ -1811,11 +1871,12 @@ async function renderAlerts(page = 1, filters = null) {
       if (!confirm(`确认软清理当前筛选结果中的告警？单次最多处理 1000 条，审计历史仍会保留。`)) return;
       const response = await api("/api/alerts/bulk-clear", {method:"POST", body:{filters:current}});
       toast(`已软清理 ${response.count} 条告警`);
+      await pollAlerts();
       renderAlerts(1, current);
     } catch (error) { toast(error.message, "error"); }
   });
-  $$('[data-alert-ack]').forEach((button) => { button.onclick = async () => { try { await api(`/api/alerts/${button.dataset.alertAck}/acknowledge`, {method:"POST", body:{}}); toast("已忽略该告警的后续页面提示"); renderAlerts(page, current); } catch (error) { toast(error.message, "error"); } }; });
-  $$('[data-alert-clear]').forEach((button) => { button.onclick = async () => { try { if (!confirm("确认从默认告警列表软清理该事件？审计历史仍会保留。")) return; await api(`/api/alerts/${button.dataset.alertClear}`, {method:"DELETE", body:{}}); toast("告警已软清理"); renderAlerts(page, current); } catch (error) { toast(error.message, "error"); } }; });
+  $$('[data-alert-ack]').forEach((button) => { button.onclick = async () => { try { await api(`/api/alerts/${button.dataset.alertAck}/acknowledge`, {method:"POST", body:{}}); toast("已忽略该告警的后续页面提示"); await pollAlerts(); renderAlerts(page, current); } catch (error) { toast(error.message, "error"); } }; });
+  $$('[data-alert-clear]').forEach((button) => { button.onclick = async () => { try { if (!confirm("确认从默认告警列表软清理该事件？审计历史仍会保留。")) return; await api(`/api/alerts/${button.dataset.alertClear}`, {method:"DELETE", body:{}}); toast("告警已软清理"); await pollAlerts(); renderAlerts(page, current); } catch (error) { toast(error.message, "error"); } }; });
 }
 
 function auditChangesMarkup(changes) {
@@ -1842,24 +1903,24 @@ async function renderLogs(page = 1, filters = null) {
 
 const settingGroups = {
   collection: {title:"采集与 SSH", copy:"控制后台采集频率、并发、超时及分层历史保留。", keys:["collection_interval","frontend_refresh_interval","ssh_concurrency","queue_limit","interactive_ssh_limit","ssh_connect_timeout","collection_timeout","collection_retries","retry_interval","install_timeout","ssh_reuse","ssh_idle_close","metric_raw_retention_minutes","metric_mid_retention_hours","metric_retention_days","collection_task_retention_minutes","aggregation_mid_seconds","aggregation_long_seconds"]},
-  storage: {title:"扫描与长任务", copy:"统一控制目录容量、大文件扫描和开发环境盘点的默认范围与时限。", keys:["scan_timeout_seconds","scan_max_depth","scan_result_limit","scan_minimum_mib","environment_inventory_timeout"]},
+  storage: {title:"扫描与长任务", copy:"统一控制目录容量、大文件扫描、开发环境盘点和 GPU 评估的默认范围与时限。", keys:["scan_timeout_seconds","scan_max_depth","scan_result_limit","scan_minimum_mib","environment_inventory_timeout","gpu_benchmark_timeout"]},
   alerts: {title:"告警阈值", copy:"利用率、Swap、温度及 GPU 功耗、风扇、ECC、XID、PCIe、节流与残留显存告警规则。", keys:["green_threshold","yellow_threshold","filesystem_usage_threshold","filesystem_inode_threshold","swap_usage_threshold","cpu_temp_threshold","gpu_temp_threshold","gpu_power_threshold_percent","gpu_fan_min_percent","gpu_fan_alert_temperature","gpu_ecc_corrected_threshold","gpu_xid_alert_enabled","gpu_pcie_alert_enabled","gpu_throttle_alert_enabled","gpu_residual_alert_enabled","disk_temp_threshold","alert_samples","alert_hysteresis","alert_repeat_minutes"]},
   gpu: {title:"GPU 调度", copy:"全局调度规则；主机默认命令在主机编辑页配置。", keys:["gpu_scheduler_enabled","gpu_idle_mode","gpu_util_threshold","gpu_memory_threshold","gpu_idle_seconds","gpu_process_guard","gpu_cooldown_seconds","gpu_max_attempts","gpu_retry_seconds","gpu_freeze_seconds","gpu_submit_timeout","gpu_direct_timeout"]},
   security: {title:"安全与数据", copy:"登录限制、终端会话、备份和日志数据策略。", keys:["login_fail_limit","login_window_minutes","login_lock_minutes","session_idle_minutes","terminal_idle_seconds","backup_time","backup_dir","backup_keep","log_retention_days","schedule_output_limit","timezone"]},
-  notifications: {title:"通知", copy:"网页提示和 Server 酱外部通知配置。", keys:["toast_enabled","serverchan_enabled","serverchan_sendkey"]},
+  notifications: {title:"通知", copy:"告警总提醒开关控制红点、网页/桌面弹窗和 Server 酱发送。", keys:["toast_enabled","serverchan_enabled","serverchan_sendkey"]},
 };
 
 const settingLabels = {
   collection_interval:"采集间隔（秒）",frontend_refresh_interval:"前端刷新（秒）",ssh_concurrency:"常规 SSH 并发",queue_limit:"任务队列上限",interactive_ssh_limit:"交互 SSH 并发",ssh_connect_timeout:"SSH 连接超时（秒）",collection_timeout:"采集总超时（秒）",collection_retries:"采集重试次数",retry_interval:"重试间隔（秒）",install_timeout:"工具安装超时（秒）",ssh_reuse:"启用 SSH 连接复用",ssh_idle_close:"复用连接空闲关闭（秒）",metric_raw_retention_minutes:"原始指标保留（分钟）",metric_mid_retention_hours:"中期聚合保留（小时）",metric_retention_days:"长期指标保留（天）",collection_task_retention_minutes:"采集任务摘要保留（分钟）",aggregation_mid_seconds:"中期聚合粒度（秒）",aggregation_long_seconds:"长期聚合粒度（秒）",
-  scan_timeout_seconds:"目录扫描超时（秒）",scan_max_depth:"大文件扫描深度",scan_result_limit:"大文件返回条数",scan_minimum_mib:"大文件默认阈值（MiB）",environment_inventory_timeout:"环境盘点超时（秒）",
+  scan_timeout_seconds:"目录扫描超时（秒）",scan_max_depth:"大文件扫描深度",scan_result_limit:"大文件返回条数",scan_minimum_mib:"大文件默认阈值（MiB）",environment_inventory_timeout:"环境盘点超时（秒）",gpu_benchmark_timeout:"GPU 评估总超时（秒）",
   green_threshold:"绿色上限（%）",yellow_threshold:"黄色上限（%）",filesystem_usage_threshold:"文件系统容量阈值（%）",filesystem_inode_threshold:"文件系统 inode 阈值（%）",swap_usage_threshold:"Swap 使用率阈值（%）",cpu_temp_threshold:"CPU 温度阈值（C）",gpu_temp_threshold:"GPU 温度阈值（C）",gpu_power_threshold_percent:"GPU 功耗上限比例（%）",gpu_fan_min_percent:"GPU 最低风扇转速（%）",gpu_fan_alert_temperature:"风扇告警温度门槛（C）",gpu_ecc_corrected_threshold:"可纠正 ECC 告警累计值",gpu_xid_alert_enabled:"启用 GPU XID 告警",gpu_pcie_alert_enabled:"启用 PCIe 降级告警",gpu_throttle_alert_enabled:"启用 GPU 节流告警",gpu_residual_alert_enabled:"启用 GPU 残留显存告警",disk_temp_threshold:"磁盘温度阈值（C）",alert_samples:"连续样本数",alert_hysteresis:"告警恢复回差",alert_repeat_minutes:"重复提醒间隔（分钟）",
   gpu_scheduler_enabled:"全局 GPU 自动调度",gpu_idle_mode:"空闲判定模式",gpu_util_threshold:"GPU 利用率阈值（%）",gpu_memory_threshold:"显存阈值（%）",gpu_idle_seconds:"默认空闲时长（秒）",gpu_process_guard:"默认计算进程保护",gpu_cooldown_seconds:"冷却时间（秒）",gpu_max_attempts:"最大尝试次数",gpu_retry_seconds:"重试间隔（秒）",gpu_freeze_seconds:"冻结时长（秒）",gpu_submit_timeout:"Tmux 提交超时（秒）",gpu_direct_timeout:"直接 Shell 超时（秒）",
-  login_fail_limit:"登录失败上限",login_window_minutes:"登录统计窗口（分钟）",login_lock_minutes:"登录暂停时间（分钟）",session_idle_minutes:"会话闲置超时（分钟）",terminal_idle_seconds:"终端闲置超时（秒）",backup_time:"自动备份时间",backup_dir:"备份目录",backup_keep:"备份保留份数",log_retention_days:"日志保留天数",schedule_output_limit:"单流输出上限（字节）",timezone:"显示时区",toast_enabled:"网页 Toast",serverchan_enabled:"Server 酱通知",serverchan_sendkey:"Server 酱 SendKey",
+  login_fail_limit:"登录失败上限",login_window_minutes:"登录统计窗口（分钟）",login_lock_minutes:"登录暂停时间（分钟）",session_idle_minutes:"会话闲置超时（分钟）",terminal_idle_seconds:"终端闲置超时（秒）",backup_time:"自动备份时间",backup_dir:"备份目录",backup_keep:"备份保留份数",log_retention_days:"日志保留天数",schedule_output_limit:"单流输出上限（字节）",timezone:"显示时区",toast_enabled:"告警总提醒（含红点和 Server 酱）",serverchan_enabled:"Server 酱通知",serverchan_sendkey:"Server 酱 SendKey",
 };
 
 const numberRules = {
   collection_interval:[5,60],frontend_refresh_interval:[3,30],ssh_concurrency:[1,30],queue_limit:[10,200],interactive_ssh_limit:[1,10],ssh_connect_timeout:[3,30],collection_timeout:[5,60],collection_retries:[0,3],retry_interval:[1,30],install_timeout:[30,600],ssh_idle_close:[10,600],metric_raw_retention_minutes:[5,360],metric_mid_retention_hours:[1,168],metric_retention_days:[1,30],collection_task_retention_minutes:[15,1440],aggregation_mid_seconds:[30,120],aggregation_long_seconds:[120,600],green_threshold:[0,99],yellow_threshold:[1,100],filesystem_usage_threshold:[1,100],filesystem_inode_threshold:[1,100],swap_usage_threshold:[1,100],cpu_temp_threshold:[0,150],gpu_temp_threshold:[0,150],gpu_power_threshold_percent:[50,100],gpu_fan_min_percent:[0,100],gpu_fan_alert_temperature:[0,120],gpu_ecc_corrected_threshold:[1,1000000],disk_temp_threshold:[0,150],alert_samples:[1,10],alert_hysteresis:[0,20],alert_repeat_minutes:[0,1440],gpu_util_threshold:[0,100],gpu_memory_threshold:[0,100],gpu_idle_seconds:[60,86400],gpu_cooldown_seconds:[0,3600],gpu_max_attempts:[1,5],gpu_retry_seconds:[5,3600],gpu_freeze_seconds:[60,86400],gpu_submit_timeout:[10,120],gpu_direct_timeout:[30,600],login_fail_limit:[1,20],login_window_minutes:[1,60],login_lock_minutes:[1,60],session_idle_minutes:[5,240],terminal_idle_seconds:[30,1800],backup_keep:[1,10],log_retention_days:[7,180],schedule_output_limit:[65536,5242880],
-  scan_timeout_seconds:[10,120],scan_max_depth:[1,12],scan_result_limit:[1,200],scan_minimum_mib:[1,10240],environment_inventory_timeout:[10,120],
+  scan_timeout_seconds:[10,120],scan_max_depth:[1,12],scan_result_limit:[1,200],scan_minimum_mib:[1,10240],environment_inventory_timeout:[10,120],gpu_benchmark_timeout:[60,600],
 };
 
 function settingInput(key, value) {

@@ -1,66 +1,37 @@
-# Server Monitor 部署与运维
+# 部署与运维
 
-本文对应 `v1.3.5` 和数据库 schema `6`。生产环境只运行一组 Gunicorn，并把 SQLite、主密钥、日志和 PID 文件放在独立数据目录。
+本文对应当前源码和数据库 schema `7`。
 
-## 前提
+## 运行前提
 
-- Ubuntu 22.04/24.04 或 Python 3.11+ 的 Linux。
-- 平台服务器安装 Python、SQLite、OpenSSH client；被管主机启用 SSH。
-- 被管主机使用低权限专用账号。按需授予 Docker、进程、文件、Tmux、安装或压力测试能力。
-- 默认监听 `127.0.0.1:8000`。跨机器访问放在 HTTPS 反向代理、VPN 或管理网之后。
+- Linux、Python 3.11+、OpenSSH client。
+- 被管主机开启 SSH，推荐使用权限受限的专用账号。
+- Docker 部署需要 Docker Engine 和 Compose v2。
+- 浏览器 E2E 仅开发/CI 需要 Node.js 22+ 和 Google Chrome，生产运行不需要 Node。
 
-## Ubuntu 首次安装
+## 环境变量
 
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv openssh-client
-cd /opt/server-monitor
-python3 -m venv --copies .venv
-.venv/bin/python -m pip install -r requirements.lock
-.venv/bin/python -m pip check
-SERVER_MONITOR_INITIAL_PASSWORD='至少 10 位的初始密码' bash scripts/start_ubuntu.sh start
-```
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SERVER_MONITOR_DATA_DIR` | `./data` | SQLite、主密钥、备份、日志和锁文件目录 |
+| `SERVER_MONITOR_DATABASE` | 数据目录内数据库 | 可指定 SQLite 文件 |
+| `SERVER_MONITOR_MASTER_KEY` | 数据目录内 `master.key` | 可指定主密钥路径 |
+| `SERVER_MONITOR_INITIAL_PASSWORD` | 无 | 首次创建管理员时必填，之后不会覆盖密码 |
+| `SERVER_MONITOR_BIND` | `127.0.0.1:8000` | Gunicorn 监听地址 |
+| `SERVER_MONITOR_HTTPS` | `0` | 反向代理已终止 HTTPS 时设为 `1` |
+| `SERVER_MONITOR_MAX_UPLOAD_BYTES` | 512 MiB | 单次 HTTP 请求上限 |
+| `SERVER_MONITOR_FILE_TRANSFER_LIMIT` | 512 MiB | 单次文件操作总量上限 |
+| `LOG_LEVEL` | `INFO` | 应用和 Gunicorn 日志级别 |
+| `SERVER_MONITOR_LOG_LEVEL` | 未设置 | 优先于 `LOG_LEVEL` |
 
-首次登录使用 `admin`，登录后必须改密码。初始密码只在数据库没有管理员时读取。
+日志继续输出到 stdout/stderr，这是 Docker 和 systemd 的标准采集方式。`start_ubuntu.sh` 会把 Gunicorn 日志写到数据目录。
 
-## 二次启动和异常恢复
-
-```bash
-cd /opt/server-monitor
-bash scripts/start_ubuntu.sh start
-bash scripts/start_ubuntu.sh status
-bash scripts/start_ubuntu.sh restart
-bash scripts/start_ubuntu.sh stop
-tail -f data/logs/server-monitor.log
-```
-
-脚本会校验 PID 对应的 Gunicorn 命令和工作目录，服务健康时拒绝重复启动；异常退出留下过期 PID 文件时只清理自己的文件，不会强杀未知进程。前台排错：
-
-```bash
-bash scripts/start_ubuntu.sh foreground
-```
-
-## 8000 端口占用
-
-```bash
-bash scripts/start_ubuntu.sh status
-curl http://127.0.0.1:8000/health
-ss -lntp | grep ':8000'
-ps -ef | grep '[g]unicorn.*monitor.wsgi'
-```
-
-健康服务不要再次 `start`；修改代码用 `restart`。systemd、Docker、脚本只能选择一种管理方式。临时端口：
-
-```bash
-SERVER_MONITOR_BIND=127.0.0.1:18000 bash scripts/start_ubuntu.sh restart
-```
-
-## Docker 部署
+## Docker
 
 ```bash
 cp .env.example .env
 chmod 600 .env
-# 编辑 .env，设置 SERVER_MONITOR_INITIAL_PASSWORD
+# 编辑一次性初始密码和 LOG_LEVEL
 docker compose up -d --build
 docker compose ps
 docker compose logs -f server-monitor
@@ -71,11 +42,30 @@ docker compose logs -f server-monitor
 ```bash
 git pull --ff-only
 docker compose up -d --build
+curl http://127.0.0.1:8000/health
 ```
 
-不要执行 `docker compose down -v`，否则会删除保存数据库和主密钥的数据卷。
+不要使用 `docker compose down -v`。
 
-## systemd 长期运行
+## Ubuntu
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv openssh-client
+python3 -m venv --copies .venv
+.venv/bin/python -m pip install -r requirements.lock
+.venv/bin/python -m pip check
+SERVER_MONITOR_INITIAL_PASSWORD='一次性长密码' LOG_LEVEL=INFO bash scripts/start_ubuntu.sh start
+```
+
+```bash
+bash scripts/start_ubuntu.sh status
+bash scripts/start_ubuntu.sh restart
+bash scripts/start_ubuntu.sh stop
+tail -f data/logs/server-monitor.log
+```
+
+systemd：
 
 ```bash
 sudo cp deploy/server-monitor.service.example /etc/systemd/system/server-monitor.service
@@ -85,84 +75,74 @@ sudo systemctl status server-monitor --no-pager
 sudo journalctl -u server-monitor -n 100 --no-pager
 ```
 
-使用 systemd 后，停止、重启和日志查看都使用 `systemctl/journalctl`，不要并行运行 `start_ubuntu.sh`。
+## 数据库迁移
 
-## 远端工具
+启动时先执行幂等基础建表，再由 `monitor/migrations.py` 按连续版本执行迁移。迁移记录包含版本、名称、应用时间和校验和。
 
-核心采集不依赖所有可选工具。平台会将缺失工具显示为“未安装”，不会使整台主机采集失败。建议按需安装：`sysstat`、`smartmontools`、`ethtool`、`iproute2`、`lsof`、`jq`；交互工具 `tmux`、`htop`、`ncdu`、`nvtop`、`iotop`、`btop` 等由工具页提供检查和受限安装方案。SMART、iostat、网络和 lsof 读取失败时页面显示降级原因。
+所有待执行迁移在一个 SQLite 写事务中运行：任一步失败都会回滚本批全部变更并拒绝启动。程序也会拒绝打开高于当前支持版本的数据库，防止无意降级。
 
-### SMART 和内核日志权限
-
-巡检遇到 `Smartctl open device ... Permission denied` 会显示“不可用/无权限”，不会误报磁盘损坏；dmesg 无权限时会尝试读取最近的 `journalctl -k`。需要完整只读结果时，在被管机按实际路径配置最小权限：
+查看版本和记录：
 
 ```bash
-sudo apt-get install -y smartmontools
-sudo usermod -aG adm,systemd-journal <ssh-user>
-sudo visudo -f /etc/sudoers.d/server-monitor-smart
+.venv/bin/python -c "import sqlite3; c=sqlite3.connect('data/server-monitor.sqlite3'); print(c.execute('PRAGMA user_version').fetchone()[0]); print(c.execute('select version,name,applied_at from schema_migrations order by version').fetchall())"
 ```
 
-sudoers 文件内容示例（先用 `command -v smartctl` 确认路径，再按发行版调整）：
-
-```text
-<ssh-user> ALL=(root) NOPASSWD: /usr/sbin/smartctl -H *, /usr/sbin/smartctl -H -A *
-```
-
-保存后重新登录 SSH 会话。没有上述权限时平台仍会继续采集其他指标，只把 SMART 或内核日志标记为降级，不会阻塞整台主机。
-
-## 配置和安全
-
-`SERVER_MONITOR_DATA_DIR` 默认是项目下的 `data/`，保存 SQLite、WAL、主密钥、备份和日志。建议：
-
-- 数据目录 `0700`，数据库、主密钥、`.env` 和日志 `0600`。
-- 数据库和同版本 `master.key` 必须一起备份；没有主密钥无法解密远端凭据。
-- 不提交 `.env`、`data/`、`.venv/`、私钥、真实密码、Cookie 或导出文件。
-- 在设置页配置采集间隔、SSH 并发、连接/采集超时、扫描深度、扫描超时、结果上限、告警阈值和指标保留时间。
-- 目录扫描和远端命令都有路径校验、超时、输出上限和部分结果返回；不会运行在线 `badblocks`。
-
-## 升级
-
-升级前停止唯一实例并备份数据库、WAL 和主密钥：
-
-```bash
-sudo systemctl stop server-monitor  # 若使用 systemd
-cp -a data data.backup-$(date +%Y%m%d%H%M%S)
-git pull --ff-only
-.venv/bin/python -m pip install -r requirements.lock
-.venv/bin/python -m pip check
-.venv/bin/python -m pytest -q
-node --check monitor/static/app.js
-.venv/bin/python -m compileall -q monitor tests scripts gunicorn.conf.py
-sudo systemctl start server-monitor  # 若使用 systemd
-```
-
-启动后检查 `/health` 和 schema：
-
-```bash
-curl http://127.0.0.1:8000/health
-.venv/bin/python -c "import sqlite3; print(sqlite3.connect('data/server-monitor.sqlite3').execute('PRAGMA user_version').fetchone()[0])"
-```
-
-输出应为 `6`，监听端口只能对应一组服务。迁移目录时不要复制旧 `.venv`；保留数据目录和主密钥，重新创建虚拟环境。
+当前应为 `7`。生产升级前仍应备份，因为事务回滚不能替代人为误操作、磁盘损坏或程序降级时的数据恢复。
 
 ## 备份与恢复
 
+平台设置页支持 SQLite 在线备份。主机级备份必须同时保存数据库和主密钥：
+
 ```bash
 sudo systemctl stop server-monitor
-cp -a data/server-monitor.sqlite3 /backup/server-monitor-$(date +%Y%m%d).sqlite3
-cp -a data/master.key /backup/server-monitor-master.key
+cp -a data/server-monitor.sqlite3 /backup/server-monitor.sqlite3
+cp -a data/master.key /backup/master.key
 sudo systemctl start server-monitor
 ```
 
-恢复前停止服务并保留现场副本；恢复数据库和同一主密钥后执行 `PRAGMA integrity_check`。不要手工删除 `.sqlite3-wal` 或 `.sqlite3-shm`。
+恢复时停止服务、保留现场副本、恢复同一组数据库和主密钥，再运行：
 
-## 验收
+```bash
+.venv/bin/python -c "import sqlite3; print(sqlite3.connect('data/server-monitor.sqlite3').execute('PRAGMA integrity_check').fetchone()[0])"
+```
+
+不要手工删除正在使用的 `-wal` 或 `-shm` 文件。
+
+## Worker 与扩容
+
+生产保持一个 Gunicorn Worker。应用内包含唯一后台采集/调度循环和进程锁，SQLite 也不是横向 Web 实例的共享写库。不要通过环境变量或命令行强行增加 Worker。
+
+扩容顺序应是：
+
+1. 将采集、调度、备份和维护任务移到独立 Worker 服务。
+2. 使用数据库锁或消息队列保证任务唯一性和幂等性。
+3. 将 SQLite 迁移到 PostgreSQL 等多实例数据库。
+4. 再增加无状态 Web Worker 和多节点负载均衡。
+
+## SSH 与文件传输
+
+SSH 连接复用由设置页的 `ssh_reuse` 和 `ssh_idle_close` 控制。连接池只保存空闲健康连接，凭据或指纹变化会淘汰旧连接。
+
+断点续传仅覆盖“平台到远端 SFTP”阶段。浏览器重新选择同一文件后，服务会发现匹配的隐藏临时文件并继续写；完成前目标正式文件不存在。修改了文件内容、大小或目标路径会生成新的续传标识。
+
+## GPU 评估远端依赖
+
+```bash
+python3 -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python3 -c "import torchvision; print(torchvision.__version__)"
+python3 -c "import timm; print(timm.__version__)"  # 仅 ViT-Tiny 需要
+nvidia-smi
+```
+
+FP8 和 INT8 是否可测取决于 GPU 架构、CUDA 和 PyTorch 构建。真实 CIFAR-10 首次下载由页面显式确认，缓存目录为远端用户的 `~/.cache/server-monitor/datasets`。
+
+## 升级验收
 
 ```bash
 .venv/bin/python -m pytest -q
-node --check monitor/static/app.js
+node --test tests_js/*.test.js
+.venv/bin/python scripts/e2e_acceptance.py
 .venv/bin/python -m compileall -q monitor tests scripts gunicorn.conf.py
 .venv/bin/python -m pip check
-git diff --check
+curl http://127.0.0.1:8000/health
 ```
-
-浏览器验收建议使用临时数据目录和临时端口，结束后停止临时服务。功能取舍见 [FEATURE_ASSESSMENT.md](FEATURE_ASSESSMENT.md)。

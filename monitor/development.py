@@ -5,6 +5,7 @@ import shlex
 import base64
 from typing import Any
 
+from .gpu_benchmark import run_gpu_benchmark
 from .operations import (
     OperationError,
     _APT_PACKAGE_PATTERN,
@@ -194,6 +195,9 @@ sm_timed_out "$nvlink_rc" && printf "__SM_DIAGNOSTIC_WARNING__\tNVLink 探测超
             min(self.config.all()["schedule_output_limit"], 512 * 1024),
         )
         return _parse_gpu_diagnostics(result.stdout)
+
+    def gpu_benchmark(self, host: dict[str, Any], payload: dict[str, Any]) -> tuple[dict[str, Any], str, int]:
+        return run_gpu_benchmark(self.operations, self.config, host, payload)
 
     def environment_inventory(self, host: dict[str, Any], root: str) -> dict[str, Any]:
         root = _remote_path(root, "扫描目录")

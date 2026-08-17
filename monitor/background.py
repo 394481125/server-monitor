@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from .collector import Collector
 from .gpu_scheduler import GPUScheduler
 from .operations import OperationService
+from .ssh_client import SSHConnectionPool
 from .services import compact_collection_result
 from .utils import parse_utc, utc_iso, utc_now
 
@@ -20,7 +21,7 @@ class CollectionCancelled(RuntimeError):
 
 
 class BackgroundService:
-    def __init__(self, hosts: Any, config: Any, secrets: Any, database: Any, scheduler: GPUScheduler, alerts: Any, audit: Any, backups: Any | None = None):
+    def __init__(self, hosts: Any, config: Any, secrets: Any, database: Any, scheduler: GPUScheduler, alerts: Any, audit: Any, backups: Any | None = None, connection_pool: SSHConnectionPool | None = None):
         self.hosts = hosts
         self.config = config
         self.secrets = secrets
@@ -29,6 +30,7 @@ class BackgroundService:
         self.alerts = alerts
         self.audit = audit
         self.backups = backups
+        self.connection_pool = connection_pool
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=30, thread_name_prefix="server-monitor")
         self._active: dict[int, concurrent.futures.Future[Any]] = {}
         self._cancel_events: dict[int, threading.Event] = {}
@@ -152,7 +154,7 @@ class BackgroundService:
                         raise RuntimeError("应用正在停止")
                     self._ssh_active += 1
                 try:
-                    result = Collector(self.secrets, settings).collect(host, (previous or {}).get("data"))
+                    result = Collector(self.secrets, settings, self.connection_pool).collect(host, (previous or {}).get("data"))
                 finally:
                     with self._ssh_condition:
                         self._ssh_active -= 1
@@ -202,7 +204,7 @@ class BackgroundService:
             return
         host = self.hosts.get(row["host_id"], include_secrets=True)
         latest = self.hosts.latest(host["id"])
-        recheck = Collector(self.secrets, self.config.all()).collect(host, (latest or {}).get("data"))
+        recheck = Collector(self.secrets, self.config.all(), self.connection_pool).collect(host, (latest or {}).get("data"))
         if cancel_event and cancel_event.is_set():
             return
         gpu = next((gpu for gpu in recheck.data.get("gpus", []) if gpu["uuid"] == row["gpu_uuid"]), None) if recheck.core_ok else None
@@ -214,7 +216,7 @@ class BackgroundService:
             return
         if cancel_event and cancel_event.is_set():
             return
-        self.scheduler.dispatch(host, gpu, lambda effective, current_gpu, task_id: OperationService(self.secrets, self.config, self.database).dispatch_gpu(host, effective, current_gpu, task_id))
+        self.scheduler.dispatch(host, gpu, lambda effective, current_gpu, task_id: OperationService(self.secrets, self.config, self.database, self.connection_pool).dispatch_gpu(host, effective, current_gpu, task_id))
 
     def _maintenance(self) -> None:
         try:

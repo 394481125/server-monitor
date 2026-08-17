@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import sqlite3
 from types import SimpleNamespace
 
@@ -7,6 +8,14 @@ import pytest
 
 from monitor.db import Database
 from monitor.development import DevelopmentService
+from monitor.gpu_benchmark import (
+    GPU_BENCHMARK_SCRIPT,
+    RESULT_MARKER,
+    build_benchmark_command,
+    parse_benchmark_output,
+    validate_benchmark_request,
+)
+from monitor.migrations import MIGRATIONS
 from monitor.operations import OperationError, _parse_development_stack, _parse_gpu_diagnostics
 
 from .conftest import csrf, login
@@ -37,6 +46,7 @@ class FakeConfig:
             "collection_timeout": 15, "install_timeout": 120, "schedule_output_limit": 1024 * 1024,
             "scan_timeout_seconds": 60, "scan_max_depth": 8, "scan_result_limit": 100,
             "scan_minimum_mib": 1024, "environment_inventory_timeout": 60,
+            "gpu_benchmark_timeout": 180,
         }
 
 
@@ -95,6 +105,137 @@ def test_optional_development_probes_are_bounded_and_degrade_to_warnings():
 
     diagnostics = _parse_gpu_diagnostics("__SM_GPU_AVAILABLE__\t1\n__SM_DIAGNOSTIC_WARNING__\tECC 探测超时，已跳过\n")
     assert "ECC 探测超时，已跳过" in diagnostics["notes"]
+
+
+def test_gpu_benchmark_request_and_parser_cover_modern_precisions_and_models():
+    assert validate_benchmark_request({
+        "mode": "multi", "duration_seconds": 8, "python": "/opt/conda/envs/torch/bin/python",
+        "model": "resnet50", "dataset": "cifar10", "download_dataset": True,
+    }) == ("multi", 8, "/opt/conda/envs/torch/bin/python", "resnet50", "cifar10", True)
+    with pytest.raises(OperationError):
+        validate_benchmark_request({"mode": "single", "python": "python3; reboot", "model": "resnet18"})
+    with pytest.raises(OperationError, match="模型"):
+        validate_benchmark_request({"mode": "single", "model": "unknown-net"})
+    with pytest.raises(OperationError, match="仅真实 CIFAR-10"):
+        validate_benchmark_request({"dataset": "synthetic", "download_dataset": True})
+
+    command = build_benchmark_command("single", 5, "python3", "mobilenet_v3_small", "fake_cifar10", False)
+    assert "mktemp /tmp/server-monitor-gpu-benchmark" in command
+    assert "--model mobilenet_v3_small" in command
+    assert "--dataset fake_cifar10" in command
+    assert "fp8_e4m3" in GPU_BENCHMARK_SCRIPT
+    assert "int8" in GPU_BENCHMARK_SCRIPT
+    assert "tp8_ready" in GPU_BENCHMARK_SCRIPT
+    assert "is_bf16_supported(device)" not in GPU_BENCHMARK_SCRIPT
+    assert "if not checker():" in GPU_BENCHMARK_SCRIPT
+    assert "with torch.cuda.device(device):" in GPU_BENCHMARK_SCRIPT
+    assert "if all(torch.cuda.get_device_capability(device)[0] >= 8 for device in devices):" in GPU_BENCHMARK_SCRIPT
+    assert 'warnings.append(f"GPU 训练测速失败: {training_error}")' in GPU_BENCHMARK_SCRIPT
+    assert '"available": False' in GPU_BENCHMARK_SCRIPT
+    assert "torch.stack(losses).mean().item()" in GPU_BENCHMARK_SCRIPT
+    assert all(model in GPU_BENCHMARK_SCRIPT for model in ("resnet18", "resnet34", "resnet50", "mobilenet_v3_small", "vit_tiny_patch16_224"))
+
+    sample = {
+        "ok": True, "mode": "multi", "gpu_count": 8, "devices": [{"name": "H100"}],
+        "matrix": [{"precision": "fp8_e4m3", "unit": "TFLOPS", "aggregate": 1000}],
+        "memory_bandwidth": [{"device": 0, "gbps": 3000}],
+        "training": {"model": "resnet18", "it_per_sec": 50, "avg_loss": 2.3, "avg_accuracy": 0.1},
+        "parallelism": {"tp_degree": 8, "tp8_ready": True},
+    }
+    assert parse_benchmark_output(RESULT_MARKER + __import__("json").dumps(sample))["parallelism"]["tp8_ready"] is True
+    with pytest.raises(OperationError, match="PyTorch"):
+        parse_benchmark_output(RESULT_MARKER + '{"ok":false,"error":"PyTorch missing"}')
+
+
+def test_gpu_benchmark_bf16_probe_uses_each_device_context_without_arguments():
+    tree = ast.parse(GPU_BENCHMARK_SCRIPT)
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "bf16_supported"
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+    namespace = {}
+    exec(compile(module, "<bf16-probe>", "exec"), namespace)
+
+    class DeviceContext:
+        def __init__(self, cuda, device):
+            self.cuda = cuda
+            self.device = device
+
+        def __enter__(self):
+            self.cuda.current = self.device
+
+        def __exit__(self, *_args):
+            self.cuda.current = None
+
+    class FakeCuda:
+        def __init__(self):
+            self.current = None
+            self.checked = []
+
+        def device(self, device):
+            return DeviceContext(self, device)
+
+        def is_bf16_supported(self):
+            self.checked.append(self.current)
+            return True
+
+        def get_device_capability(self, _device):
+            return (8, 0)
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    assert namespace["bf16_supported"](FakeTorch(), [0, 1]) is True
+    assert FakeTorch.cuda.checked == [0, 1]
+
+
+def test_gpu_benchmark_service_uses_bounded_remote_command():
+    sample = {
+        "ok": True, "mode": "single", "gpu_count": 1, "devices": [{"name": "RTX"}],
+        "matrix": [], "memory_bandwidth": [],
+        "training": {"model": "resnet18", "it_per_sec": 10, "avg_loss": 2.3, "avg_accuracy": 0.1},
+    }
+    runs = FakeRuns([RESULT_MARKER + __import__("json").dumps(sample)])
+    service = DevelopmentService(runs, FakeConfig())
+    result, python_command, duration = service.gpu_benchmark({}, {"model": "resnet18"})
+    assert result["gpu_count"] == 1
+    assert python_command == "python3" and duration == 5
+    assert "server-monitor-gpu-benchmark" in runs.commands[0]
+
+
+def test_gpu_benchmark_api_requires_elevation_and_persists_history(client, app, admin, monkeypatch):
+    host = app.extensions["hosts"].create(host_payload(), fingerprint="SHA256:key-one", machine_id="machine-one")
+    sample = {
+        "ok": True, "mode": "multi", "gpu_count": 8, "devices": [{"name": "H100"}],
+        "matrix": [{"precision": "fp8_e4m3", "unit": "TFLOPS", "aggregate": 1000}],
+        "memory_bandwidth": [{"device": 0, "gbps": 3000}],
+        "training": {"model": "resnet18", "dataset": "cifar10", "it_per_sec": 50, "avg_loss": 2.1, "avg_accuracy": 0.2},
+        "parallelism": {"tp_degree": 8, "tp8_ready": True},
+    }
+    monkeypatch.setattr(
+        app.extensions["development"], "gpu_benchmark",
+        lambda _host, _payload: (sample, "python3", 5),
+    )
+
+    denied = client.post(
+        f"/api/hosts/{host['id']}/development/gpu-benchmarks",
+        json={"mode": "multi", "model": "resnet18"}, headers=csrf(admin),
+    )
+    assert denied.status_code == 403 and denied.get_json()["requires_elevation"] is True
+    elevated = client.post("/api/auth/elevate", json={"password": "TemporaryPass456"}, headers=csrf(admin))
+    assert elevated.status_code == 200
+    created = client.post(
+        f"/api/hosts/{host['id']}/development/gpu-benchmarks",
+        json={"mode": "multi", "model": "resnet18"}, headers=csrf(admin),
+    )
+    assert created.status_code == 201, created.get_json()
+    assert created.get_json()["result"]["parallelism"]["tp8_ready"] is True
+
+    history = client.get(f"/api/hosts/{host['id']}/development/gpu-benchmarks")
+    assert history.status_code == 200
+    assert history.get_json()["items"][0]["result"]["training"]["dataset"] == "cifar10"
+    assert app.extensions["database"].query_one("SELECT action FROM audit_logs WHERE action='gpu_benchmark_completed'")
 
 
 def test_environment_and_system_plans_reject_shell_injection():
@@ -263,6 +404,74 @@ def test_alert_acknowledge_and_soft_clear_api(client, app, admin):
     assert app.extensions["database"].query_one("SELECT action FROM audit_logs WHERE action='alert_cleared'")
 
 
+def test_alert_notification_setting_requires_permission_and_boolean(client, app, admin):
+    disabled = client.patch(
+        "/api/alerts/notification-setting",
+        json={"enabled": False},
+        headers=csrf(admin),
+    )
+    assert disabled.status_code == 200
+    assert disabled.get_json() == {"enabled": False}
+    assert app.extensions["monitor_config"].all()["toast_enabled"] is False
+    assert client.get("/api/alerts").get_json()["toast_enabled"] is False
+    audit_row = app.extensions["database"].query_one(
+        "SELECT action,changes_json FROM audit_logs WHERE action='alert_notification_setting_updated'"
+    )
+    assert audit_row and '"after": false' in audit_row["changes_json"]
+
+    invalid = client.patch(
+        "/api/alerts/notification-setting",
+        json={"enabled": "false"},
+        headers=csrf(admin),
+    )
+    assert invalid.status_code == 400
+    missing_csrf = client.patch("/api/alerts/notification-setting", json={"enabled": True})
+    assert missing_csrf.status_code == 403
+
+    created = client.post(
+        "/api/users",
+        json={"username": "alert-toggle-viewer", "password": "ViewerPass123", "role": "viewer"},
+        headers=csrf(admin),
+    )
+    assert created.status_code == 201
+    viewer_client = app.test_client()
+    first = login(viewer_client, "alert-toggle-viewer", "ViewerPass123")
+    changed = viewer_client.post(
+        "/api/auth/change-password",
+        json={"current_password": "ViewerPass123", "new_password": "ViewerPass456"},
+        headers=csrf(first),
+    )
+    assert changed.status_code == 200
+    viewer = login(viewer_client, "alert-toggle-viewer", "ViewerPass456")
+    denied = viewer_client.patch(
+        "/api/alerts/notification-setting",
+        json={"enabled": True},
+        headers=csrf(viewer),
+    )
+    assert denied.status_code == 403
+
+
+def test_alert_notification_setting_supports_post_and_suppresses_serverchan(client, app, admin, monkeypatch):
+    notifications = app.extensions["notifications"]
+    sent = []
+    monkeypatch.setattr(notifications, "_send", lambda alert, sendkey: sent.append(alert["id"]))
+    box = app.extensions["secret_box"]
+    app.extensions["monitor_config"].update({"serverchan_enabled": True, "serverchan_sendkey": box.encrypt("test-send-key"), "serverchan_events": ["host_offline"]})
+    response = client.post("/api/alerts/notification-setting", json={"enabled": False}, headers=csrf(admin))
+    assert response.status_code == 200 and response.get_json()["enabled"] is False
+    app.extensions["alerts"].emit("serverchan-suppressed", None, "host_offline", "critical", "不应发送")
+    assert sent == []
+    response = client.post("/api/alerts/notification-setting", json={"enabled": True}, headers=csrf(admin))
+    assert response.status_code == 200 and response.get_json()["enabled"] is True
+    app.extensions["alerts"].emit("serverchan-allowed", None, "host_offline", "critical", "允许发送")
+    for _ in range(20):
+        if sent:
+            break
+        import time
+        time.sleep(0.01)
+    assert sent
+
+
 def test_bulk_alert_actions_respect_filters_permissions_and_audit(client, app, admin):
     host_a = app.extensions["hosts"].create(host_payload(address="10.0.0.21"), fingerprint="SHA256:key-a", machine_id="machine-a")
     host_b = app.extensions["hosts"].create(host_payload(address="10.0.0.22"), fingerprint="SHA256:key-b", machine_id="machine-b")
@@ -366,6 +575,6 @@ def test_database_migrates_existing_alert_table(tmp_path):
     try:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(alerts)")}
         assert {"acknowledged_at", "acknowledged_by", "cleared_at"} <= columns
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
     finally:
         connection.close()

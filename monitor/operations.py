@@ -8,7 +8,7 @@ from typing import Any
 
 from .gpu_scheduler import DispatchResult
 from .security import redact
-from .ssh_client import SSHClient, SSHError, SSHTimeout
+from .ssh_client import SSHClient, SSHConnectionPool, SSHError, SSHTimeout
 from .utils import command_summary, utc_iso
 
 
@@ -155,12 +155,15 @@ def _parse_gpu_diagnostics(output: str) -> dict[str, Any]:
 
 
 class OperationService:
-    def __init__(self, secrets: Any, config: Any, database: Any):
+    def __init__(self, secrets: Any, config: Any, database: Any, connection_pool: SSHConnectionPool | None = None):
         self.secrets = secrets
         self.config = config
         self.database = database
+        self.connection_pool = connection_pool
 
     def _client(self, host: dict[str, Any]) -> SSHClient:
+        if self.connection_pool:
+            return self.connection_pool.client(host)  # type: ignore[return-value]
         return SSHClient(host, self.secrets, self.config.all())
 
     def run(self, host: dict[str, Any], command: str, timeout: int, limit: int | None = None, stdin_data: str | None = None) -> Any:

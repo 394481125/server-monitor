@@ -57,7 +57,19 @@ if [[ "$skip_tests" -eq 0 ]]; then
         echo "pytest is unavailable; continuing without tests (use a development virtualenv for full checks)." >&2
     fi
     if command -v node >/dev/null 2>&1; then
+        node --check monitor/static/app_logic.js
         node --check monitor/static/app.js
+        node --check scripts/browser_acceptance.js
+        node --test tests_js/*.test.js
+        if command -v google-chrome >/dev/null 2>&1; then
+            if [[ -x .venv/bin/python ]]; then
+                .venv/bin/python scripts/e2e_acceptance.py
+            else
+                python3 scripts/e2e_acceptance.py
+            fi
+        else
+            echo "google-chrome is unavailable; browser E2E was skipped." >&2
+        fi
     fi
 fi
 

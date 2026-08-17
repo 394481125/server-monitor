@@ -1,9 +1,10 @@
 "use strict";
 
-const CACHE_NAME = "server-monitor-shell-v1";
+const CACHE_NAME = "server-monitor-shell-v3";
 const SHELL_FILES = [
   "/",
   "/static/style.css",
+  "/static/app_logic.js",
   "/static/app.js",
   "/static/icon.svg",
   "/static/vendor/xterm/xterm.css",

@@ -32,6 +32,7 @@ from .db import Database
 from .development import DevelopmentService
 from .files import FileManagerError, SFTPFileService
 from .gpu_scheduler import GPUScheduler
+from .logging_config import configure_logging
 from .operations import OperationError, OperationService
 from .notifications import NotificationService
 from .permissions import PermissionService
@@ -49,7 +50,7 @@ from .services import (
     host_transfer_rows,
     parse_host_import,
 )
-from .ssh_client import SSHClient, SSHError, SSHFingerprintError
+from .ssh_client import SSHClient, SSHConnectionPool, SSHError, SSHFingerprintError
 from .utils import clamp_page, clamp_page_size, json_dump, json_load, paged, parse_utc, utc_iso, utc_now
 
 
@@ -67,6 +68,7 @@ def _tmux_attach_command(name: str) -> str:
 
 
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
+    configure_logging()
     app = Flask(__name__, instance_relative_config=False)
     root = Path(__file__).resolve().parent.parent
     app.config.from_mapping(
@@ -107,6 +109,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     secret_box = SecretBox(app.config["MASTER_KEY"] or data_dir / "master.key")
     config = ConfigStore(database)
     config.migrate_alert_defaults()
+    ssh_pool = SSHConnectionPool(secret_box, config.all)
     permission_service = PermissionService(database)
     permission_service.ensure_defaults()
     audit = AuditService(database)
@@ -121,9 +124,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         "retry_at=NULL,cooldown_until=NULL,frozen_until=NULL,last_error='应用重启，重新开始空闲计时',updated_at=?",
         (utc_iso(),),
     )
-    operations = OperationService(secret_box, config, database)
+    operations = OperationService(secret_box, config, database, ssh_pool)
     development = DevelopmentService(operations, config)
-    files = SFTPFileService(secret_box, config.all(), app.config["FILE_TRANSFER_LIMIT"])
+    files = SFTPFileService(secret_box, config.all(), app.config["FILE_TRANSFER_LIMIT"], ssh_pool)
     backups = BackupService(database, data_dir)
     generated = auth.ensure_initial_admin(app.config.get("INITIAL_ADMIN_PASSWORD"))
     permission_service.ensure_defaults()
@@ -145,13 +148,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         notifications=notifications,
         permissions=permission_service,
         files=files,
+        ssh_pool=ssh_pool,
     )
 
     background = None
     if process_lock:
         app.extensions["process_lock"] = process_lock
     if app.config["START_BACKGROUND"]:
-        background = BackgroundService(hosts, config, secret_box, database, scheduler, alerts, audit, backups)
+        background = BackgroundService(hosts, config, secret_box, database, scheduler, alerts, audit, backups, ssh_pool)
         background.start()
         app.extensions["background"] = background
 
@@ -164,6 +168,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if background:
             background.stop()
         notifications.close()
+        ssh_pool.close()
         if process_lock:
             process_lock.release()
 
@@ -842,7 +847,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         else:
             task_id = str(uuid.uuid4())
             host = hosts.get(host_id, include_secrets=True)
-            result = Collector(secret_box, config.all()).collect(host, (hosts.latest(host_id) or {}).get("data"))
+            result = Collector(secret_box, config.all(), ssh_pool).collect(host, (hosts.latest(host_id) or {}).get("data"))
             outcome = hosts.ingest_collection(host_id, result)
             database.execute(
                 "INSERT INTO tasks(id,task_type,host_id,state,result_json,error,created_at,finished_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -1330,6 +1335,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             "id": item["id"], "name": item["name"], "address": item["address"],
             "username": item["username"], "status": item.get("status"),
             "allow_install": item.get("allow_install", False),
+            "allow_stress": item.get("allow_stress", False),
         } for item in items])
 
     @app.get("/api/hosts/<int:host_id>/development/stack")
@@ -1341,6 +1347,46 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @login_required(permission="diagnostics.view")
     def gpu_diagnostics(host_id: int):
         return jsonify(diagnostics=development.gpu_diagnostics(hosts.get(host_id, include_secrets=True)))
+
+    @app.get("/api/hosts/<int:host_id>/development/gpu-benchmarks")
+    @login_required(permission="diagnostics.view")
+    def gpu_benchmark_history(host_id: int):
+        hosts.get(host_id)
+        try:
+            limit = max(1, min(20, int(request.args.get("limit", 10))))
+        except ValueError as exc:
+            raise ValueError("limit 必须是整数") from exc
+        rows = database.query_all(
+            "SELECT id,mode,python_command,duration_seconds,gpu_count,result_json,created_at "
+            "FROM gpu_benchmarks WHERE host_id=? ORDER BY created_at DESC LIMIT ?",
+            (host_id, limit),
+        )
+        return jsonify(items=[{
+            "id": row["id"], "mode": row["mode"], "python": row["python_command"],
+            "duration_seconds": row["duration_seconds"], "gpu_count": row["gpu_count"],
+            "created_at": row["created_at"], "result": json_load(row["result_json"], {}),
+        } for row in rows])
+
+    @app.post("/api/hosts/<int:host_id>/development/gpu-benchmarks")
+    @login_required(permission="gpu.benchmark", write=True, elevated=True)
+    def run_gpu_benchmark_route(host_id: int):
+        host = operation_host(host_id, "allow_stress", "GPU 快速评估")
+        result, python_command, duration_seconds = development.gpu_benchmark(host, body())
+        benchmark_id = str(uuid.uuid4())
+        created_at = utc_iso()
+        database.execute(
+            "INSERT INTO gpu_benchmarks(id,host_id,user_id,mode,python_command,duration_seconds,gpu_count,result_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                benchmark_id, host_id, g.user["id"], result["mode"], python_command,
+                duration_seconds, int(result["gpu_count"]), json_dump(result), created_at,
+            ),
+        )
+        audit_action(
+            "gpu_benchmark_completed", target_type="host", target_id=host_id,
+            summary=f"完成 {result['mode']} GPU 快速评估，覆盖 {result['gpu_count']} 张 GPU",
+        )
+        return jsonify(id=benchmark_id, created_at=created_at, result=result), 201
 
     @app.get("/api/hosts/<int:host_id>/development/environments")
     @login_required(permission="development.view")

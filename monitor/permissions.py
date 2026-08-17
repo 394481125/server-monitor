@@ -28,6 +28,7 @@ PERMISSION_CATALOG: tuple[dict[str, str], ...] = (
     {"key": "stress.view", "kind": "action", "group": "远程运维", "label": "查看压力任务", "description": "查看压力测试任务状态"},
     {"key": "stress.manage", "kind": "action", "group": "远程运维", "label": "管理压力测试", "description": "启动和停止远端压力测试"},
     {"key": "gpu.manage", "kind": "action", "group": "调度", "label": "管理 GPU 调度", "description": "修改 GPU 自动调度策略"},
+    {"key": "gpu.benchmark", "kind": "action", "group": "诊断", "label": "运行 GPU 快速评估", "description": "在允许压力任务的主机上运行受控单卡或多卡基准"},
     {"key": "jobs.export", "kind": "action", "group": "调度", "label": "导出调度记录", "description": "导出 GPU 调度 CSV"},
     {"key": "logs.export", "kind": "action", "group": "审计", "label": "导出审计日志", "description": "导出操作日志 CSV"},
     {"key": "settings.manage", "kind": "action", "group": "系统", "label": "修改系统设置", "description": "保存采集、告警和安全设置"},

@@ -42,6 +42,7 @@ source_files=(
     requirements.lock
     monitor
     tests
+    tests_js
     scripts
     deploy
     docs

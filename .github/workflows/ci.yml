@@ -17,10 +17,17 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: requirements.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - run: python -m pip install -r requirements.lock
       - run: python -m pip check
       - run: python -m pytest -q
+      - run: node --check monitor/static/app_logic.js
       - run: node --check monitor/static/app.js
+      - run: node --check scripts/browser_acceptance.js
+      - run: node --test tests_js/*.test.js
+      - run: python scripts/e2e_acceptance.py
       - run: python -m compileall -q monitor tests scripts gunicorn.conf.py
 
   container:

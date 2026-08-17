@@ -8,13 +8,15 @@ import threading
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from .migrations import run_migrations
+
 
 SCHEMA = """
-PRAGMA user_version = 6;
-
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
-    applied_at TEXT NOT NULL
+    applied_at TEXT NOT NULL,
+    name TEXT,
+    checksum TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -318,18 +320,6 @@ CREATE TABLE IF NOT EXISTS saved_views (
     UNIQUE(user_id, page, name)
 );
 
-INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-VALUES(1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-VALUES(2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-VALUES(3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-VALUES(4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-VALUES(5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-VALUES(6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 """
 
 
@@ -355,34 +345,13 @@ class Database:
 
     def initialize(self) -> None:
         with self._lock:
-            with self.connect() as connection:
+            connection = self.connect()
+            try:
                 connection.executescript(SCHEMA)
-                # The project was deployed with schema versions that predate
-                # alert acknowledgement.  Keep this migration idempotent so
-                # an existing SQLite file can be opened without manual SQL.
-                columns = {row[1] for row in connection.execute("PRAGMA table_info(alerts)").fetchall()}
-                for name, definition in (
-                    ("acknowledged_at", "TEXT"),
-                    ("acknowledged_by", "INTEGER REFERENCES users(id) ON DELETE SET NULL"),
-                    ("cleared_at", "TEXT"),
-                ):
-                    if name not in columns:
-                        connection.execute(f"ALTER TABLE alerts ADD COLUMN {name} {definition}")
-                host_columns = {row[1] for row in connection.execute("PRAGMA table_info(hosts)").fetchall()}
-                for name, definition in (
-                    ("asset_location", "TEXT NOT NULL DEFAULT ''"),
-                    ("asset_owner", "TEXT NOT NULL DEFAULT ''"),
-                    ("warranty_expires", "TEXT"),
-                ):
-                    if name not in host_columns:
-                        connection.execute(f"ALTER TABLE hosts ADD COLUMN {name} {definition}")
-                runtime_columns = {row[1] for row in connection.execute("PRAGMA table_info(host_runtime)").fetchall()}
-                if "error_code" not in runtime_columns:
-                    connection.execute("ALTER TABLE host_runtime ADD COLUMN error_code TEXT")
-                audit_columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_logs)").fetchall()}
-                if "changes_json" not in audit_columns:
-                    connection.execute("ALTER TABLE audit_logs ADD COLUMN changes_json TEXT")
-                connection.execute("PRAGMA user_version = 6")
+                connection.commit()
+                run_migrations(connection)
+            finally:
+                connection.close()
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

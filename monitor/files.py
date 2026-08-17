@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import mimetypes
 import posixpath
 import stat
@@ -10,7 +11,7 @@ from typing import Any, BinaryIO, Callable, Iterable
 
 import paramiko
 
-from .ssh_client import SSHClient
+from .ssh_client import SSHClient, SSHConnectionPool
 
 
 class FileManagerError(ValueError):
@@ -19,11 +20,19 @@ class FileManagerError(ValueError):
 
 class SFTPFileService:
     CHUNK_SIZE = 64 * 1024
+    PARTIAL_MARKER = ".server-monitor-upload-"
 
-    def __init__(self, secret_box: Any, settings: Any, max_bytes: int = 512 * 1024 * 1024):
+    def __init__(
+        self,
+        secret_box: Any,
+        settings: Any,
+        max_bytes: int = 512 * 1024 * 1024,
+        connection_pool: SSHConnectionPool | None = None,
+    ):
         self.secret_box = secret_box
         self.settings = settings
         self.max_bytes = max(1, int(max_bytes))
+        self.connection_pool = connection_pool
 
     @staticmethod
     def normalize_path(value: str | None, *, allow_root: bool = True) -> str:
@@ -38,7 +47,7 @@ class SFTPFileService:
         return normalized
 
     def _open(self, host: dict[str, Any]) -> tuple[SSHClient, paramiko.SFTPClient]:
-        client = SSHClient(host, self.secret_box, self.settings)
+        client = self.connection_pool.client(host) if self.connection_pool else SSHClient(host, self.secret_box, self.settings)
         try:
             return client, client.open_sftp()
         except Exception:
@@ -58,6 +67,10 @@ class SFTPFileService:
             "mode": stat.filemode(mode),
         }
 
+    @classmethod
+    def _is_partial_name(cls, name: str) -> bool:
+        return name.startswith(".") and cls.PARTIAL_MARKER in name and name.endswith(".part")
+
     @staticmethod
     def _child_path(parent: str, filename: str) -> str:
         name = str(filename)
@@ -72,7 +85,11 @@ class SFTPFileService:
             attrs = self._stat(sftp, normalized)
             if not stat.S_ISDIR(attrs.st_mode):
                 raise FileManagerError("目标不是目录")
-            items = [self._entry(self._child_path(normalized, item.filename), item) for item in sftp.listdir_attr(normalized)]
+            items = [
+                self._entry(self._child_path(normalized, item.filename), item)
+                for item in sftp.listdir_attr(normalized)
+                if not self._is_partial_name(str(item.filename))
+            ]
             items.sort(key=lambda item: (item["type"] != "directory", item["name"].lower()))
             parent = posixpath.dirname(normalized.rstrip("/")) or "/"
             return {"path": normalized, "parent": None if normalized == "/" else parent, "items": items}
@@ -184,22 +201,36 @@ class SFTPFileService:
                     pass
                 else:
                     raise FileManagerError(f"目标已存在，拒绝覆盖: {destination}")
-                remote = sftp.open(destination, "wb")
-                created_files.append(destination)
-                size = 0
+                size, token = self._stream_identity(uploaded.stream, destination)
+                total += size
+                if total > self.max_bytes:
+                    raise FileManagerError("本次上传总大小超过限制")
+                partial = self._partial_path(destination, token)
+                offset = self._partial_size(sftp, partial, size)
+                remote = sftp.open(partial, "r+b" if offset else "wb")
                 try:
+                    uploaded.stream.seek(offset)
+                    if offset:
+                        remote.seek(offset)
                     while True:
                         chunk = uploaded.stream.read(self.CHUNK_SIZE)
                         if not chunk:
                             break
-                        size += len(chunk)
-                        total += len(chunk)
-                        if total > self.max_bytes:
-                            raise FileManagerError("本次上传总大小超过限制")
                         remote.write(chunk)
                 finally:
                     remote.close()
-                results.append({"name": filename, "relative_path": str(relative), "path": destination, "size": size})
+                completed = int(sftp.stat(partial).st_size or 0)
+                if completed != size:
+                    raise FileManagerError(f"上传未完成，已保留 {completed} 字节供下次续传")
+                sftp.rename(partial, destination)
+                created_files.append(destination)
+                results.append({
+                    "name": filename,
+                    "relative_path": str(relative),
+                    "path": destination,
+                    "size": size,
+                    "resumed_from": offset,
+                })
             return results
         except OSError as exc:
             self._cleanup_created(sftp, created_files, created_directories)
@@ -210,6 +241,38 @@ class SFTPFileService:
         finally:
             sftp.close()
             client.close()
+
+    def _stream_identity(self, stream: BinaryIO, destination: str) -> tuple[int, str]:
+        try:
+            original = stream.tell()
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(0)
+            prefix = stream.read(self.CHUNK_SIZE)
+            stream.seek(original)
+        except (AttributeError, OSError) as exc:
+            raise FileManagerError("上传流不支持断点续传") from exc
+        digest = hashlib.sha256()
+        digest.update(destination.encode("utf-8"))
+        digest.update(str(size).encode("ascii"))
+        digest.update(prefix)
+        return int(size), digest.hexdigest()[:20]
+
+    @classmethod
+    def _partial_path(cls, destination: str, token: str) -> str:
+        parent, name = posixpath.split(destination)
+        return posixpath.join(parent or "/", f".{name}{cls.PARTIAL_MARKER}{token}.part")
+
+    @staticmethod
+    def _partial_size(sftp: paramiko.SFTPClient, partial: str, expected_size: int) -> int:
+        try:
+            size = int(sftp.stat(partial).st_size or 0)
+        except OSError:
+            return 0
+        if size > expected_size:
+            sftp.remove(partial)
+            return 0
+        return size
 
     def mkdir(self, host: dict[str, Any], path: str) -> None:
         normalized = self.normalize_path(path, allow_root=False)

@@ -5,6 +5,8 @@ import stat
 import zipfile
 from pathlib import PurePosixPath
 
+import pytest
+
 from monitor.files import FileManagerError
 
 from .conftest import csrf
@@ -39,8 +41,11 @@ class FakeRemote:
         self.buffer.write(value)
         return len(value)
 
+    def seek(self, offset: int, whence: int = 0):
+        return self.buffer.seek(offset, whence)
+
     def close(self):
-        if "w" in self.mode:
+        if "w" in self.mode or "+" in self.mode or "a" in self.mode:
             self.sftp.files[self.path] = self.buffer.getvalue()
 
 
@@ -281,3 +286,56 @@ def test_sftp_symlink_and_upload_failure_guards(app, monkeypatch):
     else:
         raise AssertionError("oversized upload must be rejected")
     assert "/tmp/too-large.txt" not in fake_sftp.files
+
+
+def test_sftp_upload_resumes_hidden_partial_and_renames_atomically(app, monkeypatch):
+    service = app.extensions["files"]
+    service.CHUNK_SIZE = 4
+    fake_sftp = FakeSFTP()
+    monkeypatch.setattr(service, "_open", lambda _host: (FakeSSH(), fake_sftp))
+    content = b"abcdefghij"
+    uploaded = type("Upload", (), {"filename": "checkpoint.bin", "stream": io.BytesIO(content)})()
+    _size, token = service._stream_identity(uploaded.stream, "/tmp/checkpoint.bin")
+    partial = service._partial_path("/tmp/checkpoint.bin", token)
+    fake_sftp.files[partial] = content[:4]
+
+    result = service.upload({}, "/tmp", [uploaded])
+
+    assert result[0]["resumed_from"] == 4
+    assert fake_sftp.files["/tmp/checkpoint.bin"] == content
+    assert partial not in fake_sftp.files
+    fake_sftp.files[partial] = b"partial"
+    listing = service.list_directory({}, "/tmp")
+    assert partial.split("/")[-1] not in {item["name"] for item in listing["items"]}
+
+
+def test_sftp_upload_failure_preserves_partial_for_retry(app, monkeypatch):
+    service = app.extensions["files"]
+    service.CHUNK_SIZE = 4
+    fake_sftp = FakeSFTP()
+    monkeypatch.setattr(service, "_open", lambda _host: (FakeSSH(), fake_sftp))
+
+    class InterruptedStream(io.BytesIO):
+        def __init__(self, value):
+            super().__init__(value)
+            self.reads = 0
+
+        def read(self, size=-1):
+            self.reads += 1
+            if self.reads >= 3:
+                raise OSError("connection interrupted")
+            return super().read(size)
+
+    content = b"abcdefghij"
+    interrupted = type("Upload", (), {"filename": "model.bin", "stream": InterruptedStream(content)})()
+    with pytest.raises(FileManagerError, match="上传失败"):
+        service.upload({}, "/tmp", [interrupted])
+
+    clean = type("Upload", (), {"filename": "model.bin", "stream": io.BytesIO(content)})()
+    _size, token = service._stream_identity(clean.stream, "/tmp/model.bin")
+    partial = service._partial_path("/tmp/model.bin", token)
+    assert 0 < len(fake_sftp.files[partial]) < len(content)
+
+    result = service.upload({}, "/tmp", [clean])
+    assert result[0]["resumed_from"] > 0
+    assert fake_sftp.files["/tmp/model.bin"] == content

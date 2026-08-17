@@ -9,6 +9,7 @@ from typing import Any
 from .ssh_client import (
     SSHAuthenticationError,
     SSHClient,
+    SSHConnectionPool,
     SSHConnectionError,
     SSHError,
     SSHFingerprintError,
@@ -765,12 +766,13 @@ def _parse_smart(text: str) -> tuple[list[dict[str, Any]], str | None]:
 
 
 class Collector:
-    def __init__(self, secret_box: Any, settings: dict[str, Any]):
+    def __init__(self, secret_box: Any, settings: dict[str, Any], connection_pool: SSHConnectionPool | None = None):
         self.secret_box = secret_box
         self.settings = settings
+        self.connection_pool = connection_pool
 
     def collect(self, host: dict[str, Any], previous: dict[str, Any] | None = None) -> CollectionResult:
-        client = SSHClient(host, self.secret_box, self.settings)
+        client = self.connection_pool.client(host) if self.connection_pool else SSHClient(host, self.secret_box, self.settings)
         started = time.monotonic()
         try:
             fingerprint = client.connect()

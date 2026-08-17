@@ -156,6 +156,7 @@ def test_host_status_is_split_by_ssh_failure_reason(app, error_code, expected):
 def test_gpu_health_alerts_emit_and_recover(app):
     hosts = app.extensions["hosts"]
     host = hosts.create(host_payload(), fingerprint="SHA256:key-one", machine_id="machine-one")
+    app.extensions["monitor_config"].update({"gpu_power_threshold_percent": 95})
     data = {**sample_data(), "gpus": [{
         "index": 0, "uuid": "GPU-1", "power_w": 290, "power_limit_w": 300, "temperature_c": 75, "fan_percent": 0,
         "ecc_corrected": 200, "ecc_uncorrected": 1, "pcie_degraded": True, "pcie_gen": 1, "pcie_gen_max": 4, "pcie_width": 4, "pcie_width_max": 16,
@@ -249,11 +250,11 @@ def test_health_inspection_api_and_fault_status_detail(client, app, admin, monke
     assert faults.status_code == 200 and faults.get_json()["items"][0]["issues"][0]["last_error"] == "密码错误"
 
 
-def test_audit_changes_are_structurally_redacted_and_schema6_and_pwa(app, client, admin):
+def test_audit_changes_are_structurally_redacted_and_schema7_and_pwa(app, client, admin):
     audit_id = AuditService(app.extensions["database"]).write("test", actor=admin, changes={"password": {"before": "old", "after": "new"}, "nested": [{"sendkey": "SCT-secret"}]})
     row = app.extensions["database"].query_one("SELECT changes_json FROM audit_logs WHERE id=?", (audit_id,))
     assert "old" not in row["changes_json"] and "SCT-secret" not in row["changes_json"]
-    assert app.extensions["database"].query_one("PRAGMA user_version")[0] == 6
+    assert app.extensions["database"].query_one("PRAGMA user_version")[0] == 7
     page = client.get("/")
     assert page.status_code == 200 and 'rel="manifest"' in page.get_data(as_text=True)
     assert client.get("/static/manifest.webmanifest").status_code == 200

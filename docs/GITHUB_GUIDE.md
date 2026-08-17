@@ -1,106 +1,61 @@
-# GitHub 上传、更新与发布
-
-本文对应仓库 `git@github.com:394481125/server-monitor.git`。首次上传和日常更新必须区分：已经有 `.git` 和 `origin` 的目录不能再次执行首次发布脚本。
-
-## 首次上传
-
-在 GitHub 源码包目录执行：
-
-```bash
-cd /home/qq394481125/app/server_monitor/dist/server-monitor-github-v1.0.0
-bash scripts/publish_github.sh git@github.com:394481125/server-monitor.git "发布 v1.3.5"
-```
-
-脚本会初始化 `main`。如果 GitHub 仓库已经有 README 或其他提交，脚本会先 fetch 远程 `main`，再把当前发布目录作为后续提交推送，不使用强制推送。它只接受 GitHub URL，并会拒绝已经是 Git 仓库的目录。公开仓库发布前请自行选择并加入 `LICENSE`。
-
-发布目录即使位于另一个源码仓库的 `dist/` 下面，脚本也只使用发布目录自己的 `.git`，不会向上误用父目录仓库。第一次必须运行 `publish_github.sh`；成功后该目录才可以运行 `update_github.sh`。
+# GitHub 更新与发布
 
 ## 日常更新
 
+在已经包含 `.git` 和 `origin` 的源码目录执行：
+
 ```bash
-cd /home/qq394481125/app/server_monitor/dist/server-monitor-github-v1.0.0
-bash scripts/update_github.sh "修复扫描超时提示"
+bash scripts/update_github.sh "说明本次修改"
 ```
 
-脚本会运行 pytest 和 JavaScript 语法检查、`git add -A`、检查差异、提交并推送当前分支。只改文档且暂时没有测试环境时才使用：
+脚本会先同步远端分支，再运行 Python 测试、JavaScript 语法检查、Node 前端逻辑测试，并在本机有 Chrome 时运行 E2E；随后检查暂存差异、提交并推送。仅文档修改且明确接受跳过测试时：
 
 ```bash
-bash scripts/update_github.sh "更新部署说明" --skip-tests
+bash scripts/update_github.sh "更新文档" --skip-tests
 ```
 
-多人协作或 GitHub 网页改过代码时，`update_github.sh` 会先自动 fetch/rebase；也可以手动先同步：
+发生 rebase 冲突时手工解决并重新运行测试，不要使用强制推送。
+
+## 首次发布到新仓库
+
+`publish_github.sh` 只用于不含 `.git` 的发布目录：
 
 ```bash
-git pull --rebase origin main
-bash scripts/update_github.sh "合并后更新"
+bash scripts/publish_github.sh git@github.com:OWNER/REPOSITORY.git "首次发布"
 ```
 
-发生冲突时手工解决、运行测试后再提交；不要强制推送覆盖他人提交。没有改动时脚本会输出 `No changes to commit.`。
+脚本拒绝非 GitHub 地址和已有 Git 仓库。远端已有 `main` 时会先基于远端提交创建后续提交，不执行 force push。
 
-## 发布包
-
-在开发源码根目录使用新版本号：
+## 构建发布包
 
 ```bash
-cd /home/qq394481125/app/server_monitor
-bash scripts/build_release.sh v1.3.5
+bash scripts/build_release.sh vX.Y.Z
 (cd dist && sha256sum -c SHA256SUMS)
 ```
 
 输出：
 
-- `server-monitor-github-v1.3.5/`：源码、测试、CI 和完整文档。
-- `server-monitor-deploy-v1.3.5/`：不含测试的轻量部署包。
-- 两个压缩包和 `SHA256SUMS`。
+- `server-monitor-github-vX.Y.Z/`：源码、Python/JavaScript 测试、CI 和文档。
+- `server-monitor-deploy-vX.Y.Z/`：生产运行所需的轻量文件。
+- 对应两个 `.tar.gz` 和 `SHA256SUMS`。
 
-版本目录不会覆盖，重复版本必须换版本号。`.env`、`data/`、`.venv/`、数据库、主密钥和真实凭据不会进入包。
+构建脚本不会覆盖已有版本目录。`.env`、`data/`、`.venv/`、数据库、主密钥和真实凭据不会进入发布包。
 
-## 标签和 GitHub Actions
-
-`.github/workflows/ci.yml` 在 push/PR 上运行 pytest、pip check、JavaScript 检查和 compileall。推送版本标签会触发镜像/Release 工作流：
+## 标签发布
 
 ```bash
-git tag v1.3.5
-git push origin v1.3.5
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
-发布前先确认工作树和提交内容：
-
-```bash
-git status
-git remote -v
-git branch --show-current
-git diff --cached --check
-git log --oneline -10
-```
-
-## 常见问题
-
-### `Permission denied (publickey)`
-
-```bash
-ssh -T git@github.com
-git remote set-url origin https://github.com/394481125/server-monitor.git
-```
-
-### `fetch first` 或 `non-fast-forward`
-
-```bash
-git pull --rebase origin main
-bash scripts/update_github.sh "解决远端提交后的更新"
-```
-
-首次发布不要手动 `git init && git push`。请使用发布目录中的 `scripts/publish_github.sh`，它会处理远程已有初始提交的情况。
-
-### `not a git repository`
-
-说明当前是部署包或错误路径。进入含 `.git/` 的 GitHub 源码目录；部署包不要自行初始化第二个仓库。
-
-### 检查敏感文件
+推送前应确认：
 
 ```bash
 git status --short
-git ls-files | rg '(^data/|\.env$|master\.key|\.sqlite3$|id_rsa|\.pem$)'
+.venv/bin/python -m pytest -q
+node --test tests_js/*.test.js
+.venv/bin/python scripts/e2e_acceptance.py
+git diff --check
 ```
 
-任何敏感文件出现在输出中，都应在首次提交前移除并轮换凭据。
+CI 的 `test` Job 会运行后端测试、前端逻辑测试、真实 Chrome E2E、依赖检查和 compileall；`container` Job 会构建 Docker 镜像。

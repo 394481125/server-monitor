@@ -1,5 +1,7 @@
 import os
 
+from monitor.logging_config import configured_log_level
+
 
 bind = os.environ.get("SERVER_MONITOR_BIND", "127.0.0.1:8000")
 workers = 1
@@ -13,3 +15,4 @@ reload = False
 accesslog = "-"
 errorlog = "-"
 capture_output = True
+loglevel = configured_log_level()[0].lower()

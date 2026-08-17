@@ -172,6 +172,15 @@ def test_history_cleanup_removes_only_expired_terminal_records(app):
     old_log = utc_iso(now - timedelta(days=31))
     old_collection = utc_iso(now - timedelta(hours=2))
     recent = utc_iso(now - timedelta(minutes=5))
+    future = utc_iso(now + timedelta(hours=1))
+    database.execute(
+        "INSERT INTO sessions(token_hash,user_id,csrf_token,created_at,last_seen_at,expires_at) VALUES(?,?,?,?,?,?)",
+        ("expired-session", 1, "expired", old_collection, old_collection, old_collection),
+    )
+    database.execute(
+        "INSERT INTO sessions(token_hash,user_id,csrf_token,created_at,last_seen_at,expires_at) VALUES(?,?,?,?,?,?)",
+        ("active-session", 1, "active", recent, recent, future),
+    )
     database.execute("INSERT INTO tasks(id,task_type,state,created_at) VALUES(?,?,?,?)", ("old-collection", "collection", "success", old_collection))
     database.execute("INSERT INTO tasks(id,task_type,state,created_at) VALUES(?,?,?,?)", ("recent-collection", "collection", "success", recent))
     database.execute(
@@ -200,9 +209,11 @@ def test_history_cleanup_removes_only_expired_terminal_records(app):
     )
 
     assert counts["collection_tasks"] == 1
+    assert counts["sessions"] == 1
     assert counts["logs"] == 1 and counts["schedule_jobs"] == 1
     assert counts["notifications"] == 1 and counts["recovered_alerts"] == 1
     assert database.query_one("SELECT id FROM tasks WHERE id='recent-collection'")
+    assert database.query_one("SELECT id FROM sessions WHERE token_hash='active-session'")
     assert database.query_one("SELECT id FROM schedule_jobs WHERE id='running-job'")
 
 

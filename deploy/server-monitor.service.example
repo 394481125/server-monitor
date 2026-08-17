@@ -10,6 +10,7 @@ Group=server-monitor
 WorkingDirectory=/opt/server-monitor
 Environment=SERVER_MONITOR_DATA_DIR=/var/lib/server-monitor
 Environment=SERVER_MONITOR_BIND=127.0.0.1:8000
+Environment=LOG_LEVEL=INFO
 EnvironmentFile=-/etc/server-monitor/environment
 ExecStart=/opt/server-monitor/.venv/bin/python -m gunicorn -c gunicorn.conf.py monitor.wsgi:app
 Restart=on-failure
