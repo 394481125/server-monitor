@@ -7,7 +7,7 @@ const {spawn} = require("node:child_process");
 
 const [baseUrl, initialPassword, changedPassword, screenshotPath = ""] = process.argv.slice(2);
 if (!baseUrl || !initialPassword || !changedPassword) {
-  throw new Error("usage: node scripts/browser_acceptance.js BASE_URL INITIAL_PASSWORD CHANGED_PASSWORD [SCREENSHOT]");
+  throw new Error("usage: node tests/acceptance/browser.js BASE_URL INITIAL_PASSWORD CHANGED_PASSWORD [SCREENSHOT]");
 }
 if (typeof WebSocket === "undefined") throw new Error("Node.js 22+ is required for the built-in WebSocket client");
 

@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import atexit
-import codecs
 from datetime import timedelta
 import json
-import queue
 import secrets
-import shlex
 import logging
 import os
 import shutil
@@ -14,13 +11,11 @@ import threading
 import time
 import uuid
 import weakref
-from functools import wraps
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import quote
 
-from flask import Flask, Response, g, jsonify, render_template, request, stream_with_context
-from flask_sock import Sock
+from flask import Flask, Response, g, jsonify, render_template, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from .audit import AuditService
@@ -30,17 +25,23 @@ from .collector import Collector
 from .config import ConfigError, ConfigStore
 from .db import Database
 from .development import DevelopmentService
-from .files import FileManagerError, SFTPFileService
+from .files import SFTPFileService
 from .gpu_scheduler import GPUScheduler
 from .logging_config import configure_logging
 from .operations import OperationError, OperationService
 from .notifications import NotificationService
 from .permissions import PermissionService
 from .security import PasswordService, ProcessLock, SecretBox, redact
+from .routes import (
+    register_development_routes,
+    register_file_routes,
+    register_operation_routes,
+    register_socket_routes,
+)
+from .routes.sockets import _tmux_attach_command
 from .services import (
     AlertService,
     BackupService,
-    HistoryService,
     HostService,
     ServiceError,
     compact_collection_result,
@@ -52,19 +53,10 @@ from .services import (
 )
 from .ssh_client import SSHClient, SSHConnectionPool, SSHError, SSHFingerprintError
 from .utils import clamp_page, clamp_page_size, json_dump, json_load, paged, parse_utc, utc_iso, utc_now
+from .web import COOKIE_NAME, WebContext
 
 
 LOGGER = logging.getLogger("server_monitor")
-COOKIE_NAME = "server_monitor_session"
-WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
-
-
-def _tmux_attach_command(name: str) -> str:
-    return (
-        "if locale -a 2>/dev/null | grep -Eiq '^(C\\.UTF-8|C\\.utf8|en_US\\.UTF-8|en_US\\.utf8)$'; "
-        "then export LANG=C.UTF-8 LC_ALL=C.UTF-8; fi; "
-        f"tmux attach-session -t {shlex.quote(name)}\n"
-    )
 
 
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
@@ -150,6 +142,21 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         files=files,
         ssh_pool=ssh_pool,
     )
+    web_context = WebContext(
+        app=app,
+        database=database,
+        secret_box=secret_box,
+        config=config,
+        auth=auth,
+        audit=audit,
+        hosts=hosts,
+        operations=operations,
+        development=development,
+        backups=backups,
+        permission_service=permission_service,
+        files=files,
+    )
+    app.extensions["web_context"] = web_context
 
     background = None
     if process_lock:
@@ -221,52 +228,11 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         LOGGER.exception("request_id=%s unexpected error", getattr(g, "request_id", None), exc_info=error)
         return jsonify(error="服务器内部错误", request_id=getattr(g, "request_id", None)), 500
 
-    def login_required(admin: bool = False, permission: str | None = None, write: bool = False, elevated: bool = False):
-        def decorator(function: Callable[..., Any]):
-            @wraps(function)
-            def wrapped(*args: Any, **kwargs: Any):
-                if not g.user:
-                    return jsonify(error="请先登录"), 401
-                if admin and g.user["role"] != "admin":
-                    return jsonify(error="权限不足"), 403
-                if permission and not permission_service.allowed(g.user, permission):
-                    return jsonify(error="当前账户未获得该功能权限", permission=permission), 403
-                if write or request.method in WRITE_METHODS:
-                    try:
-                        auth.require_csrf(g.user, request.headers.get("X-CSRF-Token"))
-                    except AuthError as exc:
-                        return jsonify(error=str(exc)), 403
-                    if g.user["must_change_password"] and request.endpoint not in {"change_password", "logout"}:
-                        return jsonify(error="首次登录或密码重置后必须先修改密码", must_change_password=True), 403
-                if elevated and not auth.is_elevated(g.user):
-                    return jsonify(error="该操作需要重新验证当前密码", requires_elevation=True), 403
-                return function(*args, **kwargs)
-
-            return wrapped
-
-        return decorator
-
-    def body() -> dict[str, Any]:
-        value = request.get_json(silent=True)
-        if not isinstance(value, dict):
-            raise ValueError("请求正文必须是 JSON 对象")
-        return value
-
-    def source_ip() -> str:
-        # The app does not trust forwarding headers unless a deployment explicitly adds ProxyFix.
-        return request.remote_addr or "unknown"
-
-    def audit_action(action: str, *, target_type: str | None = None, target_id: Any = None, success: bool = True, summary: str = "", error: str | None = None, changes: dict[str, Any] | None = None) -> None:
-        audit.write(action, actor=g.user, source_ip=source_ip(), target_type=target_type, target_id=target_id, request_id=g.request_id, success=success, summary=summary, error=error, changes=changes)
-
-    def diff_changes(before: dict[str, Any], after: dict[str, Any], *, ignored: set[str] | None = None) -> dict[str, Any]:
-        ignored = ignored or set()
-        result: dict[str, Any] = {}
-        for key in sorted((set(before) | set(after)) - ignored):
-            left, right = before.get(key), after.get(key)
-            if left != right:
-                result[key] = {"before": left, "after": right}
-        return result
+    login_required = web_context.login_required
+    body = web_context.body
+    source_ip = web_context.source_ip
+    audit_action = web_context.audit_action
+    diff_changes = web_context.diff_changes
 
     @app.get("/")
     def index():
@@ -1217,552 +1183,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         audit_action("schedule_jobs_exported", target_type="schedule_job", summary="导出 GPU 调度记录")
         return Response(content, content_type="text/csv; charset=utf-8", headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"})
 
-    @app.get("/api/hosts/<int:host_id>/tmux")
-    @login_required(permission="tmux.view")
-    def list_tmux(host_id: int):
-        return jsonify(items=operations.tmux_sessions(operation_host(host_id, "allow_tmux", " Tmux 操作")))
-
-    @app.get("/api/hosts/<int:host_id>/tmux/<path:name>/snapshot")
-    @login_required(permission="tmux.view")
-    def tmux_snapshot(host_id: int, name: str):
-        return jsonify(snapshot=operations.tmux_snapshot(operation_host(host_id, "allow_tmux", " Tmux 操作"), name))
-
-    @app.post("/api/hosts/<int:host_id>/tmux")
-    @login_required(permission="tmux.manage", write=True)
-    def create_tmux(host_id: int):
-        name = str(body().get("name", ""))
-        operations.tmux_create(operation_host(host_id, "allow_tmux", " Tmux 操作"), name)
-        audit_action("tmux_created", target_type="host", target_id=host_id, summary=f"创建 Tmux 会话 {name}")
-        return jsonify(ok=True), 201
-
-    @app.patch("/api/hosts/<int:host_id>/tmux/<path:name>")
-    @login_required(permission="tmux.manage", write=True)
-    def rename_tmux(host_id: int, name: str):
-        new_name = str(body().get("name", ""))
-        operations.tmux_rename(operation_host(host_id, "allow_tmux", " Tmux 操作"), name, new_name)
-        audit_action("tmux_renamed", target_type="host", target_id=host_id, summary=f"重命名 Tmux 会话 {name}")
-        return jsonify(ok=True)
-
-    @app.delete("/api/hosts/<int:host_id>/tmux/<path:name>")
-    @login_required(permission="tmux.manage", write=True, elevated=True)
-    def delete_tmux(host_id: int, name: str):
-        operations.tmux_kill(operation_host(host_id, "allow_tmux", " Tmux 操作"), name)
-        audit_action("tmux_deleted", target_type="host", target_id=host_id, summary=f"删除 Tmux 会话 {name}")
-        return jsonify(ok=True)
-
-    @app.get("/api/hosts/<int:host_id>/processes")
-    @login_required(permission="process.view")
-    def processes(host_id: int):
-        return jsonify(items=operations.processes(operation_host(host_id, "allow_process", "进程操作"), request.args.get("hide_kernel", "1") != "0"))
-
-    @app.post("/api/hosts/<int:host_id>/processes/<int:pid>/terminate")
-    @login_required(permission="process.terminate", write=True, elevated=True)
-    def terminate_process(host_id: int, pid: int):
-        payload = body()
-        operations.terminate_process(operation_host(host_id, "allow_process", "进程操作"), pid, str(payload.get("started", "")), str(payload.get("signal", "TERM")))
-        audit_action("process_terminated", target_type="process", target_id=pid, summary=f"发送 SIG{payload.get('signal', 'TERM')} 到进程")
-        return jsonify(ok=True)
-
-    @app.get("/api/hosts/<int:host_id>/system-services")
-    @login_required(permission="diagnostics.view")
-    def system_services(host_id: int):
-        return jsonify(items=operations.systemd_services(hosts.get(host_id, include_secrets=True)))
-
-    @app.get("/api/hosts/<int:host_id>/system-services/logs")
-    @login_required(permission="diagnostics.view")
-    def system_service_logs(host_id: int):
-        return jsonify(operations.service_logs(
-            hosts.get(host_id, include_secrets=True),
-            request.args.get("unit", ""),
-            int(request.args.get("lines", 100)),
-            request.args.get("keyword", ""),
-        ))
-
-    @app.get("/api/hosts/<int:host_id>/system-services/restart-plan")
-    @login_required(permission="diagnostics.view")
-    def system_service_restart_plan(host_id: int):
-        unit = request.args.get("unit", "")
-        plan = operations.service_restart_plan(unit)
-        audit_action("system_service_restart_plan", target_type="host", target_id=host_id, summary=f"生成 systemd 服务脚本 {unit}")
-        return jsonify(unit=unit, script=plan, remote_execution=False)
-
-    @app.post("/api/hosts/<int:host_id>/network-diagnostic")
-    @login_required(permission="diagnostics.view", write=True)
-    def network_diagnostic(host_id: int):
-        payload = body()
-        result = operations.network_diagnostic(
-            hosts.get(host_id, include_secrets=True),
-            payload.get("target", ""),
-            str(payload.get("mode", "ping")),
-            payload.get("port"),
-        )
-        audit_action("network_diagnostic", target_type="host", target_id=host_id, success=result["success"], summary=f"网络诊断 {result['mode']} {result['target']}", error=None if result["success"] else result["output"][:500])
-        return jsonify(result)
-
-    @app.get("/api/hosts/<int:host_id>/docker/inventory")
-    @login_required(permission="page.hosts")
-    def docker_inventory(host_id: int):
-        host = hosts.get(host_id, include_secrets=True)
-        if not host.get("docker_enabled"):
-            raise OperationError("该主机已关闭 Docker 采集")
-        return jsonify(operations.docker_inventory(host))
-
-    @app.get("/api/hosts/<int:host_id>/docker/logs")
-    @login_required(permission="page.hosts")
-    def docker_logs(host_id: int):
-        host = hosts.get(host_id, include_secrets=True)
-        if not host.get("docker_enabled"):
-            raise OperationError("该主机已关闭 Docker 采集")
-        return jsonify(operations.docker_logs(host, request.args.get("container", ""), int(request.args.get("lines", 100)), request.args.get("keyword", "")))
-
-    @app.get("/api/hosts/<int:host_id>/tools")
-    @login_required(permission="tools.view")
-    def detect_tools(host_id: int):
-        return jsonify(tools=operations.detect_tools(hosts.get(host_id, include_secrets=True)))
-
-    @app.post("/api/hosts/<int:host_id>/health-inspection")
-    @login_required(permission="diagnostics.view", write=True)
-    def health_inspection(host_id: int):
-        result = operations.health_inspection(hosts.get(host_id, include_secrets=True))
-        audit_action("host_health_inspection", target_type="host", target_id=host_id, summary=f"完成主机巡检：通过 {result['passed']}，警告 {result['warnings']}，不可用 {result['unavailable']}")
-        return jsonify(result)
-
-    @app.get("/api/development/hosts")
-    @login_required(permission="page.environments")
-    def development_hosts():
-        items = hosts.list()
-        return jsonify(items=[{
-            "id": item["id"], "name": item["name"], "address": item["address"],
-            "username": item["username"], "status": item.get("status"),
-            "allow_install": item.get("allow_install", False),
-            "allow_stress": item.get("allow_stress", False),
-        } for item in items])
-
-    @app.get("/api/hosts/<int:host_id>/development/stack")
-    @login_required(permission="development.view")
-    def development_stack(host_id: int):
-        return jsonify(stack=development.development_stack(hosts.get(host_id, include_secrets=True)))
-
-    @app.get("/api/hosts/<int:host_id>/development/gpu-diagnostics")
-    @login_required(permission="diagnostics.view")
-    def gpu_diagnostics(host_id: int):
-        return jsonify(diagnostics=development.gpu_diagnostics(hosts.get(host_id, include_secrets=True)))
-
-    @app.get("/api/hosts/<int:host_id>/development/gpu-benchmarks")
-    @login_required(permission="diagnostics.view")
-    def gpu_benchmark_history(host_id: int):
-        hosts.get(host_id)
-        try:
-            limit = max(1, min(20, int(request.args.get("limit", 10))))
-        except ValueError as exc:
-            raise ValueError("limit 必须是整数") from exc
-        rows = database.query_all(
-            "SELECT id,mode,python_command,duration_seconds,gpu_count,result_json,created_at "
-            "FROM gpu_benchmarks WHERE host_id=? ORDER BY created_at DESC LIMIT ?",
-            (host_id, limit),
-        )
-        return jsonify(items=[{
-            "id": row["id"], "mode": row["mode"], "python": row["python_command"],
-            "duration_seconds": row["duration_seconds"], "gpu_count": row["gpu_count"],
-            "created_at": row["created_at"], "result": json_load(row["result_json"], {}),
-        } for row in rows])
-
-    @app.post("/api/hosts/<int:host_id>/development/gpu-benchmarks")
-    @login_required(permission="gpu.benchmark", write=True, elevated=True)
-    def run_gpu_benchmark_route(host_id: int):
-        host = operation_host(host_id, "allow_stress", "GPU 快速评估")
-        result, python_command, duration_seconds = development.gpu_benchmark(host, body())
-        benchmark_id = str(uuid.uuid4())
-        created_at = utc_iso()
-        database.execute(
-            "INSERT INTO gpu_benchmarks(id,host_id,user_id,mode,python_command,duration_seconds,gpu_count,result_json,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                benchmark_id, host_id, g.user["id"], result["mode"], python_command,
-                duration_seconds, int(result["gpu_count"]), json_dump(result), created_at,
-            ),
-        )
-        audit_action(
-            "gpu_benchmark_completed", target_type="host", target_id=host_id,
-            summary=f"完成 {result['mode']} GPU 快速评估，覆盖 {result['gpu_count']} 张 GPU",
-        )
-        return jsonify(id=benchmark_id, created_at=created_at, result=result), 201
-
-    @app.get("/api/hosts/<int:host_id>/development/environments")
-    @login_required(permission="development.view")
-    def environment_inventory(host_id: int):
-        host = hosts.get(host_id, include_secrets=True)
-        root = request.args.get("root") or f"/home/{host['username']}"
-        return jsonify(development.environment_inventory(host, root))
-
-    @app.post("/api/hosts/<int:host_id>/development/environment-plan")
-    @login_required(permission="development.plan", write=True)
-    def environment_plan(host_id: int):
-        plan = development.environment_plan(operation_host(host_id, "allow_install", "开发环境管理"), body())
-        audit_action("environment_plan_generated", target_type="host", target_id=host_id, summary=f"生成虚拟环境 {plan['backend']} {plan['action']} 方案")
-        return jsonify(plan=plan)
-
-    @app.post("/api/hosts/<int:host_id>/development/environment-backup-plan")
-    @login_required(permission="development.plan", write=True)
-    def environment_backup_plan(host_id: int):
-        operation_host(host_id, "allow_install", "开发环境管理")
-        plan = development.environment_backup_plan(body())
-        audit_action("environment_backup_plan_generated", target_type="host", target_id=host_id, summary=f"生成虚拟环境备份脚本 {plan['path']}")
-        return jsonify(plan=plan)
-
-    @app.post("/api/hosts/<int:host_id>/development/environment-execute")
-    @login_required(permission="development.execute", write=True, elevated=True)
-    def execute_environment_plan(host_id: int):
-        result = development.execute_environment_plan(operation_host(host_id, "allow_install", "开发环境管理"), body())
-        audit_action(
-            "environment_plan_executed", target_type="host", target_id=host_id, success=result["ok"],
-            summary=f"网页执行虚拟环境 {result['plan']['backend']} {result['plan']['action']} 方案",
-            error=None if result["ok"] else result["stderr"][:500],
-        )
-        return jsonify(result), 200 if result["ok"] else 409
-
-    @app.get("/api/hosts/<int:host_id>/development/conda-export")
-    @login_required(permission="development.view")
-    def export_conda_environment(host_id: int):
-        path = request.args.get("path", "")
-        content = development.export_conda_environment(hosts.get(host_id, include_secrets=True), path)
-        audit_action("conda_environment_exported", target_type="host", target_id=host_id, summary=f"导出 conda 环境 {path}")
-        return Response(content, content_type="text/yaml; charset=utf-8", headers={"Content-Disposition": f"attachment; filename*=UTF-8''conda-environment-{host_id}.yml"})
-
-    @app.post("/api/hosts/<int:host_id>/development/conda-yaml-plan")
-    @login_required(permission="development.plan", write=True)
-    def conda_yaml_plan(host_id: int):
-        plan = development.conda_yaml_plan(operation_host(host_id, "allow_install", "开发环境管理"), body())
-        audit_action("conda_yaml_plan_generated", target_type="host", target_id=host_id, summary=f"生成 conda YAML 重建方案 {plan['path']}")
-        return jsonify(plan=plan)
-
-    @app.post("/api/hosts/<int:host_id>/development/conda-yaml-execute")
-    @login_required(permission="development.execute", write=True, elevated=True)
-    def execute_conda_yaml_plan(host_id: int):
-        result = development.execute_conda_yaml_plan(operation_host(host_id, "allow_install", "开发环境管理"), body())
-        audit_action("conda_yaml_plan_executed", target_type="host", target_id=host_id, success=result["ok"], summary=f"网页执行 conda YAML 重建 {result['plan']['path']}")
-        return jsonify(result), 200 if result["ok"] else 409
-
-    @app.post("/api/hosts/<int:host_id>/development/system-plan")
-    @login_required(permission="development.plan", write=True)
-    def system_plan(host_id: int):
-        payload = body()
-        if payload.get("kind") == "apt" and not permission_service.allowed(g.user, "apt.plan"):
-            return jsonify(error="当前账户未获得 APT 方案权限", permission="apt.plan"), 403
-        plan = development.system_plan(operation_host(host_id, "allow_install", "开发环境管理"), payload)
-        audit_action("system_plan_generated", target_type="host", target_id=host_id, summary=f"生成 {plan['title']} 脚本")
-        return jsonify(plan=plan)
-
-    @app.get("/api/hosts/<int:host_id>/development/apt-packages")
-    @login_required(permission="development.view")
-    def apt_packages(host_id: int):
-        return jsonify(items=development.apt_packages(hosts.get(host_id, include_secrets=True), request.args.get("search", "")))
-
-    @app.get("/api/hosts/<int:host_id>/files/usage")
-    @login_required(permission="storage.scan")
-    def directory_usage(host_id: int):
-        settings = config.all()
-        return jsonify(development.directory_usage(
-            file_host(host_id), request.args.get("path", ""),
-            request.args.get("timeout_seconds", settings["scan_timeout_seconds"]),
-        ))
-
-    @app.get("/api/hosts/<int:host_id>/files/large-files")
-    @login_required(permission="storage.scan")
-    def large_files(host_id: int):
-        settings = config.all()
-        return jsonify(development.large_files(
-            file_host(host_id), request.args.get("path", ""),
-            request.args.get("minimum_bytes", settings["scan_minimum_mib"] * 1024 * 1024),
-            request.args.get("limit", settings["scan_result_limit"]),
-            request.args.get("max_depth", settings["scan_max_depth"]),
-            request.args.get("timeout_seconds", settings["scan_timeout_seconds"]),
-        ))
-
-    @app.post("/api/hosts/<int:host_id>/tools/<tool>/install")
-    @login_required(permission="tools.install", write=True, elevated=True)
-    def install_tool(host_id: int, tool: str):
-        command = operations.install_tool(operation_host(host_id, "allow_install", "工具安装"), tool)
-        audit_action("tool_installed", target_type="host", target_id=host_id, summary=f"安装工具 {tool}: {command}")
-        return jsonify(ok=True)
-
-    @app.get("/api/hosts/<int:host_id>/tools/<tool>/install-plan")
-    @login_required(permission="tools.install")
-    def install_tool_plan(host_id: int, tool: str):
-        host = operation_host(host_id, "allow_install", "工具安装")
-        return jsonify(command=operations.installation_command(host, tool), tool=tool, sudo_password_configured=bool(host.get("sudo_password")))
-
-    @app.post("/api/hosts/<int:host_id>/stress")
-    @login_required(permission="stress.manage", write=True, elevated=True)
-    def start_stress(host_id: int):
-        payload = body()
-        task_id = operations.start_stress(operation_host(host_id, "allow_stress", "压力测试"), int(payload.get("cpu_workers", 0)), int(payload.get("memory_workers", 0)), int(payload.get("memory_percent", 50)), int(payload.get("duration_minutes", 1)))
-        audit_action("stress_started", target_type="host", target_id=host_id, summary=f"启动压力测试 {task_id}")
-        return jsonify(task_id=task_id), 201
-
-    @app.post("/api/hosts/<int:host_id>/stress/<task_id>/stop")
-    @login_required(permission="stress.manage", write=True)
-    def stop_stress(host_id: int, task_id: str):
-        operations.stop_stress(operation_host(host_id, "allow_stress", "压力测试"), task_id)
-        audit_action("stress_stopped", target_type="host", target_id=host_id, summary=f"停止压力测试 {task_id}")
-        return jsonify(ok=True)
-
-    @app.get("/api/hosts/<int:host_id>/stress/<task_id>")
-    @login_required(permission="stress.view")
-    def stress_status(host_id: int, task_id: str):
-        return jsonify(task=operations.stress_status(operation_host(host_id, "allow_stress", "压力测试"), task_id))
-
-    @app.post("/api/backups")
-    @login_required(permission="backup.create", write=True)
-    def create_backup():
-        settings = config.all()
-        path = backups.create(settings["backup_dir"], settings["backup_keep"])
-        audit_action("backup_created", target_type="backup", target_id=str(path), summary="数据库备份成功")
-        return jsonify(path=str(path)), 201
-
-    @app.post("/api/maintenance/compact")
-    @login_required(admin=True, write=True, elevated=True)
-    def compact_database():
-        settings = config.all()
-        history_service = HistoryService(database)
-        aggregate = history_service.aggregate(
-            mid_seconds=settings["aggregation_mid_seconds"],
-            long_seconds=settings["aggregation_long_seconds"],
-            raw_retention_minutes=settings["metric_raw_retention_minutes"],
-            mid_retention_hours=settings["metric_mid_retention_hours"],
-        )
-        cleanup = history_service.cleanup(
-            metric_retention_days=settings["metric_retention_days"],
-            log_retention_days=settings["log_retention_days"],
-            collection_task_retention_minutes=settings["collection_task_retention_minutes"],
-        )
-        result = database.compact()
-        audit_action(
-            "database_compacted",
-            target_type="database",
-            summary=f"清理并压缩数据库，回收 {result['reclaimed_bytes']} 字节",
-        )
-        return jsonify(aggregate=aggregate, cleanup=cleanup, **result)
-
-    @app.get("/api/file-manager/hosts")
-    @login_required(permission="files.browse")
-    def file_manager_hosts():
-        items = hosts.list()
-        return jsonify(items=[{"id": item["id"], "name": item["name"], "address": item["address"], "username": item["username"], "status": item.get("status")} for item in items])
-
-    def file_host(host_id: int) -> dict[str, Any]:
-        return hosts.get(host_id, include_secrets=True)
-
-    @app.get("/api/hosts/<int:host_id>/files")
-    @login_required(permission="files.browse")
-    def list_files(host_id: int):
-        return jsonify(files.list_directory(file_host(host_id), request.args.get("path", "/")))
-
-    @app.get("/api/hosts/<int:host_id>/files/download")
-    @login_required(permission="files.download")
-    def download_file(host_id: int):
-        path = request.args.get("path", "")
-        iterator, filename, content_type, _cleanup = files.download(file_host(host_id), path)
-        audit_action("file_downloaded", target_type="host", target_id=host_id, summary=f"下载远端路径 {path}")
-        return Response(
-            stream_with_context(iterator),
-            content_type=content_type,
-            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
-        )
-
-    @app.post("/api/hosts/<int:host_id>/files/upload")
-    @login_required(permission="files.upload", write=True)
-    def upload_files(host_id: int):
-        uploaded = request.files.getlist("files")
-        if not uploaded:
-            raise FileManagerError("请选择要上传的文件或文件夹")
-        directory = request.form.get("path", "/")
-        result = files.upload(file_host(host_id), directory, uploaded)
-        audit_action("files_uploaded", target_type="host", target_id=host_id, summary=f"上传 {len(result)} 个文件到 {directory}")
-        return jsonify(items=result), 201
-
-    @app.post("/api/hosts/<int:host_id>/files/directories")
-    @login_required(permission="files.manage", write=True)
-    def create_directory(host_id: int):
-        path = str(body().get("path", ""))
-        files.mkdir(file_host(host_id), path)
-        audit_action("directory_created", target_type="host", target_id=host_id, summary=f"新建远端目录 {path}")
-        return jsonify(ok=True), 201
-
-    @app.post("/api/hosts/<int:host_id>/files/copy")
-    @login_required(permission="files.manage", write=True)
-    def copy_file(host_id: int):
-        payload = body()
-        source, destination = str(payload.get("source", "")), str(payload.get("destination", ""))
-        files.copy(file_host(host_id), source, destination)
-        audit_action("file_copied", target_type="host", target_id=host_id, summary=f"复制远端路径 {source} 到 {destination}")
-        return jsonify(ok=True)
-
-    @app.patch("/api/hosts/<int:host_id>/files")
-    @login_required(permission="files.manage", write=True)
-    def move_file(host_id: int):
-        payload = body()
-        source, destination = str(payload.get("source", "")), str(payload.get("destination", ""))
-        files.rename(file_host(host_id), source, destination)
-        audit_action("file_moved", target_type="host", target_id=host_id, summary=f"移动或重命名远端路径 {source} 到 {destination}")
-        return jsonify(ok=True)
-
-    @app.delete("/api/hosts/<int:host_id>/files")
-    @login_required(permission="files.delete", write=True, elevated=True)
-    def delete_file(host_id: int):
-        path = str(body().get("path", ""))
-        files.delete(file_host(host_id), path)
-        audit_action("file_deleted", target_type="host", target_id=host_id, summary=f"删除远端路径 {path}")
-        return jsonify(ok=True)
-
-    sock = Sock(app)
-
-    def operation_host(host_id: int, capability: str, label: str) -> dict[str, Any]:
-        host = hosts.get(host_id, include_secrets=True)
-        if not host.get(capability, False):
-            raise ServiceError(f"该主机未允许{label}")
-        return host
-
-    interactive_lock = threading.RLock()
-    interactive_total = 0
-    interactive_by_user_host: dict[tuple[int, int], int] = {}
-
-    def interactive_acquire(user_id: int, host_id: int) -> bool:
-        nonlocal interactive_total
-        key = (user_id, host_id)
-        with interactive_lock:
-            if interactive_total >= config.all()["interactive_ssh_limit"] or interactive_by_user_host.get(key, 0) >= 2:
-                return False
-            interactive_total += 1
-            interactive_by_user_host[key] = interactive_by_user_host.get(key, 0) + 1
-            return True
-
-    def interactive_release(user_id: int, host_id: int) -> None:
-        nonlocal interactive_total
-        key = (user_id, host_id)
-        with interactive_lock:
-            interactive_total = max(0, interactive_total - 1)
-            if interactive_by_user_host.get(key, 0) <= 1:
-                interactive_by_user_host.pop(key, None)
-            else:
-                interactive_by_user_host[key] -= 1
-
-    def interactive_socket(ws: Any, host_id: int, tmux_name: str | None = None) -> None:
-        user = permission_service.decorate(auth.authenticate(request.cookies.get(COOKIE_NAME), touch=False))
-        origin = request.headers.get("Origin")
-        allowed_origins = {request.host_url.rstrip("/"), request.url_root.rstrip("/")}
-        interactive_permission = "tmux.view" if tmux_name else "terminal.open"
-        if not user or not permission_service.allowed(user, interactive_permission) or not AuthService.is_elevated(user) or (origin and origin not in allowed_origins):
-            ws.close(reason=1008, message="unauthorized")
-            return
-        host = hosts.get(host_id, include_secrets=True)
-        if tmux_name and not host["allow_tmux"]:
-            ws.close(reason=1008, message="tmux disabled")
-            return
-        if not tmux_name and not host["allow_terminal"]:
-            ws.close(reason=1008, message="terminal disabled")
-            return
-        if not interactive_acquire(user["id"], host_id):
-            ws.close(reason=1013, message="interactive ssh limit")
-            return
-        client = SSHClient(host, secret_box, config.all())
-        session_id = str(uuid.uuid4())
-        channel = None
-        output_queue: queue.Queue[bytes] = queue.Queue()
-        output_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        output_size = 0
-        output_lock = threading.Lock()
-        overflow = threading.Event()
-        stopped = threading.Event()
-        last_activity = time.monotonic()
-        reason = "client_closed"
-
-        def read_output() -> None:
-            nonlocal output_size
-            try:
-                while not stopped.is_set() and channel and not channel.closed:
-                    if not channel.recv_ready():
-                        time.sleep(0.01)
-                        continue
-                    chunk = channel.recv(65536)
-                    with output_lock:
-                        if output_size + len(chunk) > 1024 * 1024:
-                            overflow.set()
-                            return
-                        output_size += len(chunk)
-                    output_queue.put(chunk)
-            except Exception:
-                return
-
-        reader = None
-        try:
-            channel = client.open_shell()
-            if tmux_name:
-                # Tmux uses the attaching client's locale to decide whether wide UTF-8
-                # characters are supported. POSIX shells commonly lack a locale export.
-                channel.send(_tmux_attach_command(tmux_name).encode("utf-8"))
-            reader = threading.Thread(target=read_output, daemon=True)
-            reader.start()
-            audit.write("tmux_attached" if tmux_name else "terminal_connected", actor=user, source_ip=request.remote_addr, target_type="host", target_id=host_id, success=True, summary=f"交互会话 {session_id}")
-            while True:
-                current = permission_service.decorate(auth.authenticate(request.cookies.get(COOKIE_NAME), touch=False))
-                if not current or not permission_service.allowed(current, interactive_permission):
-                    reason = "session_invalidated"
-                    break
-                if overflow.is_set():
-                    reason = "output_buffer_limit"
-                    break
-                if time.monotonic() - last_activity > config.all()["terminal_idle_seconds"]:
-                    reason = "idle_timeout"
-                    break
-                try:
-                    chunk = output_queue.get_nowait()
-                except queue.Empty:
-                    chunk = None
-                if chunk is not None:
-                    decoded = output_decoder.decode(chunk)
-                    if decoded:
-                        ws.send(decoded)
-                    with output_lock:
-                        output_size = max(0, output_size - len(chunk))
-                    last_activity = time.monotonic()
-                try:
-                    message = ws.receive(timeout=0.05)
-                except (TimeoutError, queue.Empty):
-                    message = None
-                if message:
-                    last_activity = time.monotonic()
-                    try:
-                        parsed = json.loads(message)
-                    except (TypeError, json.JSONDecodeError):
-                        parsed = {"type": "input", "data": message}
-                    if parsed.get("type") == "resize":
-                        channel.resize_pty(width=max(20, min(500, int(parsed.get("cols", 120)))), height=max(5, min(200, int(parsed.get("rows", 32)))))
-                    elif parsed.get("type") == "input":
-                        channel.send(str(parsed.get("data", "")).encode("utf-8"))
-                if channel.closed or channel.exit_status_ready():
-                    reason = "remote_closed"
-                    break
-        except Exception as exc:
-            reason = f"error:{type(exc).__name__}"
-        finally:
-            stopped.set()
-            if channel:
-                channel.close()
-            client.close()
-            interactive_release(user["id"], host_id)
-            audit.write("tmux_detached" if tmux_name else "terminal_disconnected", actor=user, source_ip=request.remote_addr, target_type="host", target_id=host_id, success=True, summary=f"交互会话 {session_id} 断开: {reason}")
-            try:
-                ws.close(reason=1000, message=reason[:123])
-            except Exception:
-                pass
-
-    @sock.route("/ws/terminal/<int:host_id>")
-    def terminal(ws: Any, host_id: int) -> None:
-        interactive_socket(ws, host_id)
-
-    @sock.route("/ws/tmux/<int:host_id>/<path:tmux_name>")
-    def tmux_terminal(ws: Any, host_id: int, tmux_name: str) -> None:
-        interactive_socket(ws, host_id, tmux_name)
+    register_operation_routes(web_context)
+    register_development_routes(web_context)
+    register_file_routes(web_context)
+    register_socket_routes(web_context)
 
     return app

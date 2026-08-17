@@ -25,9 +25,9 @@ jobs:
       - run: python -m pytest -q
       - run: node --check monitor/static/app_logic.js
       - run: node --check monitor/static/app.js
-      - run: node --check scripts/browser_acceptance.js
-      - run: node --test tests_js/*.test.js
-      - run: python scripts/e2e_acceptance.py
+      - run: node --check tests/acceptance/browser.js
+      - run: node --test tests/frontend/*.test.js
+      - run: python tests/acceptance/e2e.py
       - run: python -m compileall -q monitor tests scripts gunicorn.conf.py
 
   container:

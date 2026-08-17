@@ -9,7 +9,7 @@ from pathlib import Path
 
 from werkzeug.serving import make_server
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -135,7 +135,7 @@ def main() -> int:
             completed = subprocess.run(
                 [
                     "node",
-                    str(Path(__file__).with_name("browser_acceptance.js")),
+                    str(Path(__file__).with_name("browser.js")),
                     f"http://127.0.0.1:{server.server_port}/",
                     initial_password,
                     changed_password,

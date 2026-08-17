@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const logic = require("../monitor/static/app_logic.js");
+const logic = require("../../monitor/static/app_logic.js");
 
 test("escapes untrusted HTML and formats metric values", () => {
   assert.equal(logic.escapeHtml('<script a="1">&'), "&lt;script a=&quot;1&quot;&gt;&amp;");

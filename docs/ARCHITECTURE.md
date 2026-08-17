@@ -4,67 +4,69 @@
 
 ```text
 Browser
-  -> Flask/Gunicorn (1 worker, gevent)
-       -> Auth / Permission / Audit
-       -> Host, File, Operation, Development services
-       -> SSH connection pool -> managed Linux hosts
-       -> Background collector / scheduler / maintenance
-       -> SQLite WAL + encrypted secret key
+  -> Flask / Gunicorn (单 Worker, gevent)
+       -> Web 安全上下文 -> 领域路由 -> 领域服务
+       -> SSH 连接池 -> 被管 Linux 主机
+       -> 后台采集 / GPU 调度 / 维护
+       -> SQLite WAL + 加密主密钥
 ```
 
-Web API、后台采集、GPU 调度、备份和维护当前运行在同一应用进程。`ProcessLock` 保证同一数据目录只有一个实例。
-
-维护任务按配置聚合和清理指标、审计、已结束任务、通知、恢复告警及过期会话；数据库和备份文件不依赖手工删除控制增长。
+Web API、后台采集、调度和维护当前位于同一应用进程。`ProcessLock` 保证一个数据目录只被一个实例打开；SQLite 保存配置、会话、任务、指标、告警和审计。
 
 ## 模块边界
 
-- `monitor/app.py`：应用装配、HTTP/WebSocket 路由和请求级安全。
-- `monitor/services.py`：主机、历史、告警、备份等领域服务。
-- `monitor/collector.py`：远端采集命令和解析。
-- `monitor/operations.py`：受限远端运维操作。
-- `monitor/development.py`、`monitor/gpu_benchmark.py`：开发环境和 GPU 评估。
-- `monitor/files.py`：SFTP 文件管理和断点续传。
-- `monitor/ssh_client.py`：SSH 客户端、指纹校验和连接池。
-- `monitor/migrations.py`、`monitor/db.py`：SQLite schema、迁移和存储原语。
-- `monitor/static/app_logic.js`：可测试前端纯逻辑。
-- `monitor/static/app.js`：页面状态、渲染和交互。
+| 模块 | 职责 |
+| --- | --- |
+| `monitor/app.py` | 创建服务、注册通用中间件及核心 API，并装配领域路由 |
+| `monitor/web.py` | 统一登录、权限、CSRF、二次认证、JSON 请求体和审计调用 |
+| `monitor/routes/` | 运维、开发环境、文件与交互终端的 HTTP/WebSocket 适配层 |
+| `monitor/services.py` | 主机、历史、告警、备份和导出等领域逻辑 |
+| `monitor/collector.py` | 远端只读采集脚本、解析及扁平指标 |
+| `monitor/operations.py` | 进程、Tmux、诊断、Docker 只读视图和受限任务 |
+| `monitor/development.py` | Python/CUDA 环境探测、可审计方案及 GPU 评估入口 |
+| `monitor/files.py` | SFTP 浏览、传输、校验和原子断点续传 |
+| `monitor/ssh_client.py` | 主机指纹、命令超时、连接租约和空闲连接池 |
+| `monitor/db.py` / `migrations.py` | SQLite 原语、基础 schema 和 forward-only 迁移 |
 
-## 单 Worker 约束
+路由只负责输入、权限和响应适配。可独立测试的规则应进入对应服务，跨领域通用的 HTTP 规则进入 `WebContext`，不得在多个路由模块复制鉴权或审计实现。
 
-`workers = 1` 是当前一致性要求。进程锁、后台循环和 SQLite 都以单实例为前提。gevent 负责 WebSocket 和 HTTP IO 并发，后台线程池负责受控 SSH 并发，SSH 池减少重复握手。
+## 请求路径
 
-多 Worker 演进需要先完成：
+1. `before_request` 生成请求 ID、认证会话并装饰用户权限。
+2. `WebContext.login_required` 检查登录、功能权限、CSRF、强制改密和二次认证。
+3. 路由校验 HTTP 输入，调用领域服务，不直接拼接任意远端 Shell。
+4. 服务通过数据库或 SSH 客户端完成操作，写操作记录 before/after 或结构化摘要。
+5. `after_request` 设置 CSP、安全响应头和缓存策略。
 
-1. 将后台服务从 Flask 应用工厂移到独立进程。
-2. 为采集、调度和维护建立跨进程租约及幂等任务键。
-3. 将会话、交互 SSH 限制和任务状态移到共享存储。
-4. 使用 PostgreSQL 等多实例数据库。
-5. 最后把 Web 层改为无状态多 Worker。
+现有 URL 和响应结构是前端契约。拆分路由时保持端点函数名、权限键、审计动作和状态码不变，并运行完整 API 与浏览器测试。
 
-## 路由拆分策略
+## 后台与单实例约束
 
-`app.py` 仍较大，但本轮不进行全量蓝图迁移，因为装饰器依赖请求用户、权限、审计和多个服务闭包，机械拆分会扩大回归面。
+`BackgroundService` 负责定时采集、维护和告警；`GPUScheduler` 依赖连续样本推进状态。两者与 Flask 应用共享数据库和内存状态，因此当前必须使用一个 Gunicorn Worker。
 
-后续按域渐进拆分：
+横向扩展顺序：
 
-- 先把共用 `login_required`、`audit_action` 和服务访问放入明确的应用扩展接口。
-- 再按 `auth/hosts/alerts/development/files/operations` 建立 Blueprint。
-- 每迁移一个域，保持 API 路径和响应契约不变，并运行全量 API/E2E。
+1. 将采集、调度、备份和维护移到独立 Worker 服务。
+2. 为任务建立跨进程租约、幂等键及共享会话状态。
+3. 将 SQLite 迁移到支持多实例写入的数据库。
+4. 最后增加无状态 Web Worker 和节点。
 
-## 数据迁移
+## 数据与迁移
 
-基础 schema 使用 `CREATE IF NOT EXISTS` 保证新库可启动；有序迁移负责旧库升级和新字段。迁移版本必须从 1 连续递增，不允许修改已发布迁移的实现；校验和用于发现代码漂移。
+基础 schema 保证新库可启动，有序迁移负责旧库升级。迁移版本必须连续，已发布迁移不得修改；名称与校验和用于检测代码漂移。
 
-本批所有待执行迁移在单个写事务中提交。当前采用 forward-only 策略：失败自动回滚，已成功上线后的业务回退依赖升级前备份，而不是运行破坏性的 down migration。
+一次启动中的所有待执行迁移在同一个 `BEGIN IMMEDIATE` 事务内提交，任一步失败都会整体回滚并拒绝启动。迁移采用 forward-only 策略，生产回退依赖升级前成组备份数据库和主密钥。
 
-## SSH 复用
+## SSH 与文件传输
 
-连接池按主机 ID、地址、端口、用户、认证材料和指纹生成连接键。租约从空闲列表移除，因此同一个 Paramiko Client 不会被两个线程同时使用。归还时只保留活动 Transport；连接异常、空闲超时、容量超限和配置变化都会关闭连接。
+连接池按主机、地址、端口、用户、凭据和指纹生成连接键。租约从空闲池移除，因此同一个 Paramiko Client 不会被线程并发使用；凭据变化、连接异常、空闲超时和应用退出都会关闭连接。
 
-交互终端不进入连接池，因为其生命周期由 WebSocket 独占。
+交互终端由 WebSocket 独占，不进入连接池，并受全局及用户/主机并发限制。SFTP 上传先写同目录隐藏临时文件，按目标、大小和首块指纹续传，通过大小校验后原子重命名。
 
-## GPU 评估边界
+## 安全边界
 
-平台生成固定版本的远端 Python 脚本并写入随机临时文件，不接受用户提供的 Python 源码。请求只允许枚举模式、模型、数据集、时长和受限 Python 可执行路径。
-
-评估结果以带标记 JSON 返回，后端校验必需字段后入库。真实硬件能力缺失以警告或明确错误返回，不以估算值补齐。
+- 默认只绑定回环地址，不信任转发头；代理部署应显式配置可信 `ProxyFix`。
+- 密码、CSRF、功能权限、主机能力和二次认证是相互独立的检查层。
+- 远端命令使用固定模板、枚举参数、超时和输出上限，平台不接受任意脚本。
+- Docker 保持只读，因为 Docker socket 通常等价 root。
+- GPU 快速评估只接收受限模式、模型、数据集、时长和 Python 路径，结果结构化校验后入库。

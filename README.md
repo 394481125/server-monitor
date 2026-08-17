@@ -1,8 +1,8 @@
 # Server Monitor
 
-Server Monitor 是面向可信内网的 Linux 主机、NVIDIA GPU 和受控远程运维平台。平台通过 SSH 采集和执行受限操作，被管主机无需安装常驻 Agent；状态、历史、审计和配置保存在 SQLite。
+Server Monitor 是面向可信内网的 Linux 与 NVIDIA GPU 主机监控、巡检和受控运维平台。平台通过 SSH 工作，被管主机无需安装常驻 Agent；配置、历史、告警和审计保存在本机 SQLite。
 
-当前源码数据库 schema 为 `7`。版本号由发布时的 Git 标签和 `scripts/build_release.sh <version>` 参数确定，文档不再绑定历史发布包版本。
+默认监听 `127.0.0.1:8000`，适合单实例部署。跨主机访问应放在 HTTPS 反向代理、VPN 或隔离管理网之后。
 
 ## 快速启动
 
@@ -14,18 +14,15 @@ cd server-monitor
 bash scripts/quick_start.sh
 ```
 
-脚本会生成权限为 `0600` 的 `.env` 和一次性管理员密码。打开 `http://127.0.0.1:8000`，使用 `admin` 登录并立即修改密码。
-
-常用命令：
+脚本会创建权限为 `0600` 的 `.env` 并生成一次性管理员密码。打开 `http://127.0.0.1:8000`，使用 `admin` 登录并立即修改密码。
 
 ```bash
-docker compose up -d --build
 docker compose ps
 docker compose logs -f server-monitor
 docker compose restart server-monitor
 ```
 
-不要执行 `docker compose down -v`，该命令会删除数据库和主密钥所在的数据卷。
+不要执行 `docker compose down -v`，它会删除数据库和主密钥所在的数据卷。
 
 ### Ubuntu / Python
 
@@ -41,77 +38,103 @@ SERVER_MONITOR_INITIAL_PASSWORD='至少 10 位的一次性密码' bash scripts/s
 bash scripts/start_ubuntu.sh status
 bash scripts/start_ubuntu.sh restart
 bash scripts/start_ubuntu.sh stop
-bash scripts/start_ubuntu.sh foreground
 tail -f data/logs/server-monitor.log
 ```
 
-长期运行建议使用 [systemd 示例](deploy/server-monitor.service.example)。脚本、systemd 和 Docker 只能选择一种进程管理方式。
+生产环境可改用 [systemd 示例](deploy/server-monitor.service.example)。启动脚本、systemd 和 Docker 应只选择一种进程管理方式。
 
 ## 核心能力
 
-- CPU、iowait、load、内存、Swap、文件系统容量和 inode、磁盘 IO、网卡、TCP、监听端口和系统限制。
-- GPU 利用率、显存、温度、功耗、风扇、P-State、时钟、ECC、XID、PCIe、节流原因和计算进程归属。
-- 主机状态分级、SSH 指纹确认、硬件资产、SMART、内核和 systemd 只读巡检。
-- 进程、Tmux、受限终端、工具安装方案、压力任务、GPU 自动调度和审计。
-- Docker 容器、镜像、Volume、Compose、资源限制和日志只读查看。
-- 文件浏览、下载、复制、移动、删除和 SFTP 原子断点续传上传。
-- venv、conda、uv、CUDA、cuDNN、APT 方案、环境备份和 CIFAR-10 GPU 快速评估。
-- 告警确认、软清理、批量处置、网页/桌面/Server 酱通知、SQLite 在线备份和历史聚合。
+- 采集 CPU、负载、内存、Swap、文件系统、inode、磁盘 IO、网络、TCP、端口及系统限制。
+- 采集 GPU 利用率、显存、温度、功耗、时钟、ECC、XID、PCIe、节流状态及计算进程归属。
+- 提供主机状态分级、SSH 指纹确认、硬件资产、SMART、内核和 systemd 只读巡检。
+- 提供受权限控制的进程、Tmux、终端、工具安装方案、压力任务和 GPU 自动调度。
+- 提供 Docker 容器、镜像、Volume、Compose、资源限制和日志的只读视图。
+- 提供文件浏览、下载、复制、移动、删除和 SFTP 原子断点续传上传。
+- 提供 venv、conda、uv、CUDA、cuDNN、APT 方案、环境备份及 GPU 快速评估。
+- 提供告警确认、批量处置、网页/桌面/Server 酱通知、在线备份和历史聚合。
 
-## GPU 快速评估
+高影响能力默认有意受限：平台不提供任意批量 Shell、Docker 写管理、网页端口转发或 GPU 残留显存一键清理。
 
-入口位于“开发环境 / GPU 快速评估”。运行需要 `gpu.benchmark` 权限、主机启用“允许压力任务”，并通过平台密码二次验证。
+## 项目结构
 
-矩阵与系统指标：
+```text
+monitor/
+  app.py                 应用装配、通用页面和核心 API
+  web.py                 请求鉴权、JSON、审计等共享 Web 上下文
+  routes/                运维、开发环境、文件和 WebSocket 路由
+  services.py            主机、历史、告警、备份领域服务
+  collector.py           远端采集命令与结果解析
+  operations.py          受限远端运维操作
+  development.py         开发环境检查与方案生成
+  gpu_benchmark.py       GPU 快速评估脚本与结果解析
+  files.py               SFTP 文件管理和断点续传
+  ssh_client.py          SSH 客户端、指纹和连接池
+  db.py / migrations.py  SQLite 存储与连续迁移
+  static/ / templates/   原生前端资源
+tests/
+  test_*.py              后端、服务和 API 自动测试
+  frontend/              Node 前端逻辑测试
+  acceptance/            浏览器、SSH 和 WebSocket 接受测试
+scripts/                  启动、管理、发布脚本
+deploy/                   systemd 和 sudoers 示例
+docs/                     架构与运维文档
+```
 
-- 严格 FP32、TF32、FP16、BF16。
-- 硬件和 PyTorch 支持时测试 FP8 E4M3、FP8 E5M2 和 INT8；不支持的精度会记录警告，不伪造结果。
-- 单卡/逐卡 GEMM 吞吐、显存拷贝带宽、温度、功耗和时钟快照。
-- 多卡 DataParallel 训练吞吐、NCCL All-Reduce 算法带宽和总线带宽。
-- 多卡结果显示 TP degree；`TP=8 ready` 只表示卡数条件满足，不代表某个模型框架的 Tensor Parallel 已完成优化。
+从一次 HTTP 请求入手时，建议按 `monitor/app.py` 或 `monitor/routes/` -> 领域服务 -> `db.py` / `ssh_client.py` 的顺序阅读。详细边界见 [架构说明](docs/ARCHITECTURE.md)。
 
-训练模型：`ResNet-18`、`ResNet-34`、`ResNet-50`、`MobileNetV3-Small` 和 `timm` 的 `vit_tiny_patch16_224`。
+## 本地开发
 
-数据源：
+运行环境为 Linux、Python 3.11+。前端逻辑测试和浏览器验收需要 Node.js 22+，浏览器验收还需要 `google-chrome`。
 
-- `synthetic`：数据常驻 GPU，适合比较纯训练吞吐。
-- `fake_cifar10`：使用 torchvision FakeData，覆盖轻量 DataLoader 到训练链路。
-- `cifar10`：使用真实 CIFAR-10。默认只读远端缓存；首次下载必须在页面显式允许。
+```bash
+python3 -m venv --copies .venv
+.venv/bin/python -m pip install -r requirements.lock
+SERVER_MONITOR_DATA_DIR=/tmp/server-monitor-dev \
+SERVER_MONITOR_INITIAL_PASSWORD='DevelopmentPass123' \
+.venv/bin/python -m flask --app monitor.wsgi run --host 127.0.0.1 --port 8000
+```
 
-远端 Python 环境必须安装 CUDA 版 PyTorch；ResNet/MobileNet/CIFAR 需要 `torchvision`，ViT-Tiny 需要 `timm`。短时 `loss/acc` 用于执行链路和横向比较，不能替代完整收敛训练。
-
-## 可靠性改进
-
-- SQLite 使用连续版本迁移、名称和校验和记录；所有待执行迁移在一个 `BEGIN IMMEDIATE` 事务内完成，失败会整体回滚。
-- SSH 连接池按主机和凭据隔离，只复用空闲健康连接；凭据变化、超时、连接异常和应用退出都会淘汰连接。
-- SFTP 上传写入同目录隐藏临时文件，重试时按目标路径、文件大小和首块指纹续传，完成后原子重命名。
-- `LOG_LEVEL` 或 `SERVER_MONITOR_LOG_LEVEL` 支持 `DEBUG/INFO/WARNING/ERROR/CRITICAL`，默认 `INFO`。
-- 前端纯逻辑由 Node 内置测试覆盖；真实 Chrome E2E 覆盖认证、模拟 8 卡 ResNet-50/CIFAR-10 评估、历史渲染、设置页和退出。
-
-## 单 Worker 说明
-
-`gunicorn.conf.py` 有意保持 `workers = 1`。当前后台采集器、调度器、备份任务、进程锁和 SQLite 都属于单实例架构；直接增加 Worker 会造成启动锁冲突或重复后台任务，不是有效扩容。
-
-Web 请求和 SSH 工作主要是 IO 密集型，当前使用 gevent 和受控线程池。需要多 Worker 或横向扩展时，必须先把后台任务拆成独立进程、引入跨进程任务协调，并把数据库迁移到支持多实例写入的服务。详见 [架构说明](docs/ARCHITECTURE.md)。
-
-## 安全边界
-
-- 默认监听 `127.0.0.1:8000`；跨主机访问应置于 HTTPS 反向代理、VPN 或隔离管理网后。
-- 数据目录必须为 `0700`；数据库、主密钥和 `.env` 必须为 `0600`。数据库和同一 `master.key` 必须一起备份。
-- 远端操作受权限、CSRF、超时、输出上限和审计保护；高影响操作需要二次验证。
-- Docker 写操作、任意批量 Shell、GPU 残留显存一键清理和网页端口转发仍不开放。
-
-## 验证
+完整自动验证：
 
 ```bash
 .venv/bin/python -m pytest -q
 node --check monitor/static/app_logic.js
 node --check monitor/static/app.js
-node --test tests_js/*.test.js
-.venv/bin/python scripts/e2e_acceptance.py
+node --check tests/acceptance/browser.js
+node --test tests/frontend/*.test.js
+.venv/bin/python tests/acceptance/e2e.py
 .venv/bin/python -m compileall -q monitor tests scripts gunicorn.conf.py
 .venv/bin/python -m pip check
 git diff --check
 ```
 
-E2E 需要 Node.js 22+ 和 `google-chrome`。完整测试说明见 [TESTING.md](docs/TESTING.md)，部署、功能取舍和需求基线分别见 [DEPLOYMENT.md](docs/DEPLOYMENT.md)、[FEATURE_ASSESSMENT.md](docs/FEATURE_ASSESSMENT.md) 和 [REQUIREMENTS.md](docs/REQUIREMENTS.md)。
+`tests/acceptance/e2e.py` 使用 `/tmp` 中的隔离数据库和模拟 GPU，不连接生产 SSH 主机。真实 SSH 与 WebSocket 验收必须指向专用测试主机：
+
+```bash
+.venv/bin/python tests/acceptance/ssh.py
+.venv/bin/python tests/acceptance/websocket.py --help
+```
+
+## 关键配置
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SERVER_MONITOR_DATA_DIR` | `./data` | 数据库、主密钥、备份、日志和锁文件目录 |
+| `SERVER_MONITOR_DATABASE` | 数据目录内数据库 | 指定 SQLite 文件 |
+| `SERVER_MONITOR_MASTER_KEY` | 数据目录内 `master.key` | 指定主密钥路径 |
+| `SERVER_MONITOR_INITIAL_PASSWORD` | 无 | 仅首次创建管理员时必填 |
+| `SERVER_MONITOR_BIND` | `127.0.0.1:8000` | Gunicorn 监听地址 |
+| `SERVER_MONITOR_HTTPS` | `0` | HTTPS 已在反向代理终止时设为 `1` |
+| `SERVER_MONITOR_MAX_UPLOAD_BYTES` | 512 MiB | HTTP 请求体上限 |
+| `SERVER_MONITOR_FILE_TRANSFER_LIMIT` | 512 MiB | 单次文件操作总量上限 |
+| `SERVER_MONITOR_LOG_LEVEL` | 未设置 | 应用日志级别，优先于 `LOG_LEVEL` |
+| `LOG_LEVEL` | `INFO` | 通用日志级别 |
+
+完整部署、备份、恢复、升级和发布步骤见 [运维手册](docs/OPERATIONS.md)。
+
+## 架构约束
+
+`gunicorn.conf.py` 有意保持 `workers = 1`。后台采集、GPU 调度、备份、进程锁和 SQLite 当前属于同一实例；直接增加 Worker 会产生锁冲突或重复后台任务。需要横向扩展时，应先拆出后台任务、引入跨进程协调和共享数据库，再增加无状态 Web Worker。
+
+数据目录必须为 `0700`，数据库、主密钥和 `.env` 必须为 `0600`。数据库中的远端凭据依赖同一个 `master.key` 解密，因此两者必须成组备份。
