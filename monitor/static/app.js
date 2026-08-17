@@ -449,8 +449,8 @@ function hostCard(item, settings) {
   const gpuUsers = [...new Set(gpus.flatMap((gpu) => (gpu.processes || []).map((process) => String(process.user || "unknown"))))];
   const gpuFallback = data.tools?.["nvidia-smi"] === "未安装" ? "未安装" : "无 GPU";
   const gpuDetails = gpuSummary.devices.map((gpu, position) => gpuDetailMarkup(host.id, gpu, position));
-  return `<article class="host-card" data-host-status="${esc(host.status || "unknown")}" data-host-search="${esc([host.name, host.address, ...(host.tags || [])].join(" ").toLowerCase())}" data-host-tags="${esc(JSON.stringify(host.tags || []))}" data-gpu-users="${esc(JSON.stringify(gpuUsers))}">
-    <div class="host-head"><div><h3>${esc(host.name)}</h3><p title="${esc(`${host.address}:${host.port} · ${host.username}`)}">${esc(host.address)}:${host.port} · ${esc(host.username)}</p></div><span class="status ${esc(host.status || "unknown")}" title="${esc(host.last_error || statusName(host))}">${statusName(host)}</span></div>
+  return `<article class="host-card" data-host-status="${esc(host.status || "unknown")}" data-host-search="${esc([host.name, host.address, host.is_local ? "本机" : "", ...(host.tags || [])].join(" ").toLowerCase())}" data-host-tags="${esc(JSON.stringify(host.tags || []))}" data-gpu-users="${esc(JSON.stringify(gpuUsers))}">
+    <div class="host-head"><div><div class="host-title-line"><h3>${esc(host.name)}</h3>${host.is_local ? '<span class="local-badge">本机</span>' : ""}</div><p title="${esc(`${host.address}:${host.port} · ${host.username}`)}">${esc(host.address)}:${host.port} · ${esc(host.username)}</p></div><span class="status ${esc(host.status || "unknown")}" title="${esc(host.last_error || statusName(host))}">${statusName(host)}</span></div>
     <div class="tag-line">${(host.tags || []).map((tag) => `<span class="tag">${esc(tag)}</span>`).join("") || '<span class="hint">无标签</span>'}</div>
     <div class="resource-summary" aria-label="${esc(`${host.name} 资源概览`)}">
       <div class="resource-stat"><span>CPU</span><strong>${cpuCores == null ? "待采样" : `${cpuCores} 核`}</strong><small>${percentage(data.cpu?.usage_percent, "-")}</small></div>
@@ -511,7 +511,12 @@ async function renderDashboard(backgroundRefresh = false) {
   const online = items.filter((item) => item.host.status === "online").length;
   const warning = items.filter((item) => attentionStatuses.includes(item.host.status)).length;
   const offline = items.filter((item) => offlineStatuses.includes(item.host.status)).length;
-  $("#page-content").innerHTML = `<div class="stats-band">
+  $("#page-content").innerHTML = `<div class="dashboard-local-overview">
+      <div><strong>本机概览</strong><span>${result.local_configured ? "通过 SSH 与其他服务器统一展示" : "尚未配置本机 SSH 连接"}</span></div>
+      ${switchControl("show_local_overview", "显示本机", result.show_local_overview)}
+    </div>
+    ${result.show_local_overview && !result.local_configured ? `<div class="notice-panel local-overview-setup"><div><strong>需要配置本机 SSH</strong><span>${can("host.manage") ? "配置后会使用与其他服务器相同的采集、详情和终端功能。" : "请联系管理员添加并标记本机 SSH 主机。"}</span></div>${can("host.manage") ? '<button id="configure-local-host" class="primary">配置本机</button>' : ""}</div>` : ""}
+    <div class="stats-band">
       <button class="stat" data-summary-status=""><small>受管主机</small><strong>${items.length}</strong></button>
       <button class="stat success" data-summary-status="online"><small>在线</small><strong>${online}</strong></button>
       <button class="stat warning" data-summary-status="attention"><small>需要关注</small><strong>${warning}</strong></button>
@@ -530,6 +535,20 @@ async function renderDashboard(backgroundRefresh = false) {
   $("#dashboard-status").value = state.dashboardFilters.status;
   bindHostLinks();
   $("#add-host")?.addEventListener("click", () => showHostForm());
+  $("#configure-local-host")?.addEventListener("click", () => showHostForm(null, {name:"本机", address:"127.0.0.1", port:22, is_local:true}));
+  $('[name="show_local_overview"]')?.addEventListener("change", async (event) => {
+    const input = event.target;
+    input.disabled = true;
+    try {
+      await api("/api/profile/local-overview", {method:"PATCH", body:{enabled:input.checked}});
+      toast(input.checked ? "本机概览已显示" : "本机概览已隐藏");
+      renderDashboard();
+    } catch (error) {
+      input.checked = !input.checked;
+      input.disabled = false;
+      toast(error.message, "error");
+    }
+  });
   $("#dashboard-search")?.addEventListener("input", (event) => { state.dashboardFilters.search = event.target.value.trim().toLowerCase(); applyDashboardFilters(); });
   $("#dashboard-status")?.addEventListener("change", (event) => { state.dashboardFilters.status = event.target.value; applyDashboardFilters(); });
   $("#dashboard-tags")?.addEventListener("change", (event) => { state.dashboardFilters.tags = [...event.target.selectedOptions].map((option) => option.value); applyDashboardFilters(); });
@@ -586,9 +605,9 @@ async function refreshHost(hostId, button) {
 }
 
 function hostTableRows(items) {
-  return items.map((host) => `<tr data-host-id="${host.id}" data-status="${esc(host.status || "unknown")}" data-search="${esc([host.name, host.address, ...(host.tags || [])].join(" ").toLowerCase())}" data-updated="${esc(host.runtime_updated_at || host.updated_at || "")}">
+  return items.map((host) => `<tr data-host-id="${host.id}" data-status="${esc(host.status || "unknown")}" data-search="${esc([host.name, host.address, host.is_local ? "本机" : "", ...(host.tags || [])].join(" ").toLowerCase())}" data-updated="${esc(host.runtime_updated_at || host.updated_at || "")}">
     ${can("host.manage") ? `<td class="table-checkbox"><input type="checkbox" data-host-select="${host.id}" aria-label="选择 ${esc(host.name)}"></td>` : ""}
-    <td><strong>${esc(host.name)}</strong><div class="hint">${esc(host.username)}</div></td><td class="mono">${esc(host.address)}:${host.port}</td>
+    <td><div class="host-title-line"><strong>${esc(host.name)}</strong>${host.is_local ? '<span class="local-badge">本机</span>' : ""}</div><div class="hint">${esc(host.username)}</div></td><td class="mono">${esc(host.address)}:${host.port}</td>
     <td><span class="status ${esc(host.status || "unknown")}" title="${esc(host.last_error || statusName(host))}">${statusName(host)}</span></td><td>${(host.tags || []).map((tag) => `<span class="tag">${esc(tag)}</span>`).join("") || "-"}</td>
     <td>${fmtTime(host.last_success_at)}</td><td class="nowrap"><button class="text-button" data-detail="${host.id}">详情</button>${can("host.manage") ? `<button class="text-button" data-edit-host="${host.id}">编辑</button><button class="text-button" data-toggle-host="${host.id}" data-enabled="${host.enabled}">${host.enabled ? "禁用" : "启用"}</button>` : ""}</td>
   </tr>`).join("");
@@ -837,16 +856,17 @@ function bindTagMultiSelect(form) {
   sync();
 }
 
-function hostFormMarkup(host) {
+function hostFormMarkup(host, defaults = {}) {
   const edit = Boolean(host);
-  const value = (key, fallback = "") => esc(host?.[key] ?? fallback);
-  const checked = (key, fallback = true) => host ? Boolean(host[key]) : fallback;
-  const keyAuth = host?.auth_type === "key";
+  const source = host || defaults;
+  const value = (key, fallback = "") => esc(source?.[key] ?? fallback);
+  const checked = (key, fallback = true) => source && Object.hasOwn(source, key) ? Boolean(source[key]) : fallback;
+  const keyAuth = source?.auth_type === "key";
   const connectionSecretConfigured = keyAuth ? host?.private_key_configured : host?.auth_secret_configured;
   const connectionSecretPlaceholder = edit ? (connectionSecretConfigured ? "已配置，留空保持不变" : "未配置，请填写") : "";
   const connectionSecretRequired = !edit || !connectionSecretConfigured ? "required" : "";
   return `<form id="host-form"><div class="dialog-heading"><span class="dialog-icon" aria-hidden="true">▦</span><div><h2>${edit ? "编辑主机" : "添加 SSH 主机"}</h2><p>${edit ? "连接信息变更会先重新测试 SSH 身份。" : "测试连通性和物理身份后纳入统一管理。"}</p></div></div>
-    <fieldset><legend>基础连接</legend><div class="form-grid two"><label>显示名称<input name="name" value="${value("name")}" maxlength="255" required></label><label>地址<input name="address" value="${value("address")}" required></label><label>SSH 端口<input name="port" type="number" value="${value("port", 22)}" min="1" max="65535" required></label><label>SSH 用户<input name="username" value="${value("username")}" required></label><label>认证方式<select name="auth_type"><option value="password" ${host?.auth_type !== "key" ? "selected" : ""}>密码</option><option value="key" ${host?.auth_type === "key" ? "selected" : ""}>私钥</option></select></label><label data-secret-label>${keyAuth ? "私钥" : "SSH 密码"}<textarea data-secret name="${keyAuth ? "private_key" : "auth_secret"}" ${connectionSecretRequired} placeholder="${connectionSecretPlaceholder}"></textarea></label><label data-key-passphrase-row ${keyAuth ? "" : "hidden"}>私钥口令（可选）<input data-key-passphrase name="private_key_passphrase" type="password" autocomplete="new-password" placeholder="${host?.private_key_passphrase_configured ? "已配置，留空保持不变" : "未配置"}"></label><label>标签（可多选）${tagMultiSelectMarkup(host?.tags || [])}</label><label>采集超时覆盖（秒）<input name="timeout_seconds" type="number" value="${value("timeout_seconds")}" min="5" max="60" placeholder="使用系统设置"></label><label>机房位置<input name="asset_location" value="${value("asset_location")}" maxlength="255" placeholder="例如 A03 机柜"></label><label>运维负责人<input name="asset_owner" value="${value("asset_owner")}" maxlength="255"></label><label>保修到期<input name="warranty_expires" type="date" value="${value("warranty_expires")}"></label></div><label>备注<textarea name="notes" maxlength="4000">${value("notes")}</textarea></label></fieldset>
+    <fieldset><legend>基础连接</legend><div class="form-grid two"><label>显示名称<input name="name" value="${value("name")}" maxlength="255" required></label><label>地址<input name="address" value="${value("address")}" required></label><label>SSH 端口<input name="port" type="number" value="${value("port", 22)}" min="1" max="65535" required></label><label>SSH 用户<input name="username" value="${value("username")}" required></label><label>认证方式<select name="auth_type"><option value="password" ${source?.auth_type !== "key" ? "selected" : ""}>密码</option><option value="key" ${source?.auth_type === "key" ? "selected" : ""}>私钥</option></select></label><label data-secret-label>${keyAuth ? "私钥" : "SSH 密码"}<textarea data-secret name="${keyAuth ? "private_key" : "auth_secret"}" ${connectionSecretRequired} placeholder="${connectionSecretPlaceholder}"></textarea></label><label data-key-passphrase-row ${keyAuth ? "" : "hidden"}>私钥口令（可选）<input data-key-passphrase name="private_key_passphrase" type="password" autocomplete="new-password" placeholder="${host?.private_key_passphrase_configured ? "已配置，留空保持不变" : "未配置"}"></label><label>标签（可多选）${tagMultiSelectMarkup(source?.tags || [])}</label><label>采集超时覆盖（秒）<input name="timeout_seconds" type="number" value="${value("timeout_seconds")}" min="5" max="60" placeholder="使用系统设置"></label><label>机房位置<input name="asset_location" value="${value("asset_location")}" maxlength="255" placeholder="例如 A03 机柜"></label><label>运维负责人<input name="asset_owner" value="${value("asset_owner")}" maxlength="255"></label><label>保修到期<input name="warranty_expires" type="date" value="${value("warranty_expires")}"></label></div><div class="host-local-option">${switchControl("is_local", "作为本机概览", checked("is_local", false))}<span class="hint">本机仍通过 SSH 采集，同一时间只能配置一台。</span></div><label>备注<textarea name="notes" maxlength="4000">${value("notes")}</textarea></label></fieldset>
     <fieldset><legend>远端 sudo 授权</legend><div class="form-grid two"><label>远端 sudo 密码（可选）<input data-sudo-password name="sudo_password" type="password" autocomplete="new-password" placeholder="${host?.sudo_password_configured ? "已配置，留空保持不变" : "未配置"}"><span class="hint">仅在精确 NOPASSWD 授权不可用时用于工具安装。</span></label>${host?.sudo_password_configured ? '<label class="check-label"><input data-clear-sudo-password type="checkbox">移除已保存的远端 sudo 密码</label>' : ""}</div></fieldset>
     <fieldset><legend>功能权限</legend><div class="form-grid two">${switchControl("enabled", "启用定时采集", checked("enabled"))}${switchControl("docker_enabled", "采集 Docker 指标", checked("docker_enabled"))}${switchControl("allow_tmux", "允许 Tmux 管理", checked("allow_tmux"))}${switchControl("allow_terminal", "允许 Web 终端", checked("allow_terminal"))}${switchControl("allow_process", "允许进程操作", checked("allow_process"))}${switchControl("allow_install", "允许工具安装", checked("allow_install"))}${switchControl("allow_stress", "允许压力测试", checked("allow_stress"))}</div></fieldset>
     <fieldset><legend>GPU 调度</legend><div class="form-grid two">${switchControl("scheduler_enabled", "启用主机级调度", checked("scheduler_enabled", false))}<label>执行模式<select name="schedule_mode"><option value="tmux" ${host?.schedule_mode !== "direct" ? "selected" : ""}>Tmux 后台提交</option><option value="direct" ${host?.schedule_mode === "direct" ? "selected" : ""}>直接 Shell</option></select></label><label>空闲时长覆盖（秒）<input name="scheduler_idle_seconds" type="number" min="60" max="86400" value="${value("scheduler_idle_seconds")}" placeholder="使用系统设置"></label><label>计算进程保护<select name="scheduler_process_guard"><option value="inherit" ${host?.scheduler_process_guard == null ? "selected" : ""}>继承系统设置</option><option value="true" ${host?.scheduler_process_guard === true ? "selected" : ""}>启用</option><option value="false" ${host?.scheduler_process_guard === false ? "selected" : ""}>禁用</option></select></label><label>工作目录<input name="schedule_cwd" value="${value("schedule_cwd")}" placeholder="可选"></label><label>Shell<input name="schedule_shell" value="${value("schedule_shell", "/bin/bash")}" required></label></div><label>默认调度命令<textarea name="schedule_command" maxlength="500" placeholder="启用自动调度前必须配置">${value("schedule_command")}</textarea></label><label>环境变量（JSON 对象）<textarea name="schedule_env" placeholder='{"KEY":"VALUE"}'>${esc(JSON.stringify(host?.schedule_env || {}, null, 2))}</textarea></label></fieldset>
@@ -862,7 +882,7 @@ function hostPayload(form, host = null) {
   const payload = {
     name: form.name.value.trim(), address: form.address.value.trim(), port:Number(form.port.value), username:form.username.value.trim(), auth_type:form.auth_type.value,
     tags:form.tags.value.split(",").map((item) => item.trim()).filter(Boolean), notes:form.notes.value, timeout_seconds:form.timeout_seconds.value ? Number(form.timeout_seconds.value) : null,
-    enabled:form.enabled.checked, docker_enabled:form.docker_enabled.checked, allow_tmux:form.allow_tmux.checked, allow_terminal:form.allow_terminal.checked, allow_process:form.allow_process.checked, allow_install:form.allow_install.checked, allow_stress:form.allow_stress.checked,
+    is_local:form.is_local.checked, enabled:form.enabled.checked, docker_enabled:form.docker_enabled.checked, allow_tmux:form.allow_tmux.checked, allow_terminal:form.allow_terminal.checked, allow_process:form.allow_process.checked, allow_install:form.allow_install.checked, allow_stress:form.allow_stress.checked,
     scheduler_enabled:form.scheduler_enabled.checked, scheduler_idle_seconds:form.scheduler_idle_seconds.value ? Number(form.scheduler_idle_seconds.value) : null, scheduler_process_guard:guard === "inherit" ? null : guard === "true", schedule_command:form.schedule_command.value.trim() || null, schedule_cwd:form.schedule_cwd.value.trim() || null, schedule_shell:form.schedule_shell.value.trim(), schedule_env:scheduleEnv, schedule_mode:form.schedule_mode.value,
     asset_location:form.asset_location.value.trim(), asset_owner:form.asset_owner.value.trim(), warranty_expires:form.warranty_expires.value || null,
   };
@@ -902,8 +922,8 @@ async function confirmFingerprintChange(host, payload, error) {
   return identity;
 }
 
-function showHostForm(host = null) {
-  const dialog = createDialog(hostFormMarkup(host), "wide-dialog");
+function showHostForm(host = null, defaults = {}) {
+  const dialog = createDialog(hostFormMarkup(host, defaults), "wide-dialog");
   const form = $("#host-form", dialog);
   bindTagMultiSelect(form);
   $('[data-cancel]', dialog).onclick = () => dialog.close("cancel");
@@ -952,7 +972,9 @@ function showHostForm(host = null) {
         toast(`主机 ${result.host.name} 已更新`);
       }
       dialog.close("done");
-      if (state.page === "hosts") renderHosts(); else if (state.page === "host-detail") renderHostDetail(host.id);
+      if (state.page === "dashboard") renderDashboard();
+      else if (state.page === "hosts") renderHosts();
+      else if (state.page === "host-detail" && host) renderHostDetail(host.id);
     } catch (error) {
       errorNode.textContent = error.message;
     } finally {
@@ -1835,7 +1857,7 @@ async function renderAlerts(page = 1, filters = null) {
   if (state.page !== "alerts") return;
   const exportQuery = new URLSearchParams(query); exportQuery.delete("page"); exportQuery.delete("page_size");
   $("#page-content").innerHTML = `<section class="section fault-summary"><div class="section-title"><h3>故障主机聚合</h3><strong>${faults.total} 台需处理</strong></div>${faults.items.length ? `<div class="table-wrap"><table><thead><tr><th>主机</th><th>状态</th><th>活动问题</th><th>操作</th></tr></thead><tbody>${faults.items.map((item) => `<tr><td><strong>${esc(item.host.name)}</strong><div class="hint">${esc(item.host.address)}</div></td><td><span class="status ${esc(item.host.status || "unknown")}">${statusName(item.host)}</span></td><td>${item.issues.map((issue) => esc(alertNames[issue.alert_type] || issue.summary)).join(" / ")}</td><td><button class="text-button" data-detail="${item.host.id}">查看主机</button></td></tr>`).join("")}</tbody></table></div>` : '<div class="notice-panel">当前没有离线、指纹异常、采集降级或活动资源告警主机。</div>'}</section>
-    <div class="alert-notification-control"><div><strong>告警提醒 · ${result.toast_enabled ? "当前已开启" : "当前已关闭"}</strong><span>关闭后隐藏顶部红点，并停止网页弹窗、浏览器桌面通知和 Server 酱；告警历史仍会保留。</span></div>${can("alerts.manage") ? `<button type="button" data-alert-notification-toggle role="switch" aria-checked="${Boolean(result.toast_enabled)}" class="${result.toast_enabled ? "danger-quiet" : ""}">${result.toast_enabled ? "关闭告警提醒" : "开启告警提醒"}</button>` : `<span class="status ${result.toast_enabled ? "online" : "disabled"}">${result.toast_enabled ? "已开启" : "已关闭"}</span>`}</div>
+    <div class="alert-notification-control"><div><strong>告警提醒 · ${result.toast_enabled ? "当前已开启" : "当前已关闭"}</strong><span>关闭后隐藏顶部红点，并停止网页弹窗和外部通知；告警历史仍会保留。</span></div>${can("alerts.manage") ? `<button type="button" data-alert-notification-toggle role="switch" aria-checked="${Boolean(result.toast_enabled)}" class="${result.toast_enabled ? "danger-quiet" : ""}">${result.toast_enabled ? "关闭告警提醒" : "开启告警提醒"}</button>` : `<span class="status ${result.toast_enabled ? "online" : "disabled"}">${result.toast_enabled ? "已开启" : "已关闭"}</span>`}</div>
     <form id="alert-filters" class="toolbar"><div class="toolbar-group"><div class="toolbar-search"><input name="search" placeholder="搜索事件、主机或摘要" value="${esc(current.search)}"></div><input name="host_id" type="number" min="1" placeholder="主机 ID" value="${esc(current.host_id)}"><input name="alert_type" placeholder="事件类型" value="${esc(current.alert_type)}"><select name="state"><option value="">全部状态</option><option value="active" ${current.state === "active" ? "selected" : ""}>活动中</option><option value="recovered" ${current.state === "recovered" ? "selected" : ""}>已恢复</option></select><select name="severity"><option value="">全部级别</option><option value="critical" ${current.severity === "critical" ? "selected" : ""}>严重</option><option value="warning" ${current.severity === "warning" ? "selected" : ""}>警告</option><option value="info" ${current.severity === "info" ? "selected" : ""}>信息</option></select><div class="date-range-picker" role="group" aria-label="告警时间范围"><label>开始<input name="start" type="datetime-local" value="${esc(localDateTimeValue(current.start))}"></label><span aria-hidden="true">至</span><label>结束<input name="end" type="datetime-local" value="${esc(localDateTimeValue(current.end))}"></label></div><label class="check-label"><input name="include_cleared" type="checkbox" value="1" ${current.include_cleared === "1" ? "checked" : ""}>包含已清理</label><button type="submit">筛选</button></div><div class="toolbar-group">${can("alerts.manage") ? `<button type="button" data-alert-bulk-ack ${result.total ? "" : "disabled"}>一键忽略当前结果</button><button type="button" class="danger-quiet" data-alert-bulk-clear ${result.total ? "" : "disabled"}>一键清理当前结果</button>` : ""}<a class="button-link" href="/api/alerts/export?${exportQuery}">导出 CSV</a></div></form>
     ${result.items.length ? `<div class="table-wrap"><table id="alerts-table"><thead><tr><th>发生时间</th><th>事件</th><th>主机</th><th>级别</th><th>状态</th><th>摘要</th><th>恢复时间</th><th>操作</th></tr></thead><tbody>${result.items.map((item) => `<tr><td>${fmtTime(item.created_at)}</td><td>${esc(alertNames[item.alert_type] || item.alert_type)}</td><td>${esc(item.host_name || item.host_id || "平台")}${item.host_name ? `<div class="hint">ID ${item.host_id}</div>` : ""}</td><td>${esc(({critical:"严重",warning:"警告",info:"信息"})[item.severity] || item.severity)}</td><td><span class="status ${item.cleared_at ? "disabled" : item.state === "active" ? (item.severity === "critical" ? "offline" : "degraded") : "online"}">${item.cleared_at ? "已清理" : item.acknowledged_at ? "已忽略提示" : item.state === "active" ? "活动中" : "已恢复"}</span></td><td>${esc(item.summary)}</td><td>${fmtTime(item.recovered_at)}</td><td class="nowrap">${can("alerts.manage") && !item.acknowledged_at && !item.cleared_at ? `<button class="text-button" data-alert-ack="${item.id}">忽略提示</button>` : ""}${can("alerts.manage") && !item.cleared_at ? `<button class="text-button danger-quiet" data-alert-clear="${item.id}">清理</button>` : "-"}</td></tr>`).join("")}</tbody></table></div>` : '<div class="empty"><div><strong>没有符合条件的告警</strong>调整筛选条件后重试。</div></div>'}${pageControls(result)}`;
   bindHostLinks($("#page-content"));
@@ -1907,7 +1929,7 @@ const settingGroups = {
   alerts: {title:"告警阈值", copy:"利用率、Swap、温度及 GPU 功耗、风扇、ECC、XID、PCIe、节流与残留显存告警规则。", keys:["green_threshold","yellow_threshold","filesystem_usage_threshold","filesystem_inode_threshold","swap_usage_threshold","cpu_temp_threshold","gpu_temp_threshold","gpu_power_threshold_percent","gpu_fan_min_percent","gpu_fan_alert_temperature","gpu_ecc_corrected_threshold","gpu_xid_alert_enabled","gpu_pcie_alert_enabled","gpu_throttle_alert_enabled","gpu_residual_alert_enabled","disk_temp_threshold","alert_samples","alert_hysteresis","alert_repeat_minutes"]},
   gpu: {title:"GPU 调度", copy:"全局调度规则；主机默认命令在主机编辑页配置。", keys:["gpu_scheduler_enabled","gpu_idle_mode","gpu_util_threshold","gpu_memory_threshold","gpu_idle_seconds","gpu_process_guard","gpu_cooldown_seconds","gpu_max_attempts","gpu_retry_seconds","gpu_freeze_seconds","gpu_submit_timeout","gpu_direct_timeout"]},
   security: {title:"安全与数据", copy:"登录限制、终端会话、备份和日志数据策略。", keys:["login_fail_limit","login_window_minutes","login_lock_minutes","session_idle_minutes","terminal_idle_seconds","backup_time","backup_dir","backup_keep","log_retention_days","schedule_output_limit","timezone"]},
-  notifications: {title:"通知", copy:"告警总提醒开关控制红点、网页/桌面弹窗和 Server 酱发送。", keys:["toast_enabled","serverchan_enabled","serverchan_sendkey"]},
+  notifications: {title:"通知", copy:"使用 Apprise URL 将告警发送到几乎任何通知服务。", keys:["toast_enabled","apprise_enabled"]},
 };
 
 const settingLabels = {
@@ -1915,7 +1937,7 @@ const settingLabels = {
   scan_timeout_seconds:"目录扫描超时（秒）",scan_max_depth:"大文件扫描深度",scan_result_limit:"大文件返回条数",scan_minimum_mib:"大文件默认阈值（MiB）",environment_inventory_timeout:"环境盘点超时（秒）",gpu_benchmark_timeout:"GPU 评估总超时（秒）",
   green_threshold:"绿色上限（%）",yellow_threshold:"黄色上限（%）",filesystem_usage_threshold:"文件系统容量阈值（%）",filesystem_inode_threshold:"文件系统 inode 阈值（%）",swap_usage_threshold:"Swap 使用率阈值（%）",cpu_temp_threshold:"CPU 温度阈值（C）",gpu_temp_threshold:"GPU 温度阈值（C）",gpu_power_threshold_percent:"GPU 功耗上限比例（%）",gpu_fan_min_percent:"GPU 最低风扇转速（%）",gpu_fan_alert_temperature:"风扇告警温度门槛（C）",gpu_ecc_corrected_threshold:"可纠正 ECC 告警累计值",gpu_xid_alert_enabled:"启用 GPU XID 告警",gpu_pcie_alert_enabled:"启用 PCIe 降级告警",gpu_throttle_alert_enabled:"启用 GPU 节流告警",gpu_residual_alert_enabled:"启用 GPU 残留显存告警",disk_temp_threshold:"磁盘温度阈值（C）",alert_samples:"连续样本数",alert_hysteresis:"告警恢复回差",alert_repeat_minutes:"重复提醒间隔（分钟）",
   gpu_scheduler_enabled:"全局 GPU 自动调度",gpu_idle_mode:"空闲判定模式",gpu_util_threshold:"GPU 利用率阈值（%）",gpu_memory_threshold:"显存阈值（%）",gpu_idle_seconds:"默认空闲时长（秒）",gpu_process_guard:"默认计算进程保护",gpu_cooldown_seconds:"冷却时间（秒）",gpu_max_attempts:"最大尝试次数",gpu_retry_seconds:"重试间隔（秒）",gpu_freeze_seconds:"冻结时长（秒）",gpu_submit_timeout:"Tmux 提交超时（秒）",gpu_direct_timeout:"直接 Shell 超时（秒）",
-  login_fail_limit:"登录失败上限",login_window_minutes:"登录统计窗口（分钟）",login_lock_minutes:"登录暂停时间（分钟）",session_idle_minutes:"会话闲置超时（分钟）",terminal_idle_seconds:"终端闲置超时（秒）",backup_time:"自动备份时间",backup_dir:"备份目录",backup_keep:"备份保留份数",log_retention_days:"日志保留天数",schedule_output_limit:"单流输出上限（字节）",timezone:"显示时区",toast_enabled:"告警总提醒（含红点和 Server 酱）",serverchan_enabled:"Server 酱通知",serverchan_sendkey:"Server 酱 SendKey",
+  login_fail_limit:"登录失败上限",login_window_minutes:"登录统计窗口（分钟）",login_lock_minutes:"登录暂停时间（分钟）",session_idle_minutes:"会话闲置超时（分钟）",terminal_idle_seconds:"终端闲置超时（秒）",backup_time:"自动备份时间",backup_dir:"备份目录",backup_keep:"备份保留份数",log_retention_days:"日志保留天数",schedule_output_limit:"单流输出上限（字节）",timezone:"显示时区",toast_enabled:"网页告警提醒",apprise_enabled:"启用 Apprise 通知",
 };
 
 const numberRules = {
@@ -1927,10 +1949,16 @@ function settingInput(key, value) {
   if (typeof value === "boolean") return switchControl(key, settingLabels[key] || key, value);
   if (key === "gpu_idle_mode") return `<label>${settingLabels[key]}<select name="${key}"><option value="both" ${value === "both" ? "selected" : ""}>利用率和显存</option><option value="util" ${value === "util" ? "selected" : ""}>仅利用率</option><option value="memory" ${value === "memory" ? "selected" : ""}>仅显存</option></select></label>`;
   if (key === "timezone") return `<label>${settingLabels[key]}<select name="${key}"><option value="Asia/Shanghai" ${value === "Asia/Shanghai" ? "selected" : ""}>Asia/Shanghai</option><option value="UTC" ${value === "UTC" ? "selected" : ""}>UTC</option></select></label>`;
-  if (key === "serverchan_sendkey") return `<label>${settingLabels[key]}<input name="${key}" type="password" value="" placeholder="${value === "configured" ? "已配置，留空保持不变" : "未配置"}"></label>`;
   const type = key === "backup_time" ? "time" : numberRules[key] ? "number" : "text";
   const range = numberRules[key] ? `min="${numberRules[key][0]}" max="${numberRules[key][1]}"` : "";
   return `<label>${esc(settingLabels[key] || key)}<input name="${key}" type="${type}" value="${esc(value)}" ${range} required></label>`;
+}
+
+function notificationSectionMarkup(values, notificationEvents) {
+  const urls = Array.isArray(values.apprise_urls) ? values.apprise_urls : [];
+  const rows = urls.map((url, index) => `<div class="apprise-url-row" data-apprise-row data-configured-index="${index}"><input data-apprise-url placeholder="${esc(url)}" aria-label="通知 URL ${index + 1}"><button type="button" class="icon-button" data-apprise-test title="测试此通知 URL" aria-label="测试此通知 URL">▷</button><button type="button" class="icon-button danger-quiet" data-apprise-remove title="删除此通知 URL" aria-label="删除此通知 URL">×</button></div>`).join("");
+  const unavailable = values.apprise_available === false ? '<div class="notice-panel">当前运行环境未安装 Apprise，保存 URL 后才能发送外部通知。</div>' : "";
+  return `${unavailable}<div class="notification-url-panel"><div class="notification-url-heading"><div><strong>通知 URL 列表</strong><p>使用 Apprise 通知 URL，向几乎任何服务发送通知！请阅读 <a href="https://github.com/caronc/apprise/wiki" target="_blank" rel="noreferrer">通知服务 Wiki</a> 以了解重要配置说明。</p></div><button type="button" id="apprise-test-all" ${urls.length ? "" : "disabled"}>▷ 测试全部</button></div><div id="apprise-url-list">${rows}</div><button type="button" id="apprise-add-url">＋ 添加 URL</button><span class="hint">例如：ntfy://shengziran。每条 URL 使用一个通知目标，凭据会在服务器端加密保存。</span></div><div class="notification-events"><strong>发送这些告警</strong><div class="action-strip">${Object.entries(notificationEvents).map(([key,label]) => `<label class="check-label"><input type="checkbox" name="apprise_event" value="${key}" ${values.apprise_events.includes(key) ? "checked" : ""}>${label}</label>`).join("")}</div></div><div class="action-strip"><button type="button" id="desktop-notification-button">启用浏览器桌面通知</button><span class="hint" id="desktop-notification-status">${"Notification" in window ? `当前权限：${Notification.permission}` : "当前浏览器不支持系统通知"}</span></div>`;
 }
 
 async function renderSettings() {
@@ -1938,7 +1966,7 @@ async function renderSettings() {
   if (state.page !== "settings") return;
   const values = result.settings;
   const notificationEvents = {host_offline:"主机离线",temperature_high:"温度过高",filesystem_usage_high:"磁盘容量过高",filesystem_inode_high:"inode 使用率过高",swap_usage_high:"Swap 使用率过高",gpu_power_high:"GPU 功耗过高",gpu_fan_low:"GPU 风扇异常",gpu_ecc_error:"GPU ECC 错误",gpu_xid_error:"GPU XID 错误",gpu_pcie_degraded:"GPU PCIe 降级",gpu_throttling:"GPU 节流",gpu_residual_memory:"GPU 残留显存",gpu_schedule_success:"GPU 调度成功",gpu_schedule_failed:"GPU 调度失败",gpu_schedule_frozen:"GPU 调度冻结",backup_failed:"备份失败"};
-  $("#page-content").innerHTML = `<div class="settings-layout"><nav class="settings-nav">${Object.entries(settingGroups).map(([id,group], index) => `<button data-setting-target="${id}" class="${index === 0 ? "active" : ""}">${group.title}</button>`).join("")}${isAdmin() ? '<button data-setting-target="users">用户管理</button>' : ""}</nav><div><form id="settings-form">${Object.entries(settingGroups).map(([id,group]) => `<section class="settings-section" id="setting-${id}"><h2>${group.title}</h2><p>${group.copy}</p><div class="form-grid">${group.keys.map((key) => settingInput(key, values[key])).join("")}</div>${id === "notifications" ? `<div class="action-strip">${Object.entries(notificationEvents).map(([key,label]) => `<label class="check-label"><input type="checkbox" name="serverchan_event" value="${key}" ${values.serverchan_events.includes(key) ? "checked" : ""}>${label}</label>`).join("")}</div><div class="action-strip"><button type="button" id="desktop-notification-button">启用浏览器桌面通知</button><span class="hint" id="desktop-notification-status">${"Notification" in window ? `当前权限：${Notification.permission}` : "当前浏览器不支持系统通知"}</span></div><label class="check-label"><input type="checkbox" name="serverchan_sendkey_clear">清除已保存的 SendKey</label>` : ""}</section>`).join("")}<section class="settings-section"><div class="toolbar"><div><strong>数据库 ${fmtBytes(values.database_total_bytes)}</strong><div class="hint">主库 ${fmtBytes(values.database_size_bytes)}，WAL ${fmtBytes(values.wal_size_bytes)}，当前磁盘可用 ${fmtBytes(values.disk_free_bytes)}。相对备份目录以数据目录为基准；同盘备份不能防止磁盘故障。</div></div><div class="toolbar-group">${can("backup.create") ? '<button id="backup-button" type="button">立即备份</button>' : ""}${isAdmin() ? '<button id="compact-database-button" type="button" class="danger-quiet">清理并压缩</button>' : ""}${can("settings.manage") ? '<button class="primary" type="submit">保存设置</button>' : ''}</div></div>${can("settings.manage") ? '' : '<div class="notice-panel">当前账号可查看系统设置，但没有修改权限。</div>'}<div class="form-error"></div></section></form>${isAdmin() ? `<section class="settings-section" id="setting-users"><div class="toolbar"><div><h2>用户管理</h2><p>角色或状态变更会立即使目标用户的现有会话失效。</p></div></div>${usersTable(users.items)}<form id="create-user-form" class="action-strip"><input name="username" placeholder="新用户名" maxlength="64" required><input name="password" type="password" placeholder="一次性密码（10～128 位）" minlength="10" maxlength="128" required><select name="role"><option value="viewer">普通用户</option><option value="admin">管理员</option></select><button class="primary">创建用户</button></form></section>` : ""}</div></div>`;
+  $("#page-content").innerHTML = `<div class="settings-layout"><nav class="settings-nav">${Object.entries(settingGroups).map(([id,group], index) => `<button data-setting-target="${id}" class="${index === 0 ? "active" : ""}">${group.title}</button>`).join("")}${isAdmin() ? '<button data-setting-target="users">用户管理</button>' : ""}</nav><div><form id="settings-form">${Object.entries(settingGroups).map(([id,group]) => `<section class="settings-section" id="setting-${id}"><h2>${group.title}</h2><p>${group.copy}</p><div class="form-grid">${group.keys.map((key) => settingInput(key, values[key])).join("")}</div>${id === "notifications" ? notificationSectionMarkup(values, notificationEvents) : ""}</section>`).join("")}<section class="settings-section"><div class="toolbar"><div><strong>数据库 ${fmtBytes(values.database_total_bytes)}</strong><div class="hint">主库 ${fmtBytes(values.database_size_bytes)}，WAL ${fmtBytes(values.wal_size_bytes)}，当前磁盘可用 ${fmtBytes(values.disk_free_bytes)}。相对备份目录以数据目录为基准；同盘备份不能防止磁盘故障。</div></div><div class="toolbar-group">${can("backup.create") ? '<button id="backup-button" type="button">立即备份</button>' : ""}${isAdmin() ? '<button id="compact-database-button" type="button" class="danger-quiet">清理并压缩</button>' : ""}${can("settings.manage") ? '<button class="primary" type="submit">保存设置</button>' : ''}</div></div>${can("settings.manage") ? '' : '<div class="notice-panel">当前账号可查看系统设置，但没有修改权限。</div>'}<div class="form-error"></div></section></form>${isAdmin() ? `<section class="settings-section" id="setting-users"><div class="toolbar"><div><h2>用户管理</h2><p>角色或状态变更会立即使目标用户的现有会话失效。</p></div></div>${usersTable(users.items)}<form id="create-user-form" class="action-strip"><input name="username" placeholder="新用户名" maxlength="64" required><input name="password" type="password" placeholder="一次性密码（10～128 位）" minlength="10" maxlength="128" required><select name="role"><option value="viewer">普通用户</option><option value="admin">管理员</option></select><button class="primary">创建用户</button></form></section>` : ""}</div></div>`;
   bindSettings(values);
   if (isAdmin()) bindUsers(users.items);
 }
@@ -2148,6 +2176,52 @@ function bindSettings(values) {
     if (status) status.textContent = `当前权限：${permission}`;
     toast(permission === "granted" ? "浏览器桌面通知已启用" : "浏览器未授予桌面通知权限", permission === "granted" ? "success" : "warning");
   });
+  const addAppriseRow = () => {
+    const list = $("#apprise-url-list");
+    if (!list) return;
+    const row = document.createElement("div");
+    row.className = "apprise-url-row";
+    row.dataset.appriseRow = "";
+    row.innerHTML = '<input data-apprise-url placeholder="ntfy://shengziran" aria-label="新的通知 URL"><button type="button" class="icon-button" data-apprise-test title="测试此通知 URL" aria-label="测试此通知 URL">▷</button><button type="button" class="icon-button danger-quiet" data-apprise-remove title="删除此通知 URL" aria-label="删除此通知 URL">×</button>';
+    list.appendChild(row);
+    row.querySelector("input")?.focus();
+    $("#apprise-test-all")?.removeAttribute("disabled");
+  };
+  $("#apprise-add-url")?.addEventListener("click", addAppriseRow);
+  $("#apprise-url-list")?.addEventListener("click", async (event) => {
+    const button = event.target.closest("button");
+    const row = button?.closest("[data-apprise-row]");
+    if (!button || !row) return;
+    if (button.matches("[data-apprise-remove]")) {
+      row.remove();
+      if (!$$(`[data-apprise-row]`, $("#apprise-url-list")).length) $("#apprise-test-all")?.setAttribute("disabled", "");
+      return;
+    }
+    if (!button.matches("[data-apprise-test]") || !can("settings.manage")) return;
+    const input = $("[data-apprise-url]", row);
+    const value = input?.value.trim() || (row.dataset.configuredIndex != null ? `configured:${row.dataset.configuredIndex}` : "");
+    if (!value) return toast("请先输入通知 URL", "warning");
+    try {
+      button.disabled = true;
+      const result = await api("/api/notifications/test", {method:"POST", body:{url:value}});
+      toast(result.success ? "通知测试成功" : "通知测试失败", result.success ? "success" : "error");
+    } catch (error) { toast(error.message, "error"); }
+    finally { button.disabled = false; }
+  });
+  $("#apprise-test-all")?.addEventListener("click", async (event) => {
+    if (!can("settings.manage")) return;
+    try {
+      event.currentTarget.disabled = true;
+      const urls = $$('[data-apprise-row]', $("#apprise-url-list")).map((row) => {
+        const input = $("[data-apprise-url]", row);
+        return input?.value.trim() || (row.dataset.configuredIndex != null ? `configured:${row.dataset.configuredIndex}` : "");
+      }).filter(Boolean);
+      const result = await api("/api/notifications/test", {method:"POST", body:{urls}});
+      const failed = result.results.find((item) => !item.success);
+      toast(result.success ? `已发送 ${result.results.length} 个通知目标` : (failed?.summary || "通知测试失败"), result.success ? "success" : "error");
+    } catch (error) { toast(error.message, "error"); }
+    finally { event.currentTarget.disabled = false; }
+  });
   $("#settings-form").onsubmit = async (event) => {
     event.preventDefault();
     if (!can("settings.manage")) return;
@@ -2155,11 +2229,13 @@ function bindSettings(values) {
     const payload = {};
     Object.values(settingGroups).flatMap((group) => group.keys).forEach((key) => {
       const input = form.elements[key];
-      if (key === "serverchan_sendkey" && !input.value) return;
       payload[key] = input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) : input.value;
     });
-    payload.serverchan_events = $$('[name="serverchan_event"]', form).filter((input) => input.checked).map((input) => input.value);
-    if (form.serverchan_sendkey_clear.checked) payload.serverchan_sendkey_clear = true;
+    payload.apprise_events = $$('[name="apprise_event"]', form).filter((input) => input.checked).map((input) => input.value);
+    payload.apprise_urls = $$('[data-apprise-row]', form).map((row) => {
+      const input = $("[data-apprise-url]", row);
+      return input?.value.trim() || (row.dataset.configuredIndex != null ? `configured:${row.dataset.configuredIndex}` : "");
+    }).filter(Boolean);
     try {
       const response = await api("/api/settings", {method:"PATCH", body:payload});
       state.timeZone = payload.timezone;

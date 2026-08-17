@@ -260,11 +260,11 @@ def test_api_dashboard_and_settings_write(client, admin):
     settings = dashboard.get_json()["settings"]
     assert settings["gpu_util_threshold"] == 10
     assert settings["gpu_memory_threshold"] == 10
-    response = client.patch("/api/settings", json={"collection_interval": 11, "serverchan_events": ["host_offline"]}, headers=csrf(admin))
+    response = client.patch("/api/settings", json={"collection_interval": 11, "apprise_events": ["host_offline"]}, headers=csrf(admin))
     assert response.status_code == 200, response.get_json()
     settings = client.get("/api/settings").get_json()["settings"]
     assert settings["collection_interval"] == 11
-    assert settings["serverchan_events"] == ["host_offline"]
+    assert settings["apprise_events"] == ["host_offline"]
     assert settings["metric_raw_retention_minutes"] == 15
     assert settings["metric_mid_retention_hours"] == 6
     assert settings["collection_task_retention_minutes"] == 60
@@ -275,6 +275,63 @@ def test_api_dashboard_and_settings_write(client, admin):
     platform = client.get("/api/platform-status")
     assert platform.status_code == 200
     assert platform.get_json()["uptime_seconds"] >= 0
+
+
+def test_dashboard_local_overview_is_hidden_by_default_and_user_specific(client, app, admin):
+    hosts = app.extensions["hosts"]
+    remote = hosts.create(
+        host_payload(name="remote", address="10.0.0.2"),
+        fingerprint="SHA256:remote",
+        machine_id="machine-remote",
+    )
+    local = hosts.create(
+        {**host_payload(name="local", address="127.0.0.1"), "is_local": True},
+        fingerprint="SHA256:local",
+        machine_id="machine-local",
+    )
+
+    initial = client.get("/api/dashboard").get_json()
+    assert initial["show_local_overview"] is False
+    assert initial["local_configured"] is True
+    assert initial["local_host_id"] == local["id"]
+    assert [item["host"]["id"] for item in initial["items"]] == [remote["id"]]
+
+    enabled = client.patch(
+        "/api/profile/local-overview",
+        json={"enabled": True},
+        headers=csrf(admin),
+    )
+    assert enabled.status_code == 200
+    visible = client.get("/api/dashboard").get_json()
+    assert visible["show_local_overview"] is True
+    assert {item["host"]["id"] for item in visible["items"]} == {remote["id"], local["id"]}
+
+    created = client.post(
+        "/api/users",
+        json={"username": "viewer", "password": "ViewerPass123", "role": "viewer"},
+        headers=csrf(admin),
+    )
+    assert created.status_code == 201
+    viewer_client = app.test_client()
+    first = viewer_client.post("/api/auth/login", json={"username": "viewer", "password": "ViewerPass123"}).get_json()["user"]
+    changed = viewer_client.post(
+        "/api/auth/change-password",
+        json={"current_password": "ViewerPass123", "new_password": "ViewerPass456"},
+        headers=csrf(first),
+    )
+    assert changed.status_code == 200
+    viewer = viewer_client.post("/api/auth/login", json={"username": "viewer", "password": "ViewerPass456"}).get_json()["user"]
+    viewer_dashboard = viewer_client.get("/api/dashboard").get_json()
+    assert viewer_dashboard["show_local_overview"] is False
+    assert [item["host"]["id"] for item in viewer_dashboard["items"]] == [remote["id"]]
+
+    viewer_enabled = viewer_client.patch(
+        "/api/profile/local-overview",
+        json={"enabled": True},
+        headers=csrf(viewer),
+    )
+    assert viewer_enabled.status_code == 200
+    assert len(viewer_client.get("/api/dashboard").get_json()["items"]) == 2
 
 
 def test_api_host_create_retests_identity_server_side(client, admin, monkeypatch):
@@ -499,6 +556,9 @@ def test_frontend_console_contract_and_csp(client):
     assert "搜索 PID、用户、目录或命令" in script
     assert "<th>工作目录</th>" in script
     assert "setInterval(() => { if (!document.hidden) renderDashboard(true); }, state.refreshMs)" in script
+    assert 'switchControl("show_local_overview", "显示本机"' in script
+    assert 'switchControl("is_local", "作为本机概览"' in script
+    assert 'id="configure-local-host"' in script
     assert client.get("/static/vendor/xterm/xterm.js").status_code == 200
     assert client.get("/static/vendor/xterm/addon-fit.js").status_code == 200
     assert client.get("/static/vendor/xterm/xterm.css").status_code == 200

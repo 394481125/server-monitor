@@ -110,6 +110,7 @@ class AuthService:
             "role": row["role"],
             "theme": row["theme"],
             "must_change_password": bool(row["must_change_password"]),
+            "show_local_overview": bool(row["show_local_overview"]),
         }
         if csrf:
             result["csrf_token"] = csrf

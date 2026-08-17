@@ -278,6 +278,9 @@ button:focus-visible, .button-link:focus-visible { outline: 2px solid color-mix(
 .host-head > div { min-width: 0; }
 .host-head h3 { margin: 0 0 4px; font-size: 15px; }
 .host-head p { margin: 0; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.host-title-line { min-width: 0; display: flex; align-items: center; gap: 7px; }
+.host-title-line > h3, .host-title-line > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.local-badge { flex: 0 0 auto; padding: 1px 5px; border: 1px solid color-mix(in srgb, var(--success) 32%, var(--line)); border-radius: 2px; background: color-mix(in srgb, var(--success) 8%, var(--surface)); color: var(--success); font-size: 9px; font-weight: 700; }
 .tag-line { min-height: 25px; margin-top: 3px; }
 .tag { display: inline-block; margin: 4px 4px 0 0; padding: 2px 6px; border: 1px solid color-mix(in srgb, var(--primary) 18%, var(--line)); border-radius: 2px; background: var(--active); color: var(--primary); font-size: 10px; }
 .status { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; color: var(--muted); font-size: 11px; font-weight: 650; }
@@ -293,6 +296,17 @@ button:focus-visible, .button-link:focus-visible { outline: 2px solid color-mix(
 .dashboard-filter-band label { min-width: 0; margin: 0; color: var(--muted); font-size: 10px; }
 .dashboard-filter-band select { min-width: 0; }
 .dashboard-filter-band select[multiple] { min-height: 52px; padding: 3px 6px; }
+.dashboard-local-overview { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; padding: 9px 12px; border: 1px solid var(--line); background: var(--surface); }
+.dashboard-local-overview > div { min-width: 0; display: grid; gap: 2px; }
+.dashboard-local-overview strong { font-size: 12px; }
+.dashboard-local-overview span { color: var(--muted); font-size: 10px; }
+.dashboard-local-overview .switch-label { flex: 0 0 auto; margin: 0; }
+.dashboard-local-overview .switch-label span { color: var(--text); font-size: 11px; }
+.local-overview-setup { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.local-overview-setup > div { display: grid; gap: 3px; }
+.local-overview-setup span { color: var(--muted); }
+.host-local-option { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin: 12px 0; }
+.host-local-option .switch-label { margin: 0; }
 .gpu-user-summary { margin: 0 0 12px; border: 1px solid var(--line); background: var(--surface); }
 .gpu-user-summary summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 12px; color: var(--text); cursor: pointer; list-style-position: inside; }
 .gpu-user-summary summary::marker { color: var(--primary); }
@@ -434,6 +448,17 @@ td .text-button { margin-right: 2px; }
 .settings-section > p { margin: 0 0 13px; color: var(--muted); font-size: 11px; }
 .form-grid { display: grid; grid-template-columns: repeat(3, minmax(160px, 1fr)); gap: 0 16px; }
 .form-grid.two { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
+.notification-url-panel { margin-top: 15px; padding: 14px; border: 1px solid var(--line); background: var(--surface-2); }
+.notification-url-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
+.notification-url-heading strong, .notification-events > strong { display: block; font-size: 13px; }
+.notification-url-heading p { max-width: 700px; margin: 4px 0 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.notification-url-heading a { color: var(--primary); }
+.apprise-url-row { display: grid; grid-template-columns: minmax(0, 1fr) 34px 34px; gap: 7px; margin-top: 7px; }
+.apprise-url-row input { min-width: 0; font-family: var(--mono); }
+.apprise-url-row .icon-button { min-height: 34px; }
+.notification-url-panel > .hint { display: block; margin-top: 10px; }
+.notification-events { margin-top: 15px; }
+.notification-events .action-strip { margin-top: 8px; }
 .check-label { display: flex; align-items: center; gap: 8px; min-height: 36px; margin: 6px 0; color: var(--text); font-weight: 500; }
 .switch-label { display: flex; align-items: center; gap: 9px; }
 .switch-label input { position: absolute; opacity: 0; pointer-events: none; }

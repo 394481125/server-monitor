@@ -20,6 +20,7 @@ from monitor.collector import (
     flattened_metrics,
 )
 from monitor.db import Database
+from monitor.migrations import MIGRATIONS
 from monitor.services import gpu_user_usage
 
 from .conftest import csrf
@@ -250,11 +251,11 @@ def test_health_inspection_api_and_fault_status_detail(client, app, admin, monke
     assert faults.status_code == 200 and faults.get_json()["items"][0]["issues"][0]["last_error"] == "密码错误"
 
 
-def test_audit_changes_are_structurally_redacted_and_schema7_and_pwa(app, client, admin):
+def test_audit_changes_are_structurally_redacted_and_schema_version_and_pwa(app, client, admin):
     audit_id = AuditService(app.extensions["database"]).write("test", actor=admin, changes={"password": {"before": "old", "after": "new"}, "nested": [{"sendkey": "SCT-secret"}]})
     row = app.extensions["database"].query_one("SELECT changes_json FROM audit_logs WHERE id=?", (audit_id,))
     assert "old" not in row["changes_json"] and "SCT-secret" not in row["changes_json"]
-    assert app.extensions["database"].query_one("PRAGMA user_version")[0] == 7
+    assert app.extensions["database"].query_one("PRAGMA user_version")[0] == len(MIGRATIONS)
     page = client.get("/")
     assert page.status_code == 200 and 'rel="manifest"' in page.get_data(as_text=True)
     assert client.get("/static/manifest.webmanifest").status_code == 200

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 
 DEFAULTS: dict[str, Any] = {
@@ -72,9 +74,9 @@ DEFAULTS: dict[str, Any] = {
     "backup_keep": 10,
     "schedule_output_limit": 1024 * 1024,
     "toast_enabled": True,
-    "serverchan_enabled": False,
-    "serverchan_sendkey": "",
-    "serverchan_events": [
+    "apprise_enabled": False,
+    "apprise_urls": [],
+    "apprise_events": [
         "host_offline",
         "temperature_high",
         "filesystem_usage_high",
@@ -184,7 +186,7 @@ BOOLEAN_KEYS = {
     "gpu_scheduler_enabled",
     "gpu_process_guard",
     "toast_enabled",
-    "serverchan_enabled",
+    "apprise_enabled",
     "gpu_xid_alert_enabled",
     "gpu_pcie_alert_enabled",
     "gpu_throttle_alert_enabled",
@@ -237,7 +239,7 @@ def validate_settings(values: dict[str, Any], current: dict[str, Any] | None = N
             if not (0 <= hour <= 23 and 0 <= minute <= 59):
                 raise ConfigError("backup_time 超出有效时间范围")
             cleaned[key] = value
-        elif key in {"backup_dir", "serverchan_sendkey"}:
+        elif key == "backup_dir":
             if not isinstance(value, str):
                 raise ConfigError(f"{key} 必须是字符串")
             value = value.strip()
@@ -246,7 +248,34 @@ def validate_settings(values: dict[str, Any], current: dict[str, Any] | None = N
             if len(value) > 1024:
                 raise ConfigError(f"{key} 过长")
             cleaned[key] = value
-        elif key == "serverchan_events":
+        elif key == "apprise_urls":
+            if not isinstance(value, list):
+                raise ConfigError("apprise_urls 必须是 URL 数组")
+            if len(value) > 32:
+                raise ConfigError("最多配置 32 个通知 URL")
+            urls: list[str] = []
+            for item in value:
+                if not isinstance(item, str):
+                    raise ConfigError("apprise_urls 只能包含字符串")
+                item = item.strip()
+                if not item or len(item) > 4096:
+                    raise ConfigError("通知 URL 不能为空且不能超过 4096 个字符")
+                if item.startswith("enc:"):
+                    # URLs are encrypted by the HTTP layer before persistence.
+                    if len(item) <= 4 or any(char.isspace() for char in item):
+                        raise ConfigError("通知 URL 加密值无效")
+                else:
+                    parsed = urlsplit(item)
+                    if not re.fullmatch(r"[a-z][a-z0-9+.-]{1,31}", parsed.scheme, re.IGNORECASE):
+                        raise ConfigError(f"通知 URL 协议无效: {item[:48]}")
+                    if not (parsed.netloc or parsed.path):
+                        raise ConfigError(f"通知 URL 不完整: {item[:48]}")
+                    if any(ord(char) < 32 or ord(char) == 127 for char in item):
+                        raise ConfigError("通知 URL 不能包含控制字符")
+                if item not in urls:
+                    urls.append(item)
+            cleaned[key] = urls
+        elif key == "apprise_events":
             allowed_events = {
                 "host_offline", "temperature_high", "filesystem_usage_high", "filesystem_inode_high", "swap_usage_high",
                 "gpu_schedule_success", "gpu_schedule_failed", "gpu_schedule_frozen", "gpu_power_high",
@@ -254,7 +283,7 @@ def validate_settings(values: dict[str, Any], current: dict[str, Any] | None = N
                 "backup_failed",
             }
             if not isinstance(value, list) or any(item not in allowed_events for item in value):
-                raise ConfigError("serverchan_events 包含无效事件类型")
+                raise ConfigError("apprise_events 包含无效事件类型")
             cleaned[key] = sorted(set(value))
         else:
             cleaned[key] = value
@@ -305,3 +334,9 @@ class ConfigStore:
             if rows.get(key) == legacy and DEFAULTS[key] != legacy
         }
         return self.update(updates) if updates else self.all()
+
+    def remove_legacy_notification_settings(self) -> None:
+        """Discard the retired Server 酱 settings; Apprise is the only notification backend."""
+        self.database.execute(
+            "DELETE FROM settings WHERE key IN ('serverchan_enabled','serverchan_sendkey','serverchan_events')"
+        )

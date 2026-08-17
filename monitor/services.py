@@ -28,6 +28,7 @@ from .utils import (
 
 ACTIVE_HOST_FIELDS = {
     "name", "address", "port", "username", "auth_type", "tags", "notes", "asset_location", "asset_owner", "warranty_expires", "enabled",
+    "is_local",
     "docker_enabled", "allow_tmux", "allow_terminal", "allow_process", "allow_install",
     "allow_stress", "timeout_seconds", "scheduler_enabled", "scheduler_idle_seconds",
     "scheduler_process_guard", "schedule_command", "schedule_cwd", "schedule_shell",
@@ -35,7 +36,7 @@ ACTIVE_HOST_FIELDS = {
 }
 BOOLEAN_HOST_FIELDS = {
     "enabled", "docker_enabled", "allow_tmux", "allow_terminal", "allow_process", "allow_install",
-    "allow_stress", "scheduler_enabled", "scheduler_process_guard",
+    "allow_stress", "scheduler_enabled", "scheduler_process_guard", "is_local",
 }
 SECRET_HOST_FIELDS = {"auth_secret", "private_key", "private_key_passphrase", "sudo_password"}
 HOST_TRANSFER_FIELDS = (
@@ -302,6 +303,8 @@ class HostService:
 
     def create(self, payload: dict[str, Any], *, fingerprint: str, machine_id: str | None) -> dict[str, Any]:
         clean = self._validate(payload, partial=False)
+        if clean.get("is_local") and self.database.query_one("SELECT id FROM hosts WHERE is_local=1 AND deleted_at IS NULL"):
+            raise ServiceError("已有主机被设为本机概览，请先取消原主机的本机标记")
         if clean.get("auth_type") == "password" and not clean.get("auth_secret"):
             raise ServiceError("密码认证必须提供 SSH 密码")
         if clean.get("auth_type") == "key" and not clean.get("private_key"):
@@ -315,6 +318,7 @@ class HostService:
         now = utc_iso()
         values = {
             "port": 22, "tags_json": "[]", "notes": "", "asset_location": "", "asset_owner": "", "warranty_expires": None, "enabled": 1, "docker_enabled": 1,
+            "is_local": 0,
             "allow_tmux": 1, "allow_terminal": 1, "allow_process": 1, "allow_install": 1,
             "allow_stress": 1, "schedule_shell": "/bin/bash", "schedule_env_json": "{}", "schedule_mode": "tmux",
             **clean, "fingerprint": fingerprint, "machine_id": machine_id, "physical_id": physical_id,
@@ -327,6 +331,8 @@ class HostService:
             )
         except sqlite3.IntegrityError as exc:
             message = str(exc)
+            if "uq_active_local_host" in message or "hosts.is_local" in message:
+                raise ServiceError("已有主机被设为本机概览，请先取消原主机的本机标记") from exc
             if "uq_active_host_endpoint" in message or "hosts.address" in message or "hosts.port" in message:
                 raise ServiceError("该地址和 SSH 端口已被纳管") from exc
             if "uq_active_physical_host" in message or "hosts.physical_id" in message:
@@ -340,6 +346,12 @@ class HostService:
     def update(self, host_id: int, payload: dict[str, Any], *, fingerprint: str | None = None, machine_id: str | None = None) -> dict[str, Any]:
         current = self.get(host_id, include_secrets=True)
         clean = self._validate(payload, partial=True)
+        if clean.get("is_local"):
+            existing = self.database.query_one(
+                "SELECT id FROM hosts WHERE is_local=1 AND deleted_at IS NULL AND id<>?", (host_id,)
+            )
+            if existing:
+                raise ServiceError("已有主机被设为本机概览，请先取消原主机的本机标记")
         identity_changes = {"address", "port", "username", "auth_type", "auth_secret", "private_key", "private_key_passphrase"} & set(clean)
         if identity_changes and not fingerprint:
             raise ServiceError("修改连接信息时必须先重新测试 SSH 连接")
@@ -368,6 +380,8 @@ class HostService:
                 [*clean.values(), host_id],
             )
         except sqlite3.IntegrityError as exc:
+            if "uq_active_local_host" in str(exc) or "hosts.is_local" in str(exc):
+                raise ServiceError("已有主机被设为本机概览，请先取消原主机的本机标记") from exc
             raise ServiceError("主机地址或物理身份与现有有效主机重复") from exc
         if {"scheduler_enabled", "schedule_command", "scheduler_idle_seconds", "scheduler_process_guard"} & set(clean):
             self.reset_gpu_runtime(host_id, "主机调度配置已修改")

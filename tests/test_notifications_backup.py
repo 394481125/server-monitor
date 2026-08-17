@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import json
 from datetime import timedelta
 from pathlib import Path
 
@@ -11,19 +12,50 @@ from monitor.utils import utc_iso, utc_now
 from .conftest import csrf
 
 
+def test_apprise_settings_are_encrypted_and_masked(client, app, admin):
+    response = client.patch(
+        "/api/settings",
+        json={
+            "apprise_enabled": True,
+            "apprise_urls": ["ntfy://shengziran", "discord://bot-secret.example.invalid/webhook-token"],
+            "apprise_events": ["host_offline"],
+        },
+        headers=csrf(admin),
+    )
+    assert response.status_code == 200, response.get_json()
+    settings = client.get("/api/settings").get_json()["settings"]
+    assert settings["apprise_urls"] == ["ntfy://shengziran", "discord://***"]
+    stored = app.extensions["database"].query_one("SELECT value FROM settings WHERE key='apprise_urls'")
+    assert "shengziran" not in stored["value"]
+    assert all(value.startswith("enc:") for value in json.loads(stored["value"]))
+
+
+def test_apprise_test_endpoint_resolves_configured_url(client, app, admin, monkeypatch):
+    app.extensions["monitor_config"].update({"apprise_urls": ["ntfy://shengziran"]})
+    calls = []
+    monkeypatch.setattr(
+        app.extensions["notifications"],
+        "_deliver",
+        lambda url, title, body, notify_type: calls.append((url, title)) or (True, "ok"),
+    )
+    response = client.post("/api/notifications/test", json={"url": "configured:0"}, headers=csrf(admin))
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["success"] is True
+    assert calls == [("ntfy://shengziran", "Server Monitor 测试通知")]
+
+
 def test_notification_payload_is_redacted_and_async(app, monkeypatch):
     notifications = app.extensions["notifications"]
     sent = []
-    monkeypatch.setattr(notifications, "_send", lambda alert, sendkey: sent.append((alert["alert_type"], sendkey)))
+    monkeypatch.setattr(notifications, "_send", lambda alert, urls: sent.append((alert["alert_type"], urls)))
     config = app.extensions["monitor_config"]
-    box = app.extensions["secret_box"]
-    config.update({"serverchan_enabled": True, "serverchan_sendkey": box.encrypt("test-send-key"), "serverchan_events": ["host_offline"]})
+    config.update({"apprise_enabled": True, "apprise_urls": ["ntfy://test-topic"], "apprise_events": ["host_offline"]})
     app.extensions["alerts"].emit("test-host-offline", None, "host_offline", "critical", "摘要 password=secret")
     for _ in range(20):
         if sent:
             break
         time.sleep(0.01)
-    assert sent == [("host_offline", "test-send-key")]
+    assert sent == [("host_offline", ["ntfy://test-topic"])]
     notifications.close()
 
 

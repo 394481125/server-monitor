@@ -451,19 +451,18 @@ def test_alert_notification_setting_requires_permission_and_boolean(client, app,
     assert denied.status_code == 403
 
 
-def test_alert_notification_setting_supports_post_and_suppresses_serverchan(client, app, admin, monkeypatch):
+def test_alert_notification_setting_supports_post_and_suppresses_apprise(client, app, admin, monkeypatch):
     notifications = app.extensions["notifications"]
     sent = []
-    monkeypatch.setattr(notifications, "_send", lambda alert, sendkey: sent.append(alert["id"]))
-    box = app.extensions["secret_box"]
-    app.extensions["monitor_config"].update({"serverchan_enabled": True, "serverchan_sendkey": box.encrypt("test-send-key"), "serverchan_events": ["host_offline"]})
+    monkeypatch.setattr(notifications, "_send", lambda alert, urls: sent.append(alert["id"]))
+    app.extensions["monitor_config"].update({"apprise_enabled": True, "apprise_urls": ["ntfy://test-topic"], "apprise_events": ["host_offline"]})
     response = client.post("/api/alerts/notification-setting", json={"enabled": False}, headers=csrf(admin))
     assert response.status_code == 200 and response.get_json()["enabled"] is False
-    app.extensions["alerts"].emit("serverchan-suppressed", None, "host_offline", "critical", "不应发送")
+    app.extensions["alerts"].emit("apprise-suppressed", None, "host_offline", "critical", "不应发送")
     assert sent == []
     response = client.post("/api/alerts/notification-setting", json={"enabled": True}, headers=csrf(admin))
     assert response.status_code == 200 and response.get_json()["enabled"] is True
-    app.extensions["alerts"].emit("serverchan-allowed", None, "host_offline", "critical", "允许发送")
+    app.extensions["alerts"].emit("apprise-allowed", None, "host_offline", "critical", "允许发送")
     for _ in range(20):
         if sent:
             break

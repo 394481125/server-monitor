@@ -24,6 +24,27 @@ def test_host_identity_and_endpoint_are_unique(app):
         hosts.create(host_payload(name="alias", address="node-one.local"), fingerprint="SHA256:key-one", machine_id="machine-one")
 
 
+def test_only_one_active_host_can_be_the_local_overview(app):
+    hosts = app.extensions["hosts"]
+    local = hosts.create(
+        {**host_payload(name="local", address="127.0.0.1"), "is_local": True},
+        fingerprint="SHA256:local",
+        machine_id="machine-local",
+    )
+    remote = hosts.create(
+        host_payload(name="remote", address="10.0.0.2"),
+        fingerprint="SHA256:remote",
+        machine_id="machine-remote",
+    )
+
+    assert local["is_local"] is True
+    with pytest.raises(ServiceError, match="已有主机被设为本机概览"):
+        hosts.update(remote["id"], {"is_local": True})
+
+    hosts.update(local["id"], {"is_local": False})
+    assert hosts.update(remote["id"], {"is_local": True})["is_local"] is True
+
+
 def test_soft_delete_clears_secrets_and_releases_uniqueness(app):
     hosts = app.extensions["hosts"]
     first = hosts.create(host_payload(), fingerprint="SHA256:key-one", machine_id="machine-one")

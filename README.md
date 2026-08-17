@@ -118,18 +118,18 @@ git diff --check
 
 ## 关键配置
 
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `SERVER_MONITOR_DATA_DIR` | `./data` | 数据库、主密钥、备份、日志和锁文件目录 |
-| `SERVER_MONITOR_DATABASE` | 数据目录内数据库 | 指定 SQLite 文件 |
-| `SERVER_MONITOR_MASTER_KEY` | 数据目录内 `master.key` | 指定主密钥路径 |
-| `SERVER_MONITOR_INITIAL_PASSWORD` | 无 | 仅首次创建管理员时必填 |
-| `SERVER_MONITOR_BIND` | `127.0.0.1:8000` | Gunicorn 监听地址 |
-| `SERVER_MONITOR_HTTPS` | `0` | HTTPS 已在反向代理终止时设为 `1` |
-| `SERVER_MONITOR_MAX_UPLOAD_BYTES` | 512 MiB | HTTP 请求体上限 |
-| `SERVER_MONITOR_FILE_TRANSFER_LIMIT` | 512 MiB | 单次文件操作总量上限 |
-| `SERVER_MONITOR_LOG_LEVEL` | 未设置 | 应用日志级别，优先于 `LOG_LEVEL` |
-| `LOG_LEVEL` | `INFO` | 通用日志级别 |
+| 环境变量                               | 默认值                   | 说明                                   |
+| -------------------------------------- | ------------------------ | -------------------------------------- |
+| `SERVER_MONITOR_DATA_DIR`            | `./data`               | 数据库、主密钥、备份、日志和锁文件目录 |
+| `SERVER_MONITOR_DATABASE`            | 数据目录内数据库         | 指定 SQLite 文件                       |
+| `SERVER_MONITOR_MASTER_KEY`          | 数据目录内`master.key` | 指定主密钥路径                         |
+| `SERVER_MONITOR_INITIAL_PASSWORD`    | 无                       | 仅首次创建管理员时必填                 |
+| `SERVER_MONITOR_BIND`                | `127.0.0.1:8000`       | Gunicorn 监听地址                      |
+| `SERVER_MONITOR_HTTPS`               | `0`                    | HTTPS 已在反向代理终止时设为`1`      |
+| `SERVER_MONITOR_MAX_UPLOAD_BYTES`    | 512 MiB                  | HTTP 请求体上限                        |
+| `SERVER_MONITOR_FILE_TRANSFER_LIMIT` | 512 MiB                  | 单次文件操作总量上限                   |
+| `SERVER_MONITOR_LOG_LEVEL`           | 未设置                   | 应用日志级别，优先于`LOG_LEVEL`      |
+| `LOG_LEVEL`                          | `INFO`                 | 通用日志级别                           |
 
 完整部署、备份、恢复、升级和发布步骤见 [运维手册](docs/OPERATIONS.md)。
 

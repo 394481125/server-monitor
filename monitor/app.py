@@ -13,7 +13,7 @@ import uuid
 import weakref
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from flask import Flask, Response, g, jsonify, render_template, request
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -22,7 +22,7 @@ from .audit import AuditService
 from .auth import AuthError, AuthService, LoginLocked
 from .background import BackgroundService
 from .collector import Collector
-from .config import ConfigError, ConfigStore
+from .config import ConfigError, ConfigStore, validate_settings
 from .db import Database
 from .development import DevelopmentService
 from .files import SFTPFileService
@@ -57,6 +57,57 @@ from .web import COOKIE_NAME, WebContext
 
 
 LOGGER = logging.getLogger("server_monitor")
+
+
+def _mask_apprise_url(value: str) -> str:
+    """Hide credentials and token-like query values while keeping URLs recognizable."""
+    if not isinstance(value, str) or value.startswith("enc:"):
+        return "已配置的通知 URL"
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() not in {"ntfy", "ntfys"}:
+            return f"{parsed.scheme or 'apprise'}://***"
+        netloc = parsed.netloc
+        if parsed.username is not None or parsed.password is not None:
+            host = parsed.hostname or ""
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            if parsed.port:
+                host = f"{host}:{parsed.port}"
+            user = parsed.username or ""
+            netloc = f"{user}:***@{host}" if parsed.password is not None else f"{user}@{host}"
+        sensitive = {"token", "key", "password", "pass", "secret", "apikey", "api_key", "access_token", "auth"}
+        query = urlencode([(key, "***" if key.lower() in sensitive else item) for key, item in parse_qsl(parsed.query, keep_blank_values=True)])
+        fragment = "***" if parsed.fragment else ""
+        return urlunsplit((parsed.scheme, netloc, parsed.path, query, fragment))
+    except (TypeError, ValueError):
+        return "已配置的通知 URL"
+
+
+def _resolve_apprise_markers(values: Any, current: list[str]) -> list[str]:
+    if not isinstance(values, list):
+        raise ConfigError("apprise_urls 必须是 URL 数组")
+    resolved: list[str] = []
+    for value in values:
+        if isinstance(value, str) and value.startswith("configured:"):
+            try:
+                index = int(value.partition(":")[2])
+            except ValueError as exc:
+                raise ConfigError("通知 URL 配置引用无效") from exc
+            if index < 0 or index >= len(current):
+                raise ConfigError("通知 URL 配置引用已失效，请重新加载设置")
+            value = current[index]
+        resolved.append(value)
+    return resolved
+
+
+def _encode_apprise_urls(values: Any, current: list[str], secret_box: SecretBox) -> list[str]:
+    resolved = _resolve_apprise_markers(values, current)
+    cleaned = validate_settings({"apprise_urls": resolved})["apprise_urls"]
+    encoded: list[str] = []
+    for value in cleaned:
+        encoded.append(value if value.startswith("enc:") else f"enc:{secret_box.encrypt(value)}")
+    return encoded
 
 
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
@@ -100,6 +151,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         PasswordService.validate_initial(app.config["INITIAL_ADMIN_PASSWORD"])
     secret_box = SecretBox(app.config["MASTER_KEY"] or data_dir / "master.key")
     config = ConfigStore(database)
+    config.remove_legacy_notification_settings()
     config.migrate_alert_defaults()
     ssh_pool = SSHConnectionPool(secret_box, config.all)
     permission_service = PermissionService(database)
@@ -384,6 +436,22 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         visible_pages = permission_service.set_visibility(g.user["id"], body().get("visible_pages"))
         audit_action("profile_visibility_updated", target_type="user", target_id=g.user["id"], summary="用户更新页面显示偏好")
         return jsonify(visible_pages=visible_pages)
+
+    @app.patch("/api/profile/local-overview")
+    @login_required(permission="page.dashboard", write=True)
+    def update_local_overview():
+        enabled = body().get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled 必须是布尔值")
+        database.execute("UPDATE users SET show_local_overview=?,updated_at=? WHERE id=?", (int(enabled), utc_iso(), g.user["id"]))
+        audit_action(
+            "profile_local_overview_updated",
+            target_type="user",
+            target_id=g.user["id"],
+            summary="显示本机 SSH 概览" if enabled else "隐藏本机 SSH 概览",
+            changes={"show_local_overview": {"before": bool(g.user.get("show_local_overview")), "after": enabled}},
+        )
+        return jsonify(enabled=enabled)
 
     @app.post("/api/users")
     @login_required(admin=True, write=True)
@@ -834,10 +902,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @app.get("/api/dashboard")
     @login_required(permission="page.dashboard")
     def dashboard():
-        items = []
+        all_items = []
         for host in hosts.list(search=request.args.get("search"), status=request.args.get("status")):
-            items.append({"host": host, "latest": hosts.latest(host["id"])})
-        return jsonify(items=items, gpu_users=gpu_user_usage(items), settings={key: value for key, value in config.all().items() if key in {"frontend_refresh_interval", "green_threshold", "yellow_threshold", "gpu_util_threshold", "gpu_memory_threshold", "filesystem_usage_threshold", "filesystem_inode_threshold", "swap_usage_threshold", "metric_retention_days", "timezone"}})
+            all_items.append({"host": host, "latest": hosts.latest(host["id"])})
+        show_local = bool(g.user.get("show_local_overview"))
+        local_item = next((item for item in all_items if item["host"].get("is_local")), None)
+        items = all_items if show_local else [item for item in all_items if not item["host"].get("is_local")]
+        return jsonify(
+            items=items,
+            gpu_users=gpu_user_usage(items),
+            local_configured=local_item is not None,
+            local_host_id=local_item["host"]["id"] if local_item else None,
+            show_local_overview=show_local,
+            settings={key: value for key, value in config.all().items() if key in {"frontend_refresh_interval", "green_threshold", "yellow_threshold", "gpu_util_threshold", "gpu_memory_threshold", "filesystem_usage_threshold", "filesystem_inode_threshold", "swap_usage_threshold", "metric_retention_days", "timezone"}},
+        )
 
     @app.get("/api/gpu-usage/users")
     @login_required(permission="page.dashboard")
@@ -942,7 +1020,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @login_required(permission="page.settings")
     def get_settings():
         values = config.all()
-        values["serverchan_sendkey"] = "configured" if values.get("serverchan_sendkey") else ""
+        values["apprise_urls"] = [_mask_apprise_url(value) for value in notifications._urls()]
+        values["apprise_available"] = notifications.available
         values.update(database.storage_info())
         return jsonify(settings=values)
 
@@ -960,24 +1039,37 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def update_settings():
         payload = body()
         before_settings = config.all()
-        clear_sendkey = payload.pop("serverchan_sendkey_clear", False)
-        if payload.get("serverchan_sendkey") == "configured":
-            payload.pop("serverchan_sendkey")
-        elif "serverchan_sendkey" in payload and payload["serverchan_sendkey"]:
-            payload["serverchan_sendkey"] = secret_box.encrypt(payload["serverchan_sendkey"])
-        elif "serverchan_sendkey" in payload:
-            payload.pop("serverchan_sendkey")
-        if clear_sendkey:
-            payload["serverchan_sendkey"] = ""
+        if "apprise_urls" in payload:
+            payload["apprise_urls"] = _encode_apprise_urls(payload["apprise_urls"], before_settings.get("apprise_urls", []), secret_box)
         values = config.update(payload)
         audit_action(
             "settings_updated",
             target_type="settings",
             summary="系统设置已更新",
-            changes=diff_changes(before_settings, values, ignored={"serverchan_sendkey"}),
+            changes=diff_changes(before_settings, values, ignored={"apprise_urls"}),
         )
-        values["serverchan_sendkey"] = "configured" if values.get("serverchan_sendkey") else ""
+        values["apprise_urls"] = [_mask_apprise_url(value) for value in notifications._urls()]
+        values["apprise_available"] = notifications.available
         return jsonify(settings=values)
+
+    @app.post("/api/notifications/test")
+    @login_required(permission="settings.manage", write=True)
+    def test_notifications():
+        payload = body()
+        current = config.all().get("apprise_urls", [])
+        if "urls" in payload:
+            urls = _resolve_apprise_markers(payload["urls"], current)
+            urls = validate_settings({"apprise_urls": urls})["apprise_urls"]
+        else:
+            value = payload.get("url")
+            if value is None:
+                urls = None
+            elif isinstance(value, str):
+                urls = _resolve_apprise_markers([value], current)
+                urls = validate_settings({"apprise_urls": urls})["apprise_urls"]
+            else:
+                raise ValueError("url 必须是字符串")
+        return jsonify(notifications.test(urls))
 
     @app.patch("/api/profile/theme")
     @login_required(write=True)

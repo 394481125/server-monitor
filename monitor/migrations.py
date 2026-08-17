@@ -120,6 +120,15 @@ def _repair_legacy_schema_and_add_gpu_benchmarks(connection: sqlite3.Connection)
     )
 
 
+def _local_overview(connection: sqlite3.Connection) -> None:
+    _add_columns(connection, "users", (("show_local_overview", "INTEGER NOT NULL DEFAULT 0"),))
+    _add_columns(connection, "hosts", (("is_local", "INTEGER NOT NULL DEFAULT 0"),))
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_local_host "
+        "ON hosts(is_local) WHERE deleted_at IS NULL AND is_local=1"
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "baseline", _baseline),
     Migration(2, "alert-acknowledgement", _alert_acknowledgement),
@@ -128,6 +137,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(5, "saved-views", _saved_views),
     Migration(6, "supporting-indexes", _supporting_indexes),
     Migration(7, "legacy-repair-and-gpu-benchmarks", _repair_legacy_schema_and_add_gpu_benchmarks),
+    Migration(8, "local-overview", _local_overview),
 )
 
 

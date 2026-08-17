@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT NOT NULL CHECK(role IN ('admin', 'viewer')),
     active INTEGER NOT NULL DEFAULT 1,
     must_change_password INTEGER NOT NULL DEFAULT 0,
+    show_local_overview INTEGER NOT NULL DEFAULT 0,
     theme TEXT NOT NULL DEFAULT 'light' CHECK(theme IN ('light', 'dark', 'tech')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -88,6 +89,7 @@ CREATE TABLE IF NOT EXISTS hosts (
     machine_id TEXT,
     physical_id TEXT,
     identity_degraded INTEGER NOT NULL DEFAULT 0,
+    is_local INTEGER NOT NULL DEFAULT 0 CHECK(is_local IN (0, 1)),
     tags_json TEXT NOT NULL DEFAULT '[]',
     notes TEXT NOT NULL DEFAULT '',
     asset_location TEXT NOT NULL DEFAULT '',

@@ -7,5 +7,6 @@ cryptography==42.0.8
 paramiko==3.4.0
 gunicorn==22.0.0
 gevent==24.2.1
+apprise==1.12.0
 pytest==8.2.2
 pytest-timeout==2.3.1

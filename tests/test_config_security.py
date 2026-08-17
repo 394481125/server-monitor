@@ -26,8 +26,11 @@ def test_settings_validate_ranges_and_cross_fields():
         validate_settings({"metric_mid_retention_hours": 24, "metric_retention_days": 1})
     with pytest.raises(ConfigError):
         validate_settings({"scan_timeout_seconds": 121})
+    with pytest.raises(ConfigError, match="协议无效"):
+        validate_settings({"apprise_urls": ["missing-scheme"]})
     assert validate_settings({"scan_max_depth": "6"})["scan_max_depth"] == 6
     assert validate_settings({"collection_interval": "10"})["collection_interval"] == 10
+    assert validate_settings({"apprise_urls": ["ntfy://shengziran"]})["apprise_urls"] == ["ntfy://shengziran"]
 
 
 def test_secret_box_round_trip_and_permissions(tmp_path):
@@ -87,6 +90,18 @@ def test_config_store_round_trip(tmp_path):
     with pytest.raises(ConfigError, match="中期聚合"):
         store.update({"metric_retention_days": 1})
     assert os.stat(database.path).st_mode & 0o777 == 0o600
+
+
+def test_config_store_discards_retired_serverchan_settings(tmp_path):
+    from monitor.db import Database
+
+    database = Database(tmp_path / "db")
+    database.initialize()
+    for key in ("serverchan_enabled", "serverchan_sendkey", "serverchan_events"):
+        database.execute("INSERT INTO settings(key,value) VALUES(?,?)", (key, '"legacy"'))
+    store = ConfigStore(database)
+    store.remove_legacy_notification_settings()
+    assert database.query_one("SELECT key FROM settings WHERE key LIKE 'serverchan_%'") is None
 
 
 def test_legacy_alert_defaults_are_migrated_but_custom_values_are_preserved(tmp_path):

@@ -92,6 +92,34 @@ def test_migration_runner_repairs_legacy_columns_marked_by_old_bootstrap(tmp_pat
     assert database.query_one("SELECT name FROM sqlite_master WHERE type='table' AND name='gpu_benchmarks'")
 
 
+def test_local_overview_migration_preserves_existing_users_and_hosts(tmp_path):
+    database = Database(tmp_path / "local-overview.sqlite3")
+    database.initialize()
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO users(username,password_hash,role,active,must_change_password,created_at,updated_at) "
+            "VALUES('existing-user','hash','admin',1,0,'before','before')"
+        )
+        connection.execute(
+            "INSERT INTO hosts(name,address,port,username,auth_type,auth_secret,created_at,updated_at) "
+            "VALUES('existing-host','10.0.0.8',22,'monitor','password','secret','before','before')"
+        )
+        connection.execute("DROP INDEX uq_active_local_host")
+        connection.execute("ALTER TABLE users DROP COLUMN show_local_overview")
+        connection.execute("ALTER TABLE hosts DROP COLUMN is_local")
+        connection.execute("DELETE FROM schema_migrations WHERE version=8")
+        connection.execute("PRAGMA user_version=7")
+        connection.commit()
+
+    database.initialize()
+
+    user = database.query_one("SELECT username,show_local_overview FROM users WHERE username='existing-user'")
+    host = database.query_one("SELECT name,is_local FROM hosts WHERE name='existing-host'")
+    assert dict(user) == {"username": "existing-user", "show_local_overview": 0}
+    assert dict(host) == {"name": "existing-host", "is_local": 0}
+    assert database.query_one("SELECT name FROM sqlite_master WHERE type='index' AND name='uq_active_local_host'")
+
+
 def test_log_level_supports_service_specific_and_standard_environment(monkeypatch):
     monkeypatch.setenv("LOG_LEVEL", "warning")
     assert configured_log_level()[0] == "WARNING"
