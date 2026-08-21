@@ -70,7 +70,8 @@ class BackgroundService:
                 next_collection = now + settings["collection_interval"]
             self._dispatch_ready()
             self._maybe_backup()
-            if now - self._last_maintenance >= 300:
+            maintenance_interval = max(60, int(settings["cleanup_interval_minutes"]) * 60)
+            if now - self._last_maintenance >= maintenance_interval:
                 self._maintenance()
                 self._last_maintenance = now
             self._stop.wait(0.25)
@@ -168,6 +169,7 @@ class BackgroundService:
             outcome = self.hosts.ingest_collection(host_id, result)
             self.alerts.evaluate_host(host_id, outcome["status"], outcome.get("data"))
             if result.core_ok and outcome.get("data"):
+                self.alerts.evaluate_gpu_availability(host_id, (previous or {}).get("data"), outcome["data"])
                 self.scheduler.observe(host, outcome["data"].get("gpus", []), sample_valid=True)
             else:
                 self.scheduler.reset_host(host_id, outcome.get("error") or "采集失败")
@@ -235,6 +237,9 @@ class BackgroundService:
                 log_retention_days=settings["log_retention_days"],
                 collection_task_retention_minutes=settings["collection_task_retention_minutes"],
             )
+            # Cleanup removes rows; checkpointing releases the WAL growth
+            # without forcing a potentially expensive VACUUM on every cycle.
+            self.database.checkpoint()
         except Exception as exc:
             self.audit.write("maintenance_failed", success=False, summary="历史维护任务失败", error=str(exc))
 

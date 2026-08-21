@@ -49,7 +49,7 @@ def test_notification_payload_is_redacted_and_async(app, monkeypatch):
     sent = []
     monkeypatch.setattr(notifications, "_send", lambda alert, urls: sent.append((alert["alert_type"], urls)))
     config = app.extensions["monitor_config"]
-    config.update({"apprise_enabled": True, "apprise_urls": ["ntfy://test-topic"], "apprise_events": ["host_offline"]})
+    config.update({"apprise_enabled": True, "apprise_urls": ["ntfy://test-topic"], "toast_events": [], "apprise_events": ["host_offline"]})
     app.extensions["alerts"].emit("test-host-offline", None, "host_offline", "critical", "摘要 password=secret")
     for _ in range(20):
         if sent:

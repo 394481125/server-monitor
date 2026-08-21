@@ -16,6 +16,7 @@ from .operations import OperationService
 from .permissions import PermissionService
 from .security import SecretBox
 from .services import BackupService, HostService, ServiceError
+from .credentials import CredentialService
 
 
 COOKIE_NAME = "server_monitor_session"
@@ -36,6 +37,7 @@ class WebContext:
     backups: BackupService
     permission_service: PermissionService
     files: SFTPFileService
+    credentials: CredentialService
 
     def login_required(
         self,

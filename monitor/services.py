@@ -33,12 +33,16 @@ ACTIVE_HOST_FIELDS = {
     "allow_stress", "timeout_seconds", "scheduler_enabled", "scheduler_idle_seconds",
     "scheduler_process_guard", "schedule_command", "schedule_cwd", "schedule_shell",
     "schedule_env", "schedule_mode",
+    "ssh_key_id", "jump_enabled", "jump_address", "jump_port", "jump_username", "jump_auth_type", "jump_fingerprint",
 }
 BOOLEAN_HOST_FIELDS = {
     "enabled", "docker_enabled", "allow_tmux", "allow_terminal", "allow_process", "allow_install",
-    "allow_stress", "scheduler_enabled", "scheduler_process_guard", "is_local",
+    "allow_stress", "scheduler_enabled", "scheduler_process_guard", "is_local", "jump_enabled",
 }
-SECRET_HOST_FIELDS = {"auth_secret", "private_key", "private_key_passphrase", "sudo_password"}
+SECRET_HOST_FIELDS = {
+    "auth_secret", "private_key", "private_key_passphrase", "sudo_password",
+    "jump_auth_secret", "jump_private_key", "jump_private_key_passphrase",
+}
 HOST_TRANSFER_FIELDS = (
     "name", "address", "port", "username", "auth_type", "auth_secret", "private_key",
     "private_key_passphrase", "sudo_password", "tags", "notes", "asset_location", "asset_owner", "warranty_expires", "enabled", "docker_enabled",
@@ -175,6 +179,15 @@ class HostService:
                     result[f"{key}_configured"] = bool(result.pop(key))
         return result
 
+    def _resolve_vault_reference(self, result: dict[str, Any]) -> dict[str, Any]:
+        key_id = result.get("ssh_key_id")
+        if key_id and not result.get("private_key"):
+            key = self.database.query_one("SELECT private_key,passphrase FROM ssh_keys WHERE id=?", (key_id,))
+            if key:
+                result["private_key"] = key["private_key"]
+                result["private_key_passphrase"] = key["passphrase"]
+        return result
+
     def list(self, *, include_deleted: bool = False, search: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
         clauses = ["h.deleted_at IS NULL" if not include_deleted else "1=1"]
         params: list[Any] = []
@@ -201,7 +214,8 @@ class HostService:
             if required:
                 raise ServiceError("主机不存在或已删除")
             return None
-        return self._row(row, include_secrets=include_secrets)
+        result = self._row(row, include_secrets=include_secrets)
+        return self._resolve_vault_reference(result) if include_secrets else result
 
     def _validate(self, payload: dict[str, Any], *, partial: bool) -> dict[str, Any]:
         unknown = set(payload) - ACTIVE_HOST_FIELDS - SECRET_HOST_FIELDS
@@ -224,6 +238,43 @@ class HostService:
                 if not 1 <= value <= 65535:
                     raise ServiceError("SSH 端口必须在 1～65535 之间")
                 result[key] = value
+            elif key == "ssh_key_id":
+                if value in {None, ""}:
+                    result[key] = None
+                else:
+                    try:
+                        key_id = int(value)
+                    except (TypeError, ValueError) as exc:
+                        raise ServiceError("ssh_key_id 无效") from exc
+                    if not self.database.query_one("SELECT id FROM ssh_keys WHERE id=?", (key_id,)):
+                        raise ServiceError("所选密钥不存在")
+                    result[key] = key_id
+            elif key == "jump_enabled":
+                if not isinstance(value, bool):
+                    raise ServiceError("jump_enabled 必须是布尔值")
+                result[key] = int(value)
+            elif key in {"jump_address", "jump_username", "jump_fingerprint"}:
+                if value in {None, ""}:
+                    result[key] = None
+                elif not isinstance(value, str) or len(value.strip()) > 255:
+                    raise ServiceError(f"{key} 无效")
+                else:
+                    result[key] = value.strip()
+            elif key == "jump_port":
+                if value in {None, ""}:
+                    result[key] = None
+                else:
+                    try:
+                        value = int(value)
+                    except (TypeError, ValueError) as exc:
+                        raise ServiceError("跳板机端口无效") from exc
+                    if not 1 <= value <= 65535:
+                        raise ServiceError("跳板机端口必须在 1～65535 之间")
+                    result[key] = value
+            elif key == "jump_auth_type":
+                if value not in {None, "", "password", "key"}:
+                    raise ServiceError("跳板机认证方式仅支持 password 或 key")
+                result[key] = value or None
             elif key == "auth_type":
                 if value not in {"password", "key"}:
                     raise ServiceError("认证方式仅支持 password 或 key")
@@ -305,13 +356,27 @@ class HostService:
         clean = self._validate(payload, partial=False)
         if clean.get("is_local") and self.database.query_one("SELECT id FROM hosts WHERE is_local=1 AND deleted_at IS NULL"):
             raise ServiceError("已有主机被设为本机概览，请先取消原主机的本机标记")
-        if clean.get("auth_type") == "password" and not clean.get("auth_secret"):
+        if clean.get("auth_type") == "password" and not clean.get("auth_secret") and not clean.get("is_local"):
             raise ServiceError("密码认证必须提供 SSH 密码")
-        if clean.get("auth_type") == "key" and not clean.get("private_key"):
+        if clean.get("auth_type") == "key" and not clean.get("private_key") and not clean.get("ssh_key_id") and not clean.get("is_local"):
             raise ServiceError("私钥认证必须提供私钥")
+        if clean.get("jump_enabled"):
+            if not clean.get("jump_address") or not clean.get("jump_username") or clean.get("jump_auth_type") not in {"password", "key"}:
+                raise ServiceError("启用跳板机时必须填写地址、账号和认证方式")
+            if clean.get("jump_auth_type") == "password" and not clean.get("jump_auth_secret"):
+                raise ServiceError("跳板机密码认证必须提供密码")
+            if clean.get("jump_auth_type") == "key" and not clean.get("jump_private_key"):
+                raise ServiceError("跳板机私钥认证必须提供私钥")
+        if clean.get("is_local"):
+            # Direct local collection does not use SSH credentials.
+            clean["auth_secret"] = None
+            clean["private_key"] = None
+            clean["private_key_passphrase"] = None
+            clean["ssh_key_id"] = None
         if clean.get("auth_type") == "password":
             clean["private_key"] = None
             clean["private_key_passphrase"] = None
+            clean["ssh_key_id"] = None
         else:
             clean["auth_secret"] = None
         physical_id, degraded = self.physical_id(fingerprint, machine_id)
@@ -352,7 +417,7 @@ class HostService:
             )
             if existing:
                 raise ServiceError("已有主机被设为本机概览，请先取消原主机的本机标记")
-        identity_changes = {"address", "port", "username", "auth_type", "auth_secret", "private_key", "private_key_passphrase"} & set(clean)
+        identity_changes = {"address", "port", "username", "auth_type", "auth_secret", "private_key", "private_key_passphrase", "ssh_key_id", "jump_enabled", "jump_address", "jump_port", "jump_username", "jump_auth_type", "jump_auth_secret", "jump_private_key", "jump_private_key_passphrase"} & set(clean)
         if identity_changes and not fingerprint:
             raise ServiceError("修改连接信息时必须先重新测试 SSH 连接")
         if fingerprint:
@@ -366,13 +431,25 @@ class HostService:
             private_key = clean["private_key"] if "private_key" in clean else current.get("private_key")
             if auth_type == "password" and not password:
                 raise ServiceError("密码认证必须保留或提供 SSH 密码")
-            if auth_type == "key" and not private_key:
+            if auth_type == "key" and not private_key and not clean.get("ssh_key_id") and not current.get("ssh_key_id"):
                 raise ServiceError("私钥认证必须保留或提供私钥")
             if auth_type == "password":
                 clean["private_key"] = None
                 clean["private_key_passphrase"] = None
+                clean["ssh_key_id"] = None
             else:
                 clean["auth_secret"] = None
+        if "ssh_key_id" in clean and clean.get("ssh_key_id"):
+            clean["private_key"] = None
+            clean["private_key_passphrase"] = None
+        if clean.get("jump_enabled"):
+            merged = {**current, **clean}
+            if not merged.get("jump_address") or not merged.get("jump_username") or merged.get("jump_auth_type") not in {"password", "key"}:
+                raise ServiceError("启用跳板机时必须填写地址、账号和认证方式")
+            if merged.get("jump_auth_type") == "password" and not merged.get("jump_auth_secret"):
+                raise ServiceError("跳板机密码认证必须提供密码")
+            if merged.get("jump_auth_type") == "key" and not merged.get("jump_private_key"):
+                raise ServiceError("跳板机私钥认证必须提供私钥")
         clean["updated_at"] = utc_iso()
         try:
             self.database.execute(
@@ -395,7 +472,7 @@ class HostService:
         with self.database.transaction() as connection:
             connection.execute(
                 "UPDATE hosts SET deleted_at=?,auth_secret=NULL,private_key=NULL,private_key_passphrase=NULL,"
-                "sudo_password=NULL,enabled=0,scheduler_enabled=0,updated_at=? WHERE id=?",
+                "sudo_password=NULL,jump_auth_secret=NULL,jump_private_key=NULL,jump_private_key_passphrase=NULL,enabled=0,scheduler_enabled=0,updated_at=? WHERE id=?",
                 (now, now, host_id),
             )
             connection.execute("UPDATE gpu_configs SET active=0,updated_at=? WHERE host_id=?", (now, host_id))
@@ -761,7 +838,7 @@ class AlertService:
         power_percent = float(power) * 100 / float(power_limit) if power is not None and power_limit else None
         state_alert(
             "power",
-            power_percent is not None and power_percent >= settings["gpu_power_threshold_percent"],
+            settings["gpu_power_alert_enabled"] and power_percent is not None and power_percent >= settings["gpu_power_threshold_percent"],
             "gpu_power_high",
             f"{title} 功耗 {float(power or 0):.1f}W 达到功耗上限的 {float(power_percent or 0):.1f}%",
             f"{title} 功耗恢复正常",
@@ -769,11 +846,11 @@ class AlertService:
         fan = gpu.get("fan_percent")
         temperature = gpu.get("temperature_c")
         fan_low = fan is not None and temperature is not None and float(temperature) >= settings["gpu_fan_alert_temperature"] and float(fan) <= settings["gpu_fan_min_percent"]
-        state_alert("fan", fan_low, "gpu_fan_low", f"{title} 温度 {float(temperature or 0):.1f}C 但风扇仅 {float(fan or 0):.1f}%", f"{title} 风扇状态恢复正常")
+        state_alert("fan", settings["gpu_fan_alert_enabled"] and fan_low, "gpu_fan_low", f"{title} 温度 {float(temperature or 0):.1f}C 但风扇仅 {float(fan or 0):.1f}%", f"{title} 风扇状态恢复正常")
         corrected = float(gpu.get("ecc_corrected") or 0)
         uncorrected = float(gpu.get("ecc_uncorrected") or 0)
         ecc_bad = uncorrected > 0 or corrected >= settings["gpu_ecc_corrected_threshold"]
-        state_alert("ecc", ecc_bad, "gpu_ecc_error", f"{title} ECC 错误：可纠正 {corrected:g}，不可纠正 {uncorrected:g}", f"{title} ECC 状态恢复正常", "critical" if uncorrected > 0 else "warning")
+        state_alert("ecc", settings["gpu_ecc_alert_enabled"] and ecc_bad, "gpu_ecc_error", f"{title} ECC 错误：可纠正 {corrected:g}，不可纠正 {uncorrected:g}", f"{title} ECC 状态恢复正常", "critical" if uncorrected > 0 else "warning")
         xid_events = gpu.get("xid_errors") or []
         xid_codes = sorted({str(event.get("code")) for event in xid_events})
         state_alert("xid", settings["gpu_xid_alert_enabled"] and bool(xid_events), "gpu_xid_error", f"{title} 检测到 XID 错误：{', '.join(xid_codes)}", f"{title} 最近未检测到 XID 错误", "critical")
@@ -799,6 +876,92 @@ class AlertService:
             f"{title} 疑似存在残留显存：未归属 {float(gpu.get('residual_memory_mib') or 0):.1f} MiB",
             f"{title} 残留显存异常已解除",
         )
+
+    @staticmethod
+    def _gpu_availability(state: str | None) -> str | None:
+        if state in {"idle_timing", "pending"}:
+            return "idle"
+        if state == "busy":
+            return "busy"
+        return None
+
+    def evaluate_gpu_states(self, host_id: int, statuses: list[dict[str, Any]]) -> None:
+        """Emit one notification when a scheduler-visible GPU becomes idle/busy.
+
+        The scheduler returns both sides of the transition so this remains
+        edge-triggered and does not create an alert on every collection cycle.
+        Initial, disabled, unknown, cooldown and frozen states are intentionally
+        silent because they do not represent an actionable availability change.
+        """
+        for item in statuses or []:
+            previous = self._gpu_availability(item.get("previous_state"))
+            current = self._gpu_availability(item.get("state"))
+            if not previous or not current or previous == current:
+                continue
+            gpu_uuid = str(item.get("uuid") or "unknown")
+            key_prefix = f"gpu-state:{host_id}:{gpu_uuid}"
+            if current == "idle":
+                self.emit(
+                    f"{key_prefix}:idle",
+                    host_id,
+                    "gpu_idle",
+                    "info",
+                    f"GPU {gpu_uuid[:12]} 已空闲，可用于调度",
+                )
+                self.emit(
+                    f"{key_prefix}:busy",
+                    host_id,
+                    "gpu_busy",
+                    "info",
+                    f"GPU {gpu_uuid[:12]} 已从占用状态恢复",
+                    state="recovered",
+                )
+            else:
+                self.emit(
+                    f"{key_prefix}:busy",
+                    host_id,
+                    "gpu_busy",
+                    "info",
+                    f"GPU {gpu_uuid[:12]} 已从空闲变为占用",
+                )
+                self.emit(
+                    f"{key_prefix}:idle",
+                    host_id,
+                    "gpu_idle",
+                    "info",
+                    f"GPU {gpu_uuid[:12]} 已不再空闲",
+                    state="recovered",
+                )
+
+    def evaluate_gpu_availability(self, host_id: int, previous_data: dict[str, Any] | None, current_data: dict[str, Any] | None) -> None:
+        """Track GPU availability even when automatic dispatch is disabled."""
+        settings = self.config.all()
+
+        def state(gpu: dict[str, Any]) -> str | None:
+            util = gpu.get("utilization_percent")
+            memory = gpu.get("memory_percent")
+            if util is None or memory is None:
+                return None
+            mode = settings["gpu_idle_mode"]
+            util_ok = float(util) < float(settings["gpu_util_threshold"])
+            memory_ok = float(memory) < float(settings["gpu_memory_threshold"])
+            idle = util_ok if mode == "util" else memory_ok if mode == "memory" else util_ok and memory_ok
+            if settings["gpu_process_guard"] and gpu.get("processes"):
+                idle = False
+            return "idle_timing" if idle else "busy"
+
+        previous = {
+            str(gpu.get("uuid")): state(gpu)
+            for gpu in (previous_data or {}).get("gpus", []) or []
+            if gpu.get("uuid")
+        }
+        statuses = []
+        for gpu in (current_data or {}).get("gpus", []) or []:
+            uuid = str(gpu.get("uuid") or "")
+            current = state(gpu)
+            if uuid and current:
+                statuses.append({"uuid": uuid, "previous_state": previous.get(uuid), "state": current})
+        self.evaluate_gpu_states(host_id, statuses)
 
     def _temperature(self, host_id: int, key: str, title: str, value: float, limit: float, settings: dict[str, Any]) -> None:
         recent = self.database.query_all(

@@ -7,6 +7,28 @@ from typing import Any
 from urllib.parse import urlsplit
 
 
+ALERT_EVENT_TYPES = (
+    "host_offline",
+    "temperature_high",
+    "filesystem_usage_high",
+    "filesystem_inode_high",
+    "swap_usage_high",
+    "gpu_power_high",
+    "gpu_fan_low",
+    "gpu_ecc_error",
+    "gpu_xid_error",
+    "gpu_pcie_degraded",
+    "gpu_throttling",
+    "gpu_residual_memory",
+    "gpu_idle",
+    "gpu_busy",
+    "gpu_schedule_success",
+    "gpu_schedule_failed",
+    "gpu_schedule_frozen",
+    "backup_failed",
+)
+
+
 DEFAULTS: dict[str, Any] = {
     "collection_interval": 10,
     "frontend_refresh_interval": 5,
@@ -32,6 +54,10 @@ DEFAULTS: dict[str, Any] = {
     "metric_raw_retention_minutes": 15,
     "metric_mid_retention_hours": 6,
     "collection_task_retention_minutes": 60,
+    # Maintenance is deliberately independent from retention.  A longer
+    # retention window can still be cleaned on a predictable, user-selected
+    # cadence instead of tying cleanup to the five-minute background loop.
+    "cleanup_interval_minutes": 60,
     "log_retention_days": 30,
     "aggregation_mid_seconds": 60,
     "aggregation_long_seconds": 300,
@@ -43,6 +69,9 @@ DEFAULTS: dict[str, Any] = {
     "gpu_fan_min_percent": 5,
     "gpu_fan_alert_temperature": 70,
     "gpu_ecc_corrected_threshold": 1000,
+    "gpu_power_alert_enabled": True,
+    "gpu_fan_alert_enabled": True,
+    "gpu_ecc_alert_enabled": True,
     "gpu_xid_alert_enabled": True,
     "gpu_pcie_alert_enabled": True,
     "gpu_throttle_alert_enabled": True,
@@ -74,26 +103,10 @@ DEFAULTS: dict[str, Any] = {
     "backup_keep": 10,
     "schedule_output_limit": 1024 * 1024,
     "toast_enabled": True,
+    "toast_events": list(ALERT_EVENT_TYPES),
     "apprise_enabled": False,
     "apprise_urls": [],
-    "apprise_events": [
-        "host_offline",
-        "temperature_high",
-        "filesystem_usage_high",
-        "filesystem_inode_high",
-        "swap_usage_high",
-        "gpu_schedule_success",
-        "gpu_schedule_failed",
-        "gpu_schedule_frozen",
-        "gpu_power_high",
-        "gpu_fan_low",
-        "gpu_ecc_error",
-        "gpu_xid_error",
-        "gpu_pcie_degraded",
-        "gpu_throttling",
-        "gpu_residual_memory",
-        "backup_failed",
-    ],
+    "apprise_events": list(ALERT_EVENT_TYPES),
     "timezone": "Asia/Shanghai",
 }
 
@@ -114,6 +127,8 @@ LEGACY_ALERT_DEFAULTS = {
     "alert_hysteresis": 3,
     "alert_repeat_minutes": 30,
 }
+
+LEGACY_APPRISE_EVENTS = sorted(set(DEFAULTS["apprise_events"]) - {"gpu_idle", "gpu_busy"})
 
 
 @dataclass(frozen=True)
@@ -147,6 +162,7 @@ NUMBER_RULES: dict[str, NumberRule] = {
     "metric_raw_retention_minutes": NumberRule(5, 360),
     "metric_mid_retention_hours": NumberRule(1, 168),
     "collection_task_retention_minutes": NumberRule(15, 1440),
+    "cleanup_interval_minutes": NumberRule(1, 1440),
     "log_retention_days": NumberRule(7, 180),
     "aggregation_mid_seconds": NumberRule(30, 120),
     "aggregation_long_seconds": NumberRule(120, 600),
@@ -187,6 +203,9 @@ BOOLEAN_KEYS = {
     "gpu_process_guard",
     "toast_enabled",
     "apprise_enabled",
+    "gpu_power_alert_enabled",
+    "gpu_fan_alert_enabled",
+    "gpu_ecc_alert_enabled",
     "gpu_xid_alert_enabled",
     "gpu_pcie_alert_enabled",
     "gpu_throttle_alert_enabled",
@@ -275,15 +294,10 @@ def validate_settings(values: dict[str, Any], current: dict[str, Any] | None = N
                 if item not in urls:
                     urls.append(item)
             cleaned[key] = urls
-        elif key == "apprise_events":
-            allowed_events = {
-                "host_offline", "temperature_high", "filesystem_usage_high", "filesystem_inode_high", "swap_usage_high",
-                "gpu_schedule_success", "gpu_schedule_failed", "gpu_schedule_frozen", "gpu_power_high",
-                "gpu_fan_low", "gpu_ecc_error", "gpu_xid_error", "gpu_pcie_degraded", "gpu_throttling", "gpu_residual_memory",
-                "backup_failed",
-            }
+        elif key in {"apprise_events", "toast_events"}:
+            allowed_events = set(ALERT_EVENT_TYPES)
             if not isinstance(value, list) or any(item not in allowed_events for item in value):
-                raise ConfigError("apprise_events 包含无效事件类型")
+                raise ConfigError(f"{key} 包含无效事件类型")
             cleaned[key] = sorted(set(value))
         else:
             cleaned[key] = value
@@ -333,6 +347,8 @@ class ConfigStore:
             for key, legacy in LEGACY_ALERT_DEFAULTS.items()
             if rows.get(key) == legacy and DEFAULTS[key] != legacy
         }
+        if rows.get("apprise_events") == LEGACY_APPRISE_EVENTS:
+            updates["apprise_events"] = DEFAULTS["apprise_events"]
         return self.update(updates) if updates else self.all()
 
     def remove_legacy_notification_settings(self) -> None:

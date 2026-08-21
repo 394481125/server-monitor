@@ -122,6 +122,16 @@ ON hosts(address, port) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_physical_host
 ON hosts(physical_id) WHERE deleted_at IS NULL AND physical_id IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS host_notification_preferences (
+    host_id INTEGER PRIMARY KEY REFERENCES hosts(id) ON DELETE CASCADE,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    toast_enabled INTEGER NOT NULL DEFAULT 1 CHECK(toast_enabled IN (0, 1)),
+    apprise_enabled INTEGER NOT NULL DEFAULT 1 CHECK(apprise_enabled IN (0, 1)),
+    toast_events_json TEXT,
+    apprise_events_json TEXT,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS host_runtime (
     host_id INTEGER PRIMARY KEY REFERENCES hosts(id) ON DELETE CASCADE,
     status TEXT NOT NULL DEFAULT 'unknown',
@@ -432,3 +442,17 @@ class Database:
                 "disk_free_bytes": after["disk_free_bytes"],
                 "reclaimed_bytes": max(0, before["database_total_bytes"] - after["database_total_bytes"]),
             }
+
+    def checkpoint(self) -> None:
+        """Flush committed WAL pages during scheduled maintenance.
+
+        This is intentionally separate from ``compact``: a normal cleanup
+        cycle should keep the database available and only reclaim WAL space,
+        while the explicitly elevated compact action can still run VACUUM.
+        """
+        with self._lock:
+            connection = self.connect()
+            try:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                connection.close()

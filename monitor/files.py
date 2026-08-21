@@ -6,6 +6,7 @@ import posixpath
 import stat
 import tempfile
 import zipfile
+import shlex
 from pathlib import PurePosixPath
 from typing import Any, BinaryIO, Callable, Iterable
 
@@ -65,6 +66,8 @@ class SFTPFileService:
             "size": int(attrs.st_size or 0),
             "modified_at": int(attrs.st_mtime or 0),
             "mode": stat.filemode(mode),
+            "uid": getattr(attrs, "st_uid", None),
+            "gid": getattr(attrs, "st_gid", None),
         }
 
     @classmethod
@@ -98,6 +101,62 @@ class SFTPFileService:
         finally:
             sftp.close()
             client.close()
+
+    def preview(self, host: dict[str, Any], path: str, max_bytes: int = 1024 * 1024) -> dict[str, Any]:
+        normalized = self.normalize_path(path, allow_root=False)
+        allowed = {".txt", ".log", ".py", ".json", ".yaml", ".yml", ".sh", ".md", ".csv", ".ini", ".conf"}
+        if PurePosixPath(normalized).suffix.lower() not in allowed:
+            raise FileManagerError("仅支持常见文本文件预览")
+        client, sftp = self._open(host)
+        try:
+            attrs = self._stat(sftp, normalized)
+            if stat.S_ISLNK(attrs.st_mode) or stat.S_ISDIR(attrs.st_mode):
+                raise FileManagerError("目标不是普通文本文件")
+            size = int(attrs.st_size or 0)
+            if size > max_bytes:
+                raise FileManagerError("文件过大，请下载后查看")
+            with sftp.open(normalized, "rb") as remote:
+                raw = remote.read(max_bytes + 1)
+            if b"\x00" in raw:
+                raise FileManagerError("检测到二进制内容，禁止网页预览")
+            return {"path": normalized, "size": size, "content": raw[:max_bytes].decode("utf-8", errors="replace"), "truncated": len(raw) > max_bytes}
+        finally:
+            sftp.close()
+            client.close()
+
+    @staticmethod
+    def permission_script(host: dict[str, Any], path: str, mode: str | None = None, owner: str | None = None, group: str | None = None) -> dict[str, Any]:
+        normalized = SFTPFileService.normalize_path(path, allow_root=False)
+        command: list[str] = []
+        if mode is not None:
+            if not isinstance(mode, str) or not __import__("re").fullmatch(r"[0-7]{3,4}", mode):
+                raise FileManagerError("权限必须是三位或四位八进制数字")
+            command.append(f"chmod {shlex.quote(mode)} -- {shlex.quote(normalized)}")
+        token = lambda value: isinstance(value, str) and bool(__import__("re").fullmatch(r"[A-Za-z0-9_.:-]+", value))
+        if owner is not None or group is not None:
+            if owner is not None and not token(owner) or group is not None and not token(group):
+                raise FileManagerError("属主或属组格式无效")
+            command.append(f"chown {shlex.quote((owner or '') + (':' + group if group else ''))} -- {shlex.quote(normalized)}")
+        if not command:
+            raise FileManagerError("至少提供 mode、owner 或 group")
+        return {"path": normalized, "script": "#!/bin/sh\nset -eu\n" + "\n".join(command) + "\n", "remote_execution": False}
+
+    @staticmethod
+    def transfer_script(host: dict[str, Any], path: str, *, direction: str = "download", local_path: str = ".") -> dict[str, Any]:
+        normalized = SFTPFileService.normalize_path(path, allow_root=False)
+        if direction not in {"download", "upload"}:
+            raise FileManagerError("direction 仅支持 download 或 upload")
+        target = f"{host.get('username')}@{host.get('address')}:{normalized}"
+        jump = ""
+        if host.get("jump_enabled"):
+            jump = f" -J {shlex.quote(str(host.get('jump_username')))}@{shlex.quote(str(host.get('jump_address')))}:{int(host.get('jump_port') or 22)}"
+        if direction == "download":
+            scp = f"scp{jump} {shlex.quote(target)} {shlex.quote(local_path)}"
+            rsync = f"rsync -avP{jump} {shlex.quote(target)} {shlex.quote(local_path)}"
+        else:
+            scp = f"scp{jump} {shlex.quote(local_path)} {shlex.quote(target)}"
+            rsync = f"rsync -avP{jump} {shlex.quote(local_path)} {shlex.quote(target)}"
+        return {"direction": direction, "path": normalized, "script": "#!/bin/sh\nset -eu\n" + scp + "\n", "rsync_script": "#!/bin/sh\nset -eu\n" + rsync + "\n", "remote_execution": False}
 
     def _stat(self, sftp: paramiko.SFTPClient, path: str) -> Any:
         try:

@@ -448,6 +448,11 @@ td .text-button { margin-right: 2px; }
 .settings-section > p { margin: 0 0 13px; color: var(--muted); font-size: 11px; }
 .form-grid { display: grid; grid-template-columns: repeat(3, minmax(160px, 1fr)); gap: 0 16px; }
 .form-grid.two { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
+.settings-subgroup { margin: 14px 0 0; background: var(--surface-2); }
+.settings-subgroup:first-of-type { margin-top: 0; }
+.notification-event-groups { display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 10px; margin-top: 8px; }
+.notification-event-group { min-width: 0; margin: 0; padding: 10px 12px 5px; background: var(--surface-2); }
+.notification-event-grid { display: grid; grid-template-columns: 1fr; }
 .notification-url-panel { margin-top: 15px; padding: 14px; border: 1px solid var(--line); background: var(--surface-2); }
 .notification-url-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
 .notification-url-heading strong, .notification-events > strong { display: block; font-size: 13px; }
@@ -534,6 +539,7 @@ dialog::backdrop { background: rgb(12 22 36 / 58%); }
   .stat:nth-child(2) { border-right: 0; }
   .stat:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
   .settings-layout { display: block; }
+  .notification-event-groups { grid-template-columns: 1fr; }
   .settings-nav { position: static; display: flex; margin-bottom: 12px; overflow-x: auto; }
   .settings-nav button { flex: 0 0 auto; }
   .detail-head { align-items: flex-start; }

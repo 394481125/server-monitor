@@ -260,11 +260,17 @@ def test_api_dashboard_and_settings_write(client, admin):
     settings = dashboard.get_json()["settings"]
     assert settings["gpu_util_threshold"] == 10
     assert settings["gpu_memory_threshold"] == 10
-    response = client.patch("/api/settings", json={"collection_interval": 11, "apprise_events": ["host_offline"]}, headers=csrf(admin))
+    response = client.patch(
+        "/api/settings",
+        json={"collection_interval": 11, "toast_events": ["gpu_idle"], "apprise_events": ["host_offline"]},
+        headers=csrf(admin),
+    )
     assert response.status_code == 200, response.get_json()
     settings = client.get("/api/settings").get_json()["settings"]
     assert settings["collection_interval"] == 11
     assert settings["apprise_events"] == ["host_offline"]
+    assert settings["toast_events"] == ["gpu_idle"]
+    assert client.get("/api/alerts").get_json()["toast_events"] == ["gpu_idle"]
     assert settings["metric_raw_retention_minutes"] == 15
     assert settings["metric_mid_retention_hours"] == 6
     assert settings["collection_task_retention_minutes"] == 60

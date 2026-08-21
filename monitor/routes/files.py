@@ -63,6 +63,28 @@ def register_file_routes(context: WebContext) -> None:
             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
         )
 
+    @app.get("/api/hosts/<int:host_id>/files/preview")
+    @login_required(permission="files.download")
+    def preview_file(host_id: int):
+        result = files.preview(file_host(host_id), request.args.get("path", ""))
+        return jsonify(result)
+
+    @app.post("/api/hosts/<int:host_id>/files/permission-script")
+    @login_required(permission="files.manage", write=True)
+    def permission_script(host_id: int):
+        payload = body()
+        result = files.permission_script(file_host(host_id), str(payload.get("path", "")), payload.get("mode"), payload.get("owner"), payload.get("group"))
+        audit_action("file_permission_script_generated", target_type="host", target_id=host_id, summary=f"生成远端权限脚本 {payload.get('path')}")
+        return jsonify(result)
+
+    @app.post("/api/hosts/<int:host_id>/files/transfer-script")
+    @login_required(permission="files.browse", write=True)
+    def transfer_script(host_id: int):
+        payload = body()
+        result = files.transfer_script(file_host(host_id), str(payload.get("path", "")), direction=str(payload.get("direction", "download")), local_path=str(payload.get("local_path", ".")))
+        audit_action("file_transfer_script_generated", target_type="host", target_id=host_id, summary=f"生成大文件传输脚本 {payload.get('path')}")
+        return jsonify(result)
+
     @app.post("/api/hosts/<int:host_id>/files/upload")
     @login_required(permission="files.upload", write=True)
     def upload_files(host_id: int):

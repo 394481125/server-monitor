@@ -171,6 +171,49 @@ def test_gpu_health_alerts_emit_and_recover(app):
     assert app.extensions["database"].query_one("SELECT COUNT(*) count FROM alerts WHERE state='active'")["count"] == 0
 
 
+def test_gpu_health_alert_switches_disable_each_requested_signal(app):
+    hosts = app.extensions["hosts"]
+    host = hosts.create(host_payload(), fingerprint="SHA256:key-switches", machine_id="machine-switches")
+    app.extensions["monitor_config"].update({
+        "alert_samples": 1,
+        "gpu_power_alert_enabled": False,
+        "gpu_fan_alert_enabled": False,
+        "gpu_ecc_alert_enabled": False,
+        "gpu_xid_alert_enabled": False,
+        "gpu_pcie_alert_enabled": False,
+        "gpu_throttle_alert_enabled": False,
+        "gpu_residual_alert_enabled": False,
+    })
+    app.extensions["alerts"].evaluate_host(host["id"], "online", {**sample_data(), "gpus": [{
+        "index": 0, "uuid": "GPU-switches", "power_w": 299, "power_limit_w": 300, "temperature_c": 80, "fan_percent": 0,
+        "ecc_corrected": 2000, "ecc_uncorrected": 1, "pcie_degraded": True, "throttle_reasons": ["Power"],
+        "xid_errors": [{"code": 79}], "residual_memory_suspected": True,
+    }]})
+    assert app.extensions["database"].query_one("SELECT COUNT(*) count FROM alerts WHERE state='active'")["count"] == 0
+
+
+def test_gpu_state_alerts_are_edge_triggered_and_recover(app):
+    alerts = app.extensions["alerts"]
+    host = app.extensions["hosts"].create(host_payload(), fingerprint="SHA256:key-state", machine_id="machine-state")
+    alerts.evaluate_gpu_states(host["id"], [{"uuid": "GPU-state", "previous_state": "busy", "state": "idle_timing"}])
+    alerts.evaluate_gpu_states(host["id"], [{"uuid": "GPU-state", "previous_state": "idle_timing", "state": "idle_timing"}])
+    idle = app.extensions["database"].query_all("SELECT * FROM alerts WHERE alert_type='gpu_idle'")
+    assert len(idle) == 1 and idle[0]["state"] == "active"
+    alerts.evaluate_gpu_states(host["id"], [{"uuid": "GPU-state", "previous_state": "idle_timing", "state": "busy"}])
+    active = {row["alert_type"] for row in app.extensions["database"].query_all("SELECT * FROM alerts WHERE state='active'")}
+    assert "gpu_busy" in active and "gpu_idle" not in active
+
+
+def test_gpu_availability_alerts_work_without_scheduler_enabled(app):
+    host = app.extensions["hosts"].create(host_payload(), fingerprint="SHA256:key-availability", machine_id="machine-availability")
+    alerts = app.extensions["alerts"]
+    previous = {"gpus": [{"uuid": "GPU-availability", "utilization_percent": 80, "memory_percent": 40, "processes": [{"user": "alice"}]}]}
+    current = {"gpus": [{"uuid": "GPU-availability", "utilization_percent": 0, "memory_percent": 0, "processes": []}]}
+    alerts.evaluate_gpu_availability(host["id"], previous, current)
+    row = app.extensions["database"].query_one("SELECT alert_type,state FROM alerts WHERE alert_type='gpu_idle'")
+    assert row and row["state"] == "active"
+
+
 def test_swap_and_residual_gpu_alerts_emit_and_recover(app):
     hosts = app.extensions["hosts"]
     host = hosts.create(host_payload(), fingerprint="SHA256:key-swap", machine_id="machine-swap")

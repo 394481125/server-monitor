@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import atexit
 from datetime import timedelta
+import hashlib
 import json
 import secrets
 import logging
 import os
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -23,6 +25,7 @@ from .auth import AuthError, AuthService, LoginLocked
 from .background import BackgroundService
 from .collector import Collector
 from .config import ConfigError, ConfigStore, validate_settings
+from .credentials import CredentialError, CredentialService
 from .db import Database
 from .development import DevelopmentService
 from .files import SFTPFileService
@@ -159,6 +162,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     audit = AuditService(database)
     auth = AuthService(database, config)
     hosts = HostService(database, secret_box, config)
+    credentials = CredentialService(database, secret_box)
     alerts = AlertService(database, config)
     notifications = NotificationService(database, config, secret_box)
     alerts.notifier = notifications
@@ -193,6 +197,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         permissions=permission_service,
         files=files,
         ssh_pool=ssh_pool,
+        credentials=credentials,
     )
     web_context = WebContext(
         app=app,
@@ -207,6 +212,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         backups=backups,
         permission_service=permission_service,
         files=files,
+        credentials=credentials,
     )
     app.extensions["web_context"] = web_context
 
@@ -448,7 +454,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             "profile_local_overview_updated",
             target_type="user",
             target_id=g.user["id"],
-            summary="显示本机 SSH 概览" if enabled else "隐藏本机 SSH 概览",
+            summary="显示本机概览" if enabled else "隐藏本机概览",
             changes={"show_local_overview": {"before": bool(g.user.get("show_local_overview")), "after": enabled}},
         )
         return jsonify(enabled=enabled)
@@ -543,12 +549,60 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if current_host_id is None:
             clean = hosts._validate(payload, partial=False)
             candidate = {"port": 22, "timeout_seconds": None, **clean}
+            candidate = hosts._resolve_vault_reference(candidate)
         else:
             current = hosts.get(current_host_id, include_secrets=True)
             clean = hosts._validate(payload, partial=True)
             candidate = {**current, **clean}
+            if "ssh_key_id" in clean:
+                candidate["private_key"] = None
+                candidate["private_key_passphrase"] = None
+                candidate = hosts._resolve_vault_reference(candidate)
         if confirmed_fingerprint:
             candidate["fingerprint"] = confirmed_fingerprint
+        if candidate.get("is_local"):
+            timeout = candidate.get("timeout_seconds") or config.all()["collection_timeout"]
+            try:
+                result = subprocess.run(
+                    "LC_ALL=C sh -c 'hostname; cat /etc/machine-id 2>/dev/null || true; command -v tmux || true; command -v nvidia-smi || true'",
+                    shell=True,
+                    executable="/bin/bash",
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise SSHError("本机采集命令超时") from exc
+            except OSError as exc:
+                raise SSHError(f"本机采集命令失败: {exc}") from exc
+            if result.returncode != 0:
+                raise ValueError(redact(result.stderr) or "本机 Shell 不可用")
+            lines = result.stdout.splitlines()
+            machine_id = lines[1].strip() if len(lines) > 1 and len(lines[1].strip()) >= 8 else None
+            # There is no SSH host key for direct local collection. Keep an
+            # existing identity stable; for a new host derive one from machine-id.
+            fingerprint = current.get("fingerprint") if current else None
+            identity_seed = machine_id or (lines[0] if lines else "local")
+            fingerprint = fingerprint or "SHA256:local-" + hashlib.sha256(identity_seed.encode()).hexdigest()
+            physical_id, degraded = hosts.physical_id(fingerprint, machine_id)
+            duplicate = database.query_one(
+                "SELECT id,name FROM hosts WHERE physical_id=? AND deleted_at IS NULL"
+                + (" AND id<>?" if current_host_id is not None else ""),
+                (physical_id, current_host_id) if current_host_id is not None else (physical_id,),
+            )
+            return {
+                "success": True,
+                "fingerprint": fingerprint,
+                "machine_id": machine_id,
+                "physical_id": physical_id,
+                "identity_degraded": degraded,
+                "hostname": lines[0] if lines else None,
+                "duplicate": dict(duplicate) if duplicate else None,
+                "fingerprint_changed": False,
+                "machine_id_changed": bool(current and current.get("machine_id") and machine_id and current.get("machine_id") != machine_id),
+            }
+
         client = SSHClient(candidate, secret_box, config.all())
         try:
             fingerprint = client.connect()
@@ -573,6 +627,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 "duplicate": dict(duplicate) if duplicate else None,
                 "fingerprint_changed": bool(current and current.get("fingerprint") != fingerprint),
                 "machine_id_changed": bool(current and current.get("machine_id") and machine_id and current.get("machine_id") != machine_id),
+                "jump_fingerprint": getattr(client, "jump_fingerprint", None),
             }
         finally:
             client.close()
@@ -606,6 +661,102 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return fingerprint_mismatch_response(error)
         audit_action("host_connection_test", target_type="host", target_id=host_id, summary="SSH 连接测试成功")
         return jsonify(result)
+
+    @app.get("/api/credentials/ssh-keys")
+    @login_required(permission="host.manage")
+    def list_ssh_keys():
+        return jsonify(items=credentials.list())
+
+    @app.post("/api/credentials/ssh-keys")
+    @login_required(permission="host.manage", write=True, elevated=True)
+    def create_ssh_key():
+        payload = body()
+        item = credentials.create(payload.get("name"), payload.get("private_key"), payload.get("passphrase"))
+        audit_action("ssh_key_created", target_type="ssh_key", target_id=item.get("id"), summary=f"新增 SSH 密钥 {item.get('name')}")
+        return jsonify(key=item), 201
+
+    @app.post("/api/credentials/ssh-keys/generate")
+    @login_required(permission="host.manage", write=True, elevated=True)
+    def generate_ssh_key():
+        payload = body()
+        item = credentials.generate(payload.get("name"), payload.get("key_type"), payload.get("passphrase"))
+        audit_action("ssh_key_generated", target_type="ssh_key", target_id=item.get("id"), summary=f"生成 SSH 密钥 {item.get('name')}")
+        return jsonify(key=item), 201
+
+    @app.delete("/api/credentials/ssh-keys/<int:key_id>")
+    @login_required(permission="host.manage", write=True, elevated=True)
+    def delete_ssh_key(key_id: int):
+        credentials.delete(key_id)
+        audit_action("ssh_key_deleted", target_type="ssh_key", target_id=key_id, summary="删除 SSH 密钥")
+        return jsonify(ok=True)
+
+    @app.post("/api/hosts/<int:host_id>/key-push")
+    @login_required(permission="host.manage", write=True, elevated=True)
+    def push_host_key(host_id: int):
+        payload = body()
+        host = hosts.get(host_id, include_secrets=True)
+        key_id = payload.get("ssh_key_id") or host.get("ssh_key_id")
+        row = database.query_one("SELECT public_key FROM ssh_keys WHERE id=?", (key_id,)) if key_id else None
+        if not row:
+            raise CredentialError("未找到待推送的密钥")
+        script = credentials.push_script(row["public_key"])
+        if payload.get("mode", "script") == "script":
+            audit_action("ssh_key_push_script", target_type="host", target_id=host_id, summary="生成公钥推送脚本")
+            return jsonify(mode="script", script=script, public_key=row["public_key"])
+        if payload.get("mode") != "remote":
+            raise CredentialError("mode 仅支持 script 或 remote")
+        result = SSHClient(host, secret_box, config.all()).run("sh -s", config.all()["ssh_connect_timeout"], stdin_data=script)
+        audit_action("ssh_key_pushed", target_type="host", target_id=host_id, success=result.exit_code == 0, summary="远程推送平台公钥")
+        return jsonify(mode="remote", public_key=row["public_key"], exit_code=result.exit_code, stdout=result.stdout, stderr=result.stderr)
+
+    @app.route("/api/hosts/<int:host_id>/command-favorites", methods=["GET", "POST"])
+    @login_required(permission="terminal.open")
+    def command_favorites(host_id: int):
+        hosts.get(host_id)
+        if request.method == "GET":
+            rows = database.query_all("SELECT id,name,command,created_at,updated_at FROM command_favorites WHERE user_id=? AND (host_id=? OR host_id IS NULL) ORDER BY updated_at DESC", (g.user["id"], host_id))
+            return jsonify(items=[dict(row) for row in rows])
+        try:
+            auth.require_csrf(g.user, request.headers.get("X-CSRF-Token"))
+        except AuthError as exc:
+            return jsonify(error=str(exc)), 403
+        payload = body()
+        name, command = str(payload.get("name", "")).strip(), str(payload.get("command", "")).strip()
+        if not name or not command or len(name) > 128 or len(command) > 4000:
+            raise ValueError("快捷命令名称或内容无效")
+        now = utc_iso()
+        favorite_id = database.execute("INSERT INTO command_favorites(user_id,host_id,name,command,created_at,updated_at) VALUES(?,?,?,?,?,?)", (g.user["id"], host_id, name, command, now, now))
+        return jsonify(id=favorite_id, name=name, command=command), 201
+
+    @app.delete("/api/command-favorites/<int:favorite_id>")
+    @login_required(permission="terminal.open", write=True)
+    def delete_command_favorite(favorite_id: int):
+        database.execute("DELETE FROM command_favorites WHERE id=? AND user_id=?", (favorite_id, g.user["id"]))
+        return jsonify(ok=True)
+
+    @app.route("/api/hosts/<int:host_id>/directory-favorites", methods=["GET", "POST"])
+    @login_required(permission="files.browse")
+    def directory_favorites(host_id: int):
+        hosts.get(host_id)
+        if request.method == "GET":
+            rows = database.query_all("SELECT id,name,path,created_at FROM directory_favorites WHERE user_id=? AND host_id=? ORDER BY name COLLATE NOCASE", (g.user["id"], host_id))
+            return jsonify(items=[dict(row) for row in rows])
+        try:
+            auth.require_csrf(g.user, request.headers.get("X-CSRF-Token"))
+        except AuthError as exc:
+            return jsonify(error=str(exc)), 403
+        payload = body()
+        name, path = str(payload.get("name", "")).strip(), str(payload.get("path", "")).strip()
+        if not name or not path.startswith("/") or len(name) > 128 or len(path) > 4096:
+            raise ValueError("目录收藏名称或路径无效")
+        favorite_id = database.execute("INSERT INTO directory_favorites(user_id,host_id,name,path,created_at) VALUES(?,?,?,?,?)", (g.user["id"], host_id, name, path, utc_iso()))
+        return jsonify(id=favorite_id, name=name, path=path), 201
+
+    @app.delete("/api/directory-favorites/<int:favorite_id>")
+    @login_required(permission="files.browse", write=True)
+    def delete_directory_favorite(favorite_id: int):
+        database.execute("DELETE FROM directory_favorites WHERE id=? AND user_id=?", (favorite_id, g.user["id"]))
+        return jsonify(ok=True)
 
     @app.get("/api/hosts")
     @login_required(permission="page.hosts")
@@ -669,6 +820,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         identity = connection_test(payload)
         if identity.get("duplicate"):
             raise ValueError(f"该物理主机已被纳管: {identity['duplicate']['name']}")
+        if identity.get("jump_fingerprint"):
+            payload["jump_fingerprint"] = identity["jump_fingerprint"]
         host = hosts.create(payload, fingerprint=identity["fingerprint"], machine_id=identity.get("machine_id"))
         audit_action("host_created", target_type="host", target_id=host["id"], summary=f"新增主机 {host['name']}")
         return jsonify(host=host), 201
@@ -828,7 +981,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         confirmed_physical_replacement = payload.pop("confirmed_physical_replacement", False)
         if not isinstance(confirmed_physical_replacement, bool):
             raise ValueError("物理节点替换确认值必须是布尔值")
-        connection_fields = {"address", "port", "username", "auth_type", "auth_secret", "private_key", "private_key_passphrase"}
+        connection_fields = {"address", "port", "username", "auth_type", "auth_secret", "private_key", "private_key_passphrase", "ssh_key_id", "jump_enabled", "jump_address", "jump_port", "jump_username", "jump_auth_type", "jump_auth_secret", "jump_private_key", "jump_private_key_passphrase"}
         sensitive = connection_fields | {"sudo_password", "schedule_command", "confirmed_fingerprint", "confirmed_physical_replacement"}
         if (sensitive & set(payload) or confirmed_fingerprint or confirmed_physical_replacement) and not auth.is_elevated(g.user):
             return jsonify(error="修改连接信息、凭据、SSH 指纹或调度命令需要重新验证当前密码", requires_elevation=True), 403
@@ -845,6 +998,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 error="远端 machine-id 也已变化，可能是另一台服务器。请确认沿用当前记录，或删除旧记录后重新添加",
                 physical_identity_changed=True,
             ), 409
+        if identity and identity.get("jump_fingerprint"):
+            payload["jump_fingerprint"] = identity["jump_fingerprint"]
         if background and (connection_fields & set(payload) or payload.get("enabled") is False):
             reason = "主机连接配置已修改" if connection_fields & set(payload) else "主机采集已禁用"
             background.cancel_host(host_id, reason)
@@ -1103,8 +1258,36 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def list_alerts():
         filters = parse_alert_filters(request.args)
         result = alerts.list(request.args.get("page", 1), request.args.get("page_size", 20), filters)
-        result["toast_enabled"] = config.all()["toast_enabled"]
+        settings = config.all()
+        result["toast_enabled"] = settings["toast_enabled"]
+        result["toast_events"] = settings.get("toast_events", [])
+        for item in result["items"]:
+            item["notification_allowed"] = notifications.web_allowed(item)
         return jsonify(result)
+
+    @app.get("/api/notifications/hosts")
+    @login_required(permission="alerts.manage")
+    def list_notification_hosts():
+        items = []
+        for host in hosts.list():
+            items.append({
+                "host_id": host["id"], "name": host["name"], "address": host["address"],
+                **notifications.host_preference(host["id"]),
+            })
+        return jsonify(items=items)
+
+    @app.put("/api/hosts/<int:host_id>/notification-settings")
+    @login_required(permission="alerts.manage", write=True)
+    def update_host_notification_settings(host_id: int):
+        host = hosts.get(host_id)
+        before = notifications.host_preference(host_id)
+        result = notifications.update_host_preference(host_id, body())
+        audit_action(
+            "host_notification_settings_updated", target_type="host", target_id=host_id,
+            summary=f"更新主机 {host['name']} 的告警通知范围",
+            changes=diff_changes(before, result, ignored={"event_types", "customized", "toast_events_inherited", "apprise_events_inherited"}),
+        )
+        return jsonify(settings=result)
 
     @app.patch("/api/alerts/notification-setting")
     @app.post("/api/alerts/notification-setting")

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 from typing import Any
 from urllib.parse import urlsplit
 
 from .security import redact
 from .utils import utc_iso
+from .config import ALERT_EVENT_TYPES
 
 try:  # Apprise is an optional import during development; production installs it from requirements.txt.
     import apprise as _apprise
@@ -48,14 +50,82 @@ class NotificationService:
         if not row:
             return
         settings = self.config.all()
+        preference = self._host_preference(row["host_id"])
+        if not preference["enabled"] or not preference["apprise_enabled"]:
+            return
         if not settings.get("toast_enabled", True):
             return
         if not settings.get("apprise_enabled") or row["alert_type"] not in settings.get("apprise_events", []):
+            return
+        events = preference.get("apprise_events")
+        if events is not None and row["alert_type"] not in events:
             return
         urls = self._urls()
         if not urls:
             return
         self.executor.submit(self._send, dict(row), urls)
+
+    def _host_preference(self, host_id: int | None) -> dict[str, Any]:
+        defaults = {"enabled": True, "toast_enabled": True, "apprise_enabled": True, "toast_events": None, "apprise_events": None}
+        if not host_id:
+            return defaults
+        row = self.database.query_one("SELECT * FROM host_notification_preferences WHERE host_id=?", (host_id,))
+        if not row:
+            return defaults
+        result = dict(defaults)
+        result.update({key: bool(row[key]) for key in ("enabled", "toast_enabled", "apprise_enabled")})
+        for key, column in (("toast_events", "toast_events_json"), ("apprise_events", "apprise_events_json")):
+            result[key] = json.loads(row[column]) if row[column] else None
+        return result
+
+    def host_preference(self, host_id: int) -> dict[str, Any]:
+        result = self._host_preference(host_id)
+        settings = self.config.all()
+        result["toast_events_inherited"] = result["toast_events"] is None
+        result["apprise_events_inherited"] = result["apprise_events"] is None
+        result["toast_events"] = result["toast_events"] if result["toast_events"] is not None else list(settings.get("toast_events", []))
+        result["apprise_events"] = result["apprise_events"] if result["apprise_events"] is not None else list(settings.get("apprise_events", []))
+        result["event_types"] = list(ALERT_EVENT_TYPES)
+        result["customized"] = bool(self.database.query_one("SELECT 1 FROM host_notification_preferences WHERE host_id=?", (host_id,)))
+        return result
+
+    def update_host_preference(self, host_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        allowed = {"enabled", "toast_enabled", "apprise_enabled", "toast_events", "apprise_events"}
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValueError(f"未知主机告警设置: {', '.join(sorted(unknown))}")
+        current = self.host_preference(host_id)
+        values: dict[str, Any] = {}
+        for key in ("enabled", "toast_enabled", "apprise_enabled"):
+            value = payload.get(key, current[key])
+            if not isinstance(value, bool):
+                raise ValueError(f"{key} 必须是布尔值")
+            values[key] = int(value)
+        valid_events = set(ALERT_EVENT_TYPES)
+        for key in ("toast_events", "apprise_events"):
+            events = payload.get(key, current[key])
+            if not isinstance(events, list) or any(not isinstance(event, str) or event not in valid_events for event in events):
+                raise ValueError(f"{key} 包含不支持的告警事件")
+            values[f"{key}_json"] = json.dumps(list(dict.fromkeys(events)), ensure_ascii=False, separators=(",", ":"))
+        values["updated_at"] = utc_iso()
+        self.database.execute(
+            "INSERT INTO host_notification_preferences(host_id,enabled,toast_enabled,apprise_enabled,toast_events_json,apprise_events_json,updated_at) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(host_id) DO UPDATE SET enabled=excluded.enabled,toast_enabled=excluded.toast_enabled,"
+            "apprise_enabled=excluded.apprise_enabled,toast_events_json=excluded.toast_events_json,"
+            "apprise_events_json=excluded.apprise_events_json,updated_at=excluded.updated_at",
+            (host_id, values["enabled"], values["toast_enabled"], values["apprise_enabled"], values["toast_events_json"], values["apprise_events_json"], values["updated_at"]),
+        )
+        return self.host_preference(host_id)
+
+    def web_allowed(self, alert: dict[str, Any]) -> bool:
+        settings = self.config.all()
+        if not settings.get("toast_enabled", True) or alert.get("alert_type") not in settings.get("toast_events", []):
+            return False
+        preference = self._host_preference(alert.get("host_id"))
+        if not preference["enabled"] or not preference["toast_enabled"]:
+            return False
+        events = preference.get("toast_events")
+        return events is None or alert.get("alert_type") in events
 
     def _payload(self, alert: dict[str, Any]) -> tuple[str, str, Any]:
         host = self.database.query_one("SELECT name FROM hosts WHERE id=?", (alert.get("host_id"),)) if alert.get("host_id") else None

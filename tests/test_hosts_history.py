@@ -296,3 +296,18 @@ def test_docker_disabled_is_passed_to_remote_collector(app, monkeypatch):
     )
     assert result.core_ok is False
     assert commands and commands[0].startswith("SERVER_MONITOR_DOCKER_ENABLED=0 ")
+
+
+def test_local_collector_does_not_require_sshd(app, monkeypatch):
+    from monitor.collector import Collector
+
+    def fail_ssh(*_args, **_kwargs):
+        raise AssertionError("本机采集不应连接 SSH")
+
+    monkeypatch.setattr("monitor.collector.SSHClient", fail_ssh)
+    settings = app.extensions["monitor_config"].all()
+    result = Collector(app.extensions["secret_box"], settings).collect(
+        {"is_local": True, "docker_enabled": False, "fingerprint": "SHA256:local"}
+    )
+    assert result.core_ok is True
+    assert result.data["identity"]["hostname"]

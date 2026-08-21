@@ -61,6 +61,9 @@ class SSHClient:
         self.secret_box = secret_box
         self.settings = settings
         self.client: paramiko.SSHClient | None = None
+        self.jump_client: paramiko.SSHClient | None = None
+        self.jump_channel: Any = None
+        self.jump_fingerprint: str | None = None
 
     def _pkey(self) -> paramiko.PKey | None:
         encrypted = self.host.get("private_key")
@@ -68,6 +71,20 @@ class SSHClient:
             return None
         key_text = self.secret_box.decrypt(encrypted)
         passphrase = self.secret_box.decrypt(self.host.get("private_key_passphrase"))
+        errors: list[Exception] = []
+        for key_type in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
+            try:
+                return key_type.from_private_key(io.StringIO(key_text or ""), password=passphrase)
+            except (paramiko.SSHException, ValueError) as exc:
+                errors.append(exc)
+        raise SSHAuthenticationError("私钥格式无法识别") from errors[-1]
+
+    def _pkey_for(self, key_field: str, passphrase_field: str) -> paramiko.PKey | None:
+        encrypted = self.host.get(key_field)
+        if not encrypted:
+            return None
+        key_text = self.secret_box.decrypt(encrypted)
+        passphrase = self.secret_box.decrypt(self.host.get(passphrase_field))
         errors: list[Exception] = []
         for key_type in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
             try:
@@ -84,6 +101,35 @@ class SSHClient:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
+            jump_client = None
+            jump_channel = None
+            if self.host.get("jump_enabled"):
+                jump_client = paramiko.SSHClient()
+                jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                jump_kwargs: dict[str, Any] = {
+                    "hostname": self.host.get("jump_address"),
+                    "port": int(self.host.get("jump_port") or 22),
+                    "username": self.host.get("jump_username"),
+                    "timeout": self.settings["ssh_connect_timeout"],
+                    "banner_timeout": self.settings["ssh_connect_timeout"],
+                    "auth_timeout": self.settings["ssh_connect_timeout"],
+                    "look_for_keys": False,
+                    "allow_agent": False,
+                }
+                if self.host.get("jump_auth_type") == "password":
+                    jump_kwargs["password"] = self.secret_box.decrypt(self.host.get("jump_auth_secret"))
+                else:
+                    jump_kwargs["pkey"] = self._pkey_for("jump_private_key", "jump_private_key_passphrase")
+                jump_client.connect(**jump_kwargs)
+                transport = jump_client.get_transport()
+                if not transport or not transport.is_active():
+                    raise SSHConnectionError("跳板机连接未建立")
+                observed_jump = host_fingerprint(transport.get_remote_server_key())
+                self.jump_fingerprint = observed_jump
+                expected_jump = self.host.get("jump_fingerprint")
+                if expected_jump and expected_jump != observed_jump:
+                    raise SSHFingerprintError("跳板机 SSH 指纹与已记录值不一致", expected=expected_jump, observed=observed_jump)
+                jump_channel = transport.open_channel("direct-tcpip", (self.host["address"], int(self.host.get("port") or 22)), ("127.0.0.1", 0))
             kwargs: dict[str, Any] = {
                 "hostname": self.host["address"],
                 "port": int(self.host.get("port") or 22),
@@ -94,21 +140,36 @@ class SSHClient:
                 "look_for_keys": False,
                 "allow_agent": False,
             }
+            if jump_channel is not None:
+                kwargs["sock"] = jump_channel
             if self.host["auth_type"] == "password":
                 kwargs["password"] = self.secret_box.decrypt(self.host.get("auth_secret"))
             else:
                 kwargs["pkey"] = self._pkey()
             client.connect(**kwargs)
+        except SSHError:
+            client.close()
+            if 'jump_client' in locals() and jump_client:
+                jump_client.close()
+            raise
         except paramiko.AuthenticationException as exc:
             client.close()
+            if 'jump_client' in locals() and jump_client:
+                jump_client.close()
             raise SSHAuthenticationError("SSH 认证失败") from exc
         except (socket.timeout, TimeoutError) as exc:
             client.close()
+            if 'jump_client' in locals() and jump_client:
+                jump_client.close()
             raise SSHTimeout("SSH 连接超时") from exc
         except (paramiko.SSHException, OSError) as exc:
             client.close()
+            if 'jump_client' in locals() and jump_client:
+                jump_client.close()
             raise SSHConnectionError(f"SSH 连接失败: {exc}") from exc
         self.client = client
+        self.jump_client = jump_client
+        self.jump_channel = jump_channel
         fingerprint = self._fingerprint()
         expected = self.host.get("fingerprint")
         if expected and expected != fingerprint:
@@ -218,6 +279,15 @@ class SSHClient:
         if self.client:
             self.client.close()
             self.client = None
+        if self.jump_channel:
+            try:
+                self.jump_channel.close()
+            except Exception:
+                pass
+            self.jump_channel = None
+        if self.jump_client:
+            self.jump_client.close()
+            self.jump_client = None
 
     def is_reusable(self) -> bool:
         if not self.client:
@@ -289,6 +359,16 @@ class SSHConnectionPool:
             host.get("private_key"),
             host.get("private_key_passphrase"),
             host.get("fingerprint"),
+            host.get("ssh_key_id"),
+            host.get("jump_enabled"),
+            host.get("jump_address"),
+            host.get("jump_port"),
+            host.get("jump_username"),
+            host.get("jump_auth_type"),
+            host.get("jump_auth_secret"),
+            host.get("jump_private_key"),
+            host.get("jump_private_key_passphrase"),
+            host.get("jump_fingerprint"),
         )
 
     def _prune_locked(self, settings: dict[str, Any], now: float) -> None:

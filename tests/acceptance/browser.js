@@ -172,13 +172,33 @@ async function run() {
 
   await evaluate(protocol, `document.querySelector('button[data-page="settings"]').click()`);
   await waitFor(protocol, `document.querySelector("#page-title")?.textContent === "系统设置" && document.querySelector("#settings-form")`, "settings page");
+  const vaultPage = await evaluate(protocol, `(() => ({
+    generateButton: Boolean(document.querySelector("#generate-vault-key")),
+    filePicker: Boolean(document.querySelector("[data-vault-file]")),
+    privateKeyForm: Boolean(document.querySelector("#vault-key-form")),
+  }))()`);
+  if (!vaultPage.generateButton || !vaultPage.filePicker || !vaultPage.privateKeyForm) {
+    throw new Error(`SSH vault controls missing: ${JSON.stringify(vaultPage)}`);
+  }
+  await evaluate(protocol, `(() => { const input = document.querySelector("[data-vault-file]"); const transfer = new DataTransfer(); transfer.items.add(new File(["loaded-from-file"], "existing-key.pem", {type:"text/plain"})); input.files = transfer.files; input.dispatchEvent(new Event("change", {bubbles:true})); return true; })()`);
+  await waitFor(protocol, `document.querySelector("#vault-key-form textarea[name=private_key]")?.value === "loaded-from-file"`, "private-key file loaded");
+  await evaluate(protocol, `document.querySelector("#generate-vault-key").click()`);
+  await waitFor(protocol, `document.querySelector("dialog[open] input[name=name]")`, "SSH key generation dialog");
+  await evaluate(protocol, `(() => { const dialog = document.querySelector("dialog[open]"); dialog.querySelector("input[name=name]").value = "browser-generated-key"; dialog.querySelector("select[name=key_type]").value = "ed25519"; dialog.querySelector("input[name=passphrase]").value = "browser-key-pass"; dialog.querySelector("form").requestSubmit(); return true; })()`);
+  await waitFor(protocol, `document.querySelector("#elevate-dialog")?.open || document.querySelector("#setting-credentials")?.textContent.includes("browser-generated-key")`, "SSH key generation authorization");
+  if (await evaluate(protocol, `Boolean(document.querySelector("#elevate-dialog")?.open)`)) {
+    await evaluate(protocol, submitExpression("#elevate-form", {password:changedPassword}));
+  }
+  await waitFor(protocol, `document.querySelector("#setting-credentials")?.textContent.includes("browser-generated-key")`, "generated SSH key listed");
+  await evaluate(protocol, `document.querySelector('[data-delete-vault-key-name="browser-generated-key"]').click()`);
+  await waitFor(protocol, `!document.querySelector("#setting-credentials")?.textContent.includes("browser-generated-key")`, "generated SSH key deleted");
   await evaluate(protocol, `document.querySelector("#logout-button").click()`);
   await waitFor(protocol, `!document.querySelector("#login-view")?.hidden && document.querySelector("#app-view")?.hidden`, "logout");
 
   const exceptions = protocol.events.filter((event) => event.method === "Runtime.exceptionThrown");
   protocol.close();
   if (exceptions.length) throw new Error(`Browser reported ${exceptions.length} uncaught exception(s)`);
-  return {login:"passed", password_rotation:"passed", dashboard:"passed", gpu_benchmark:"passed", settings:"passed", logout:"passed"};
+  return {login:"passed", password_rotation:"passed", dashboard:"passed", gpu_benchmark:"passed", settings:"passed", ssh_vault:"passed", logout:"passed"};
 }
 
 run().then((result) => {

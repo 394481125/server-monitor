@@ -143,28 +143,29 @@ class GPUScheduler:
 
     def _observe_one(self, host: dict[str, Any], gpu: dict[str, Any], config: dict[str, Any], runtime: dict[str, Any], settings: dict[str, Any], sample_valid: bool) -> dict[str, Any]:
         physical_id, gpu_uuid = host["physical_id"], gpu["uuid"]
+        previous_state = runtime.get("state")
         all_enabled = bool(settings["gpu_scheduler_enabled"] and host["scheduler_enabled"] and config.get("enabled"))
         if not all_enabled:
             self._set_runtime(physical_id, gpu_uuid, host["id"], state="disabled", idle_seconds_accum=0, attempts=0, retry_at=None, cooldown_until=None, frozen_until=None, last_error=None)
-            return {"uuid": gpu_uuid, "state": "disabled", "idle_seconds": 0}
+            return {"uuid": gpu_uuid, "state": "disabled", "previous_state": previous_state, "idle_seconds": 0}
         if not sample_valid:
             self._set_unknown(physical_id, gpu_uuid, host["id"], "GPU 采样无效")
-            return {"uuid": gpu_uuid, "state": "unknown", "idle_seconds": 0}
+            return {"uuid": gpu_uuid, "state": "unknown", "previous_state": previous_state, "idle_seconds": 0}
         now = utc_now()
         frozen = parse_utc(runtime.get("frozen_until"))
         if frozen and frozen > now:
             self._set_runtime(physical_id, gpu_uuid, host["id"], **{**runtime, "state": "frozen", "updated_at": utc_iso()})
-            return {"uuid": gpu_uuid, "state": "frozen", "idle_seconds": 0, "until": utc_iso(frozen)}
+            return {"uuid": gpu_uuid, "state": "frozen", "previous_state": previous_state, "idle_seconds": 0, "until": utc_iso(frozen)}
         if frozen:
             self._set_unknown(physical_id, gpu_uuid, host["id"], "冻结已解除，等待重新采样")
-            return {"uuid": gpu_uuid, "state": "unknown", "idle_seconds": 0}
+            return {"uuid": gpu_uuid, "state": "unknown", "previous_state": previous_state, "idle_seconds": 0}
         cooldown = parse_utc(runtime.get("cooldown_until"))
         if cooldown and cooldown > now:
             self._set_runtime(physical_id, gpu_uuid, host["id"], **{**runtime, "state": "cooldown", "updated_at": utc_iso()})
-            return {"uuid": gpu_uuid, "state": "cooldown", "idle_seconds": 0, "until": utc_iso(cooldown)}
+            return {"uuid": gpu_uuid, "state": "cooldown", "previous_state": previous_state, "idle_seconds": 0, "until": utc_iso(cooldown)}
         if cooldown:
             self._set_unknown(physical_id, gpu_uuid, host["id"], "冷却结束，等待重新采样")
-            return {"uuid": gpu_uuid, "state": "unknown", "idle_seconds": 0}
+            return {"uuid": gpu_uuid, "state": "unknown", "previous_state": previous_state, "idle_seconds": 0}
         mode = config.get("idle_mode") or settings["gpu_idle_mode"]
         util_limit = config.get("util_threshold") if config.get("util_threshold") is not None else settings["gpu_util_threshold"]
         memory_limit = config.get("memory_threshold") if config.get("memory_threshold") is not None else settings["gpu_memory_threshold"]
@@ -176,7 +177,7 @@ class GPUScheduler:
             idle = False
         if not idle:
             self._set_runtime(physical_id, gpu_uuid, host["id"], state="busy", idle_seconds_accum=0, last_valid_at=utc_iso(), attempts=0, retry_at=None, cooldown_until=None, frozen_until=None, last_error=None)
-            return {"uuid": gpu_uuid, "state": "busy", "idle_seconds": 0}
+            return {"uuid": gpu_uuid, "state": "busy", "previous_state": previous_state, "idle_seconds": 0}
         previous = parse_utc(runtime.get("last_valid_at"))
         elapsed = max(0.0, (now - previous).total_seconds()) if previous else 0.0
         # State restarts only after a real valid interval; application downtime never appears in samples.
@@ -184,7 +185,7 @@ class GPUScheduler:
         idle_seconds = int(host.get("scheduler_idle_seconds") or settings["gpu_idle_seconds"])
         state = "pending" if accumulated >= idle_seconds else "idle_timing"
         self._set_runtime(physical_id, gpu_uuid, host["id"], state=state, idle_seconds_accum=accumulated, last_valid_at=utc_iso(), attempts=int(runtime.get("attempts") or 0), retry_at=runtime.get("retry_at"), cooldown_until=None, frozen_until=None, last_error=None)
-        return {"uuid": gpu_uuid, "state": state, "idle_seconds": accumulated, "remaining_seconds": max(0, idle_seconds - accumulated), "near_trigger": accumulated >= idle_seconds * 0.8}
+        return {"uuid": gpu_uuid, "state": state, "previous_state": previous_state, "idle_seconds": accumulated, "remaining_seconds": max(0, idle_seconds - accumulated), "near_trigger": accumulated >= idle_seconds * 0.8}
 
     def ready(self) -> list[dict[str, Any]]:
         rows = self.database.query_all(

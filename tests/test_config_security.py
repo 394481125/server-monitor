@@ -14,6 +14,9 @@ def test_settings_validate_ranges_and_cross_fields():
     assert DEFAULTS["filesystem_usage_threshold"] == 90
     assert DEFAULTS["swap_usage_threshold"] == 80
     assert DEFAULTS["alert_samples"] == 5
+    assert DEFAULTS["cleanup_interval_minutes"] == 60
+    assert {"gpu_idle", "gpu_busy"} <= set(DEFAULTS["apprise_events"])
+    assert DEFAULTS["toast_events"] == DEFAULTS["apprise_events"]
     with pytest.raises(ConfigError):
         validate_settings({"collection_interval": 1})
     with pytest.raises(ConfigError):
@@ -26,10 +29,17 @@ def test_settings_validate_ranges_and_cross_fields():
         validate_settings({"metric_mid_retention_hours": 24, "metric_retention_days": 1})
     with pytest.raises(ConfigError):
         validate_settings({"scan_timeout_seconds": 121})
+    with pytest.raises(ConfigError):
+        validate_settings({"cleanup_interval_minutes": 0})
     with pytest.raises(ConfigError, match="协议无效"):
         validate_settings({"apprise_urls": ["missing-scheme"]})
     assert validate_settings({"scan_max_depth": "6"})["scan_max_depth"] == 6
     assert validate_settings({"collection_interval": "10"})["collection_interval"] == 10
+    assert validate_settings({"cleanup_interval_minutes": "60"})["cleanup_interval_minutes"] == 60
+    assert validate_settings({"gpu_power_alert_enabled": False})["gpu_power_alert_enabled"] is False
+    assert validate_settings({"toast_events": ["host_offline"]})["toast_events"] == ["host_offline"]
+    with pytest.raises(ConfigError, match="toast_events"):
+        validate_settings({"toast_events": ["unknown_alert"]})
     assert validate_settings({"apprise_urls": ["ntfy://shengziran"]})["apprise_urls"] == ["ntfy://shengziran"]
 
 

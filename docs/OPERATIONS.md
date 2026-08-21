@@ -1,137 +1,63 @@
 # 运维手册
 
-## 运行前提
+## 使用已有数据启动
 
-- Linux、Python 3.11+ 和 OpenSSH client。
-- 被管主机开启 SSH，推荐使用权限受限的专用账号。
-- Docker 部署需要 Docker Engine 和 Compose v2。
-- Node.js 与 Chrome 仅用于开发和 CI，生产不需要。
-
-配置项见根目录 [README](../README.md#关键配置)。首次启动必须通过环境变量提供一次性管理员密码；已有数据库不会被该变量覆盖。
-
-## Docker 部署
+确认 `/home/qq394481125/app/server_monitor/data/server-monitor.sqlite3` 和 `data/master.key` 存在且权限分别不超过 0600/0700，然后运行：
 
 ```bash
-cp .env.example .env
-chmod 600 .env
-# 编辑 SERVER_MONITOR_INITIAL_PASSWORD 和日志级别
-docker compose up -d --build
-docker compose ps
-docker compose logs -f server-monitor
-curl http://127.0.0.1:8000/health
+cd /home/qq394481125/app/server_monitor
+.venv/bin/python -m flask --app monitor.wsgi run --host 127.0.0.1 --port 8000
 ```
 
-升级：
+检查：
 
 ```bash
-git pull --ff-only
-docker compose up -d --build
-curl http://127.0.0.1:8000/health
+curl --fail http://127.0.0.1:8000/
 ```
 
-不要使用 `docker compose down -v`，除非明确要删除数据卷。
+不要使用新的临时数据目录替代现有目录。升级前先执行设置页备份或复制数据库；应用启动会自动完成未应用迁移。
 
-## Ubuntu 部署
+## 密钥库与跳板机
+
+在“系统设置 → SSH 密钥库”中点击“生成新密钥”，选择 ed25519 或 RSA（3072 位），可设置 passphrase。密钥由服务端生成后立即用主密钥加密写入数据库，浏览器只收到名称、类型、公钥和指纹，不会收到私钥。
+
+已有密钥可以选择“加载私钥文件”（建议文件权限保持 0600），也可以直接粘贴 RSA 或 ed25519 私钥文本；文件内容只作为请求正文提交并按同样方式加密保存，不会在服务器落地上传文件。主机编辑页选择密钥库条目即可，旧的主机级粘贴私钥方式仍兼容。删除前必须解除所有主机引用。
+
+命令行生成的密钥也可导入，例如：
 
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-venv openssh-client
-python3 -m venv --copies .venv
-.venv/bin/python -m pip install -r requirements.lock
-.venv/bin/python -m pip check
-SERVER_MONITOR_INITIAL_PASSWORD='一次性长密码' LOG_LEVEL=INFO bash scripts/start_ubuntu.sh start
+ssh-keygen -t ed25519 -f ~/.ssh/server-monitor
+ssh-keygen -t rsa -b 3072 -f ~/.ssh/server-monitor-rsa
 ```
 
-```bash
-bash scripts/start_ubuntu.sh status
-bash scripts/start_ubuntu.sh foreground
-bash scripts/start_ubuntu.sh restart
-bash scripts/start_ubuntu.sh stop
-tail -f data/logs/server-monitor.log
-```
+生成命令会分别产生私钥和 `.pub` 公钥文件；导入平台时选择没有 `.pub` 后缀的私钥文件，并在页面填写生成时设置的 passphrase。
 
-systemd 部署：
+公钥推送有“仅输出脚本”和“远程 SSH 执行”两种模式。远程执行前确认目标账号有权限写入 `~/.ssh/authorized_keys`，并在指纹变化时人工确认。
 
-```bash
-sudo cp deploy/server-monitor.service.example /etc/systemd/system/server-monitor.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now server-monitor
-sudo systemctl status server-monitor --no-pager
-sudo journalctl -u server-monitor -n 100 --no-pager
-```
+跳板机配置填写地址、端口、账号和密码/私钥。平台会先测试跳板机和目标机指纹，后续采集、终端、文件和命令都走服务端中转。浏览器不会收到跳板机账号、密码或私钥。
 
-启动脚本、systemd 和 Docker 只能选择一种进程管理方式。生产始终保持一个 Gunicorn Worker。
+## 文件管理安全边界
 
-## 数据与备份
+- 小文本可使用“预览”；默认超过 1 MiB、未知后缀、二进制内容或符号链接直接拒绝。
+- 上传和下载受 `FILE_TRANSFER_LIMIT`（默认 512 MiB）限制。GB 级文件使用页面生成的 `scp` 或 `rsync` 脚本，在受控网络环境执行。
+- 重命名、新建目录可直接执行；删除文件/目录要求 elevated 会话和前端二次确认。
+- 权限/属主页面只生成 `chmod`/`chown` 脚本，运维人员检查后在目标环境自行执行。
 
-启动时会自动执行连续数据库迁移。查看当前版本与迁移记录：
+## 告警与通知
 
-```bash
-.venv/bin/python -c "import sqlite3; c=sqlite3.connect('data/server-monitor.sqlite3'); print(c.execute('PRAGMA user_version').fetchone()[0]); print(c.execute('select version,name,applied_at from schema_migrations order by version').fetchall())"
-```
+设置页将“网页告警”与“发送这些告警（Apprise）”分开勾选。两组都覆盖主机离线、温度、磁盘容量、inode、Swap、备份失败、GPU 功耗/风扇/ECC/XID/PCIe/节流/残留显存及 GPU 状态与调度事件。网页提醒只影响当前浏览器提示；Apprise URL 在服务端加密保存并异步发送。
 
-设置页可以创建 SQLite 在线备份。主机级备份必须同时保存数据库与主密钥：
+同一设置页的“通知主机”表格可以逐台控制：总开关、网页提醒、Apprise，以及事件范围。未保存过策略的主机继承全局事件列表；关闭某台主机不会删除告警，告警历史和审计记录仍然保留。
 
-```bash
-sudo systemctl stop server-monitor
-cp -a data/server-monitor.sqlite3 /backup/server-monitor.sqlite3
-cp -a data/master.key /backup/master.key
-sudo systemctl start server-monitor
-```
+## 故障排查
 
-恢复时停止服务、保留现场副本、恢复同一组文件，再检查：
+- SSH 认证失败：检查主机认证方式、密钥口令、跳板机凭证及目标指纹；不要关闭指纹校验。
+- 跳板连接失败：先独立验证跳板机能访问目标端口，再检查 `direct-tcpip` 允许策略和防火墙。
+- 预览被拒绝：使用下载或生成的传输脚本，不要尝试在网页加载大文件。
+- 查看审计日志定位用户、主机、请求 ID 和执行结果。备份恢复前停止写入并保留原数据库副本。
 
-```bash
-.venv/bin/python -c "import sqlite3; print(sqlite3.connect('data/server-monitor.sqlite3').execute('PRAGMA integrity_check').fetchone()[0])"
-```
-
-不要手工删除正在使用的 `-wal` 或 `-shm` 文件。
-
-## SSH 与 GPU 验收
-
-SSH 连接池只复用空闲且健康的连接，修改凭据或指纹后旧连接会失效。真实环境验收应使用专用主机：
-
-```bash
-.venv/bin/python tests/acceptance/ssh.py
-.venv/bin/python tests/acceptance/websocket.py --help
-```
-
-GPU 快速评估的远端 Python 环境需要 CUDA 版 PyTorch；ResNet、MobileNet 和 CIFAR-10 需要 `torchvision`，ViT-Tiny 需要 `timm`。
-
-```bash
-python3 -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-python3 -c "import torchvision; print(torchvision.__version__)"
-python3 -c "import timm; print(timm.__version__)"
-nvidia-smi
-```
-
-FP8、INT8 和 NCCL 能力取决于 GPU、驱动、CUDA 与 PyTorch 构建。短时 loss/accuracy 和 GEMM 峰值只用于链路及横向比较，不是综合性能或模型精度结论。
-
-## 发布与升级验收
-
-日常提交并推送前，脚本会同步远端并执行可用测试：
-
-```bash
-bash scripts/update_github.sh "说明本次修改"
-```
-
-首次发布到新仓库使用 `scripts/publish_github.sh`。构建源码包和部署包：
-
-```bash
-bash scripts/build_release.sh 1.4.0
-cd dist
-sha256sum -c SHA256SUMS
-```
-
-升级前至少执行：
+完整回归测试：
 
 ```bash
 .venv/bin/python -m pytest -q
-node --test tests/frontend/*.test.js
-.venv/bin/python tests/acceptance/e2e.py
-.venv/bin/python -m compileall -q monitor tests scripts gunicorn.conf.py
-.venv/bin/python -m pip check
-git diff --check
 ```
-
-升级后检查 `/health`、后台采集线程、数据库版本、最近告警、SSH 指纹状态和一台专用测试主机的采集结果。

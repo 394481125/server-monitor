@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from .ssh_client import (
+    CommandResult,
     SSHAuthenticationError,
     SSHClient,
     SSHConnectionPool,
@@ -376,12 +378,14 @@ def _parse_count(text: str) -> int | None:
 def _parse_network(text: str, previous: dict[str, Any] | None, elapsed: float | None) -> list[dict[str, Any]]:
     old = (previous or {}).get("network_counters", {})
     rows: list[dict[str, Any]] = []
+    loopback: list[str] = []
     for line in text.splitlines():
         if ":" not in line:
             continue
         name, values = line.split(":", 1)
         name = name.strip()
         if name == "lo":
+            loopback.append(line)
             continue
         fields = values.split()
         if len(fields) < 12:
@@ -402,6 +406,30 @@ def _parse_network(text: str, previous: dict[str, Any] | None, elapsed: float | 
             if tx_delta >= 0:
                 tx_rate = round(tx_delta / elapsed, 2)
         rows.append({"name": name, **current, "rx_rate": rx_rate, "tx_rate": tx_rate, "rx_errors": rx_errors, "rx_dropped": rx_drop, "tx_errors": tx_errors, "tx_dropped": tx_drop})
+    # Network-isolated containers and test environments may expose only lo.
+    # Keep the sample usable instead of rejecting all otherwise valid metrics.
+    if not rows:
+        for line in loopback:
+            name, values = line.split(":", 1)
+            fields = values.split()
+            if len(fields) < 12:
+                continue
+            try:
+                rx_bytes, rx_errors, rx_drop = int(fields[0]), int(fields[2]), int(fields[3])
+                tx_bytes, tx_errors, tx_drop = int(fields[8]), int(fields[10]), int(fields[11])
+            except ValueError:
+                continue
+            current = {"rx_bytes": rx_bytes, "tx_bytes": tx_bytes}
+            prior = old.get(name.strip())
+            rx_rate = tx_rate = None
+            if prior and elapsed and elapsed > 0:
+                rx_delta = rx_bytes - prior.get("rx_bytes", rx_bytes)
+                tx_delta = tx_bytes - prior.get("tx_bytes", tx_bytes)
+                if rx_delta >= 0:
+                    rx_rate = round(rx_delta / elapsed, 2)
+                if tx_delta >= 0:
+                    tx_rate = round(tx_delta / elapsed, 2)
+            rows.append({"name": name.strip(), **current, "rx_rate": rx_rate, "tx_rate": tx_rate, "rx_errors": rx_errors, "rx_dropped": rx_drop, "tx_errors": tx_errors, "tx_dropped": tx_drop})
     if not rows:
         raise ValueError("/proc/net/dev 无可用网卡")
     return rows
@@ -772,13 +800,38 @@ class Collector:
         self.connection_pool = connection_pool
 
     def collect(self, host: dict[str, Any], previous: dict[str, Any] | None = None) -> CollectionResult:
-        client = self.connection_pool.client(host) if self.connection_pool else SSHClient(host, self.secret_box, self.settings)
+        # The local overview represents the machine running this process. It must
+        # remain collectable even when sshd is disabled (the common local setup).
+        # Remote hosts continue to use the SSH client and connection pool below.
+        client = None if host.get("is_local") else (self.connection_pool.client(host) if self.connection_pool else SSHClient(host, self.secret_box, self.settings))
         started = time.monotonic()
         try:
-            fingerprint = client.connect()
             docker_enabled = "1" if host.get("docker_enabled", True) else "0"
             command = f"SERVER_MONITOR_DOCKER_ENABLED={docker_enabled} {CORE_COMMAND}"
-            result = client.run(command, host.get("timeout_seconds") or self.settings["collection_timeout"])
+            timeout = host.get("timeout_seconds") or self.settings["collection_timeout"]
+            if host.get("is_local"):
+                try:
+                    completed = subprocess.run(
+                        command,
+                        shell=True,
+                        executable="/bin/bash",
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    return CollectionResult(False, {}, {}, host.get("fingerprint"), "本机采集命令超时", "timeout")
+                except OSError as exc:
+                    return CollectionResult(False, {}, {}, host.get("fingerprint"), f"本机采集命令失败: {exc}", "remote_command_failed")
+                result = CommandResult(completed.stdout, completed.stderr, completed.returncode)
+                # Local collection has no SSH host key to verify. Preserve the
+                # stored fingerprint so an existing local host is not flagged.
+                fingerprint = host.get("fingerprint")
+            else:
+                assert client is not None
+                fingerprint = client.connect()
+                result = client.run(command, timeout)
             if result.exit_code != 0 and not result.stdout:
                 return CollectionResult(False, {}, {}, fingerprint, result.stderr or "远端采集命令失败", "remote_command_failed")
             parts = _sections(result.stdout)
@@ -863,7 +916,8 @@ class Collector:
         except (ValueError, KeyError, IndexError) as exc:
             return CollectionResult(False, {}, {}, None, f"核心指标解析失败: {exc}", "remote_command_failed")
         finally:
-            client.close()
+            if client is not None:
+                client.close()
 
 
 def flattened_metrics(data: dict[str, Any]) -> list[tuple[str, str, float]]:

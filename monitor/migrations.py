@@ -129,6 +129,86 @@ def _local_overview(connection: sqlite3.Connection) -> None:
     )
 
 
+def _credential_management(connection: sqlite3.Connection) -> None:
+    """Add encrypted key-vault references, jump hosts and user favorites."""
+    _add_columns(
+        connection,
+        "hosts",
+        (
+            ("ssh_key_id", "INTEGER REFERENCES ssh_keys(id) ON DELETE SET NULL"),
+            ("jump_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("jump_address", "TEXT"),
+            ("jump_port", "INTEGER"),
+            ("jump_username", "TEXT"),
+            ("jump_auth_type", "TEXT"),
+            ("jump_auth_secret", "TEXT"),
+            ("jump_private_key", "TEXT"),
+            ("jump_private_key_passphrase", "TEXT"),
+            ("jump_fingerprint", "TEXT"),
+        ),
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ssh_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            key_type TEXT NOT NULL CHECK(key_type IN ('rsa','ed25519')),
+            private_key TEXT NOT NULL,
+            passphrase TEXT,
+            public_key TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS command_favorites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            host_id INTEGER REFERENCES hosts(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            command TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, host_id, name)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS directory_favorites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            host_id INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, host_id, path)
+        )
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_command_favorites_lookup ON command_favorites(user_id, host_id, updated_at DESC)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_directory_favorites_lookup ON directory_favorites(user_id, host_id, name)")
+
+
+def _host_notification_preferences(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS host_notification_preferences (
+            host_id INTEGER PRIMARY KEY REFERENCES hosts(id) ON DELETE CASCADE,
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+            toast_enabled INTEGER NOT NULL DEFAULT 1 CHECK(toast_enabled IN (0, 1)),
+            apprise_enabled INTEGER NOT NULL DEFAULT 1 CHECK(apprise_enabled IN (0, 1)),
+            toast_events_json TEXT,
+            apprise_events_json TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "baseline", _baseline),
     Migration(2, "alert-acknowledgement", _alert_acknowledgement),
@@ -138,6 +218,8 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(6, "supporting-indexes", _supporting_indexes),
     Migration(7, "legacy-repair-and-gpu-benchmarks", _repair_legacy_schema_and_add_gpu_benchmarks),
     Migration(8, "local-overview", _local_overview),
+    Migration(9, "credential-management", _credential_management),
+    Migration(10, "host-notification-preferences", _host_notification_preferences),
 )
 
 
