@@ -13,6 +13,7 @@ const state = {
   refreshMs: 5000,
   timeZone: "Asia/Shanghai",
   dashboardFilters: {search: "", status: "", tags: [], gpu_user: ""},
+  idleGpuFilters: {min_memory_mib: 0, max_utilization: 10, max_memory_percent: 10, require_no_processes: true, host_status: "online"},
   hostsCache: [],
   detailHostId: null,
   history: null,
@@ -24,21 +25,25 @@ const state = {
   scanSettingsPromise: null,
   scanSettingsLoaded: false,
   stressTimers: new Set(),
+  terminalSessions: [],
+  terminalWorkbenchRender: null,
 };
 
 const pages = {
   dashboard: ["集群概览", "全部受管服务器的实时缓存状态"],
+  compute: ["空闲算力", "发现可直接用于新任务的 GPU 资源"],
   hosts: ["主机管理", "管理 SSH 连接、采集策略与运维权限"],
   files: ["文件管理", "通过 SSH 安全浏览和管理服务器文件"],
   jobs: ["调度记录", "GPU 自动调度的提交动作和执行结果"],
   alerts: ["告警事件", "查看当前告警和已恢复事件"],
   logs: ["审计日志", "追踪用户操作及远端状态变更"],
   settings: ["系统设置", "配置采集、告警、调度、安全和数据策略"],
+  terminal: ["终端工作台", "统一打开和管理多台主机的 SSH 会话"],
   environments: ["开发环境", "盘点 GPU 软件栈，管理受约束的 Python 环境与 APT 方案"],
   permissions: ["权限与界面", "管理员授权，用户调整个人页面显示"],
 };
 
-const pagePermissions = {dashboard:"page.dashboard", hosts:"page.hosts", files:"page.files", jobs:"page.jobs", alerts:"page.alerts", logs:"page.logs", settings:"page.settings", environments:"page.environments"};
+const pagePermissions = {dashboard:"page.dashboard", compute:"page.dashboard", hosts:"page.hosts", files:"page.files", jobs:"page.jobs", alerts:"page.alerts", logs:"page.logs", settings:"page.settings", environments:"page.environments", terminal:"terminal.open"};
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -46,7 +51,7 @@ const {escapeHtml:esc, formatBytes:fmtBytes, formatPercentage:percentage, format
 const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 const isAdmin = () => state.user?.role === "admin";
 const can = (permission) => isAdmin() || Boolean(state.user?.permissions?.includes(permission));
-const canShowPage = (page) => page === "permissions" || (can(pagePermissions[page]) && (isAdmin() || state.user?.visible_pages?.includes(pagePermissions[page])));
+const canShowPage = (page) => page === "permissions" || (can(pagePermissions[page]) && (page === "terminal" || isAdmin() || state.user?.visible_pages?.includes(pagePermissions[page])));
 
 function applyNavigationPermissions() {
   $$("#main-nav button").forEach((button) => { button.hidden = !canShowPage(button.dataset.page); });
@@ -226,6 +231,8 @@ function clearRuntime() {
   state.platformTimer = null;
   state.stressTimers.forEach((timer) => clearInterval(timer));
   state.stressTimers.clear();
+  state.terminalSessions.slice().forEach((session) => session.close?.());
+  state.terminalSessions = [];
 }
 
 function showLogin() {
@@ -259,7 +266,7 @@ function acceptUser(user) {
   $("#app-view").hidden = false;
   state.lastAlertId = null;
   state.alertNotifiedKeys.clear();
-  const firstPage = ["dashboard", "hosts", "files", "environments", "jobs", "alerts", "logs", "settings", "permissions"].find(canShowPage) || "permissions";
+  const firstPage = ["dashboard", "compute", "hosts", "files", "terminal", "environments", "jobs", "alerts", "logs", "settings", "permissions"].find(canShowPage) || "permissions";
   navigate(firstPage);
   if (can("page.alerts")) {
     pollAlerts();
@@ -341,17 +348,36 @@ function navigate(page) {
   renderPage();
 }
 
+async function renderTerminalWorkbench() {
+  if (!can("terminal.open")) {
+    $("#page-content").innerHTML = '<div class="notice-panel">当前账号尚未获得“打开 SSH 终端”权限。</div>';
+    return;
+  }
+  state.terminalWorkbenchRender = renderTerminalWorkbench;
+  if (!state.hostsCache.length) {
+    const result = await api("/api/hosts?page_size=200");
+    state.hostsCache = result.items || [];
+  }
+  const hosts = state.hostsCache.filter((host) => host.allow_terminal && host.enabled !== false);
+  const sessions = state.terminalSessions;
+  $("#page-content").innerHTML = `<section class="section"><div class="toolbar"><div><h2>终端工作台</h2><p>每个会话独立连接一台主机；关闭页面或会话按钮后才会断开 SSH。</p></div><div class="toolbar-group"><select id="workbench-host-select">${hosts.map((host) => `<option value="${host.id}">${esc(host.name)} · ${esc(host.address)}</option>`).join("")}</select><button id="workbench-open" type="button" class="primary" ${hosts.length ? "" : "disabled"}>打开终端</button></div></div><div class="tabs" role="tablist">${sessions.map((session, index) => `<button type="button" data-terminal-session="${session.id}" class="${index === sessions.length - 1 ? "active" : ""}">${esc(session.host.name)} <span aria-hidden="true">×</span></button>`).join("") || '<span class="hint">尚未打开会话</span>'}</div><div class="notice-panel">X11 图形转发不在浏览器终端中启用；需要 GUI 时请使用受控的服务器端调试方式或本地 SSH -X。</div></section>`;
+  $("#workbench-open")?.addEventListener("click", () => { const host = hosts.find((item) => item.id === Number($("#workbench-host-select").value)); if (host) openTerminal(host, null, {modal:false}); });
+  $$('[data-terminal-session]').forEach((button) => { button.onclick = () => { const session = state.terminalSessions.find((item) => item.id === button.dataset.terminalSession); session?.dialog?.focus(); }; });
+}
+
 async function renderPage() {
   const requestedPage = state.page;
   $("#page-content").innerHTML = '<div class="loading">正在读取缓存数据</div>';
   try {
     if (requestedPage === "dashboard") await renderDashboard();
+    else if (requestedPage === "compute") await renderIdleCompute();
     else if (requestedPage === "hosts") await renderHosts();
     else if (requestedPage === "jobs") await renderJobs();
     else if (requestedPage === "alerts") await renderAlerts();
     else if (requestedPage === "logs") await renderLogs();
     else if (requestedPage === "files") await renderFiles();
     else if (requestedPage === "settings") await renderSettings();
+    else if (requestedPage === "terminal") await renderTerminalWorkbench();
     else if (requestedPage === "environments") await renderDevelopmentPage();
     else if (requestedPage === "permissions") await renderPermissions();
   } catch (error) {
@@ -513,16 +539,19 @@ async function renderDashboard(backgroundRefresh = false) {
   const online = items.filter((item) => item.host.status === "online").length;
   const warning = items.filter((item) => attentionStatuses.includes(item.host.status)).length;
   const offline = items.filter((item) => offlineStatuses.includes(item.host.status)).length;
+  const summary = result.resource_summary || {};
   $("#page-content").innerHTML = `<div class="dashboard-local-overview">
       <div><strong>本机概览</strong><span>${result.local_configured ? "直接读取监控服务所在机器的系统指标" : "尚未配置本机概览"}</span></div>
       ${switchControl("show_local_overview", "显示本机", result.show_local_overview)}
     </div>
     ${result.show_local_overview && !result.local_configured ? `<div class="notice-panel local-overview-setup"><div><strong>需要配置本机概览</strong><span>${can("host.manage") ? "配置后会直接读取本机指标，并保留主机详情与运维功能。" : "请联系管理员添加并标记本机概览。"}</span></div>${can("host.manage") ? '<button id="configure-local-host" class="primary">配置本机</button>' : ""}</div>` : ""}
     <div class="stats-band">
-      <button class="stat" data-summary-status=""><small>受管主机</small><strong>${items.length}</strong></button>
-      <button class="stat success" data-summary-status="online"><small>在线</small><strong>${online}</strong></button>
-      <button class="stat warning" data-summary-status="attention"><small>需要关注</small><strong>${warning}</strong></button>
-      <button class="stat danger-tone" data-summary-status="failed"><small>连接或采集失败</small><strong>${offline}</strong></button>
+      <button class="stat" data-summary-status=""><small>受管主机</small><strong>${summary.host_count ?? items.length}</strong><span>当前筛选范围</span></button>
+      <button class="stat success" data-summary-status="online"><small>在线主机</small><strong>${summary.online_hosts ?? online}</strong><span>可继续采集</span></button>
+      <button class="stat compute-tone" data-page-link="compute"><small>GPU 总数</small><strong>${summary.gpu_count ?? 0}</strong><span>查看空闲算力</span></button>
+      <button class="stat success" data-page-link="compute"><small>空闲 GPU</small><strong>${summary.idle_gpu_count ?? 0}</strong><span>满足当前阈值</span></button>
+      <button class="stat warning" data-summary-status="attention"><small>需要关注</small><strong>${warning}</strong><span>指标或连接异常</span></button>
+      <button class="stat danger-tone" data-summary-status="failed"><small>活动告警</small><strong>${summary.active_alert_count ?? offline}</strong><span>待确认事件</span></button>
     </div>
     <div class="dashboard-filter-band">
       <div class="toolbar-search"><input id="dashboard-search" placeholder="搜索名称、地址或标签" value="${esc(state.dashboardFilters.search)}"></div>
@@ -581,11 +610,36 @@ async function renderDashboard(backgroundRefresh = false) {
       $$(".host-card").forEach((card) => { card.hidden ||= !offlineStatuses.includes(card.dataset.hostStatus); });
     } else applyDashboardFilters();
   }));
+  $$('[data-page-link]').forEach((button) => button.addEventListener("click", () => navigate(button.dataset.pageLink)));
   applyDashboardFilters();
   const indicator = $("#live-indicator");
   indicator.innerHTML = `<i></i>更新于 ${esc(new Date().toLocaleTimeString("zh-CN", {hour12:false}))}`;
   startDashboardTimer();
   if (!backgroundRefresh) setHeader(...pages.dashboard);
+}
+
+function idleGpuStatusLabel(status) {
+  return ({online:"在线", degraded:"指标降级", gpu_error:"GPU 采集失败"})[status] || status || "未知";
+}
+
+function idleGpuCard(item) {
+  const terminal = item.allow_terminal && can("terminal.open") ? `<button type="button" data-idle-terminal="${item.host_id}" class="primary">打开终端</button>` : "";
+  return `<article class="idle-gpu-card"><header><div><div class="host-title-line"><h3>${esc(item.host_name)}</h3><span class="status ${esc(item.host_status)}">${esc(idleGpuStatusLabel(item.host_status))}</span></div><p class="mono">GPU ${esc(item.gpu_index)} · ${esc(item.gpu_name)}</p></div><span class="idle-badge">可用</span></header><div class="idle-gpu-metrics"><div><small>可用显存</small><strong>${esc(fmtBytes(Number(item.memory_available_mib) * 1024 * 1024))}</strong><span>${Number(item.memory_available_mib).toFixed(0)} / ${Number(item.memory_total_mib).toFixed(0)} MiB</span></div><div><small>利用率</small><strong>${percentage(item.utilization_percent)}</strong><span>显存 ${percentage(item.memory_percent)}</span></div><div><small>进程</small><strong>${item.process_count}</strong><span>无归属进程</span></div></div><div class="idle-gpu-actions">${terminal}<button type="button" data-idle-detail="${item.host_id}">查看主机</button></div><footer>采样于 ${fmtTime(item.collected_at)}</footer></article>`;
+}
+
+async function renderIdleCompute() {
+  const filters = state.idleGpuFilters;
+  const params = new URLSearchParams({min_memory_mib:String(filters.min_memory_mib || 0), max_utilization:String(filters.max_utilization), max_memory_percent:String(filters.max_memory_percent), require_no_processes:filters.require_no_processes ? "1" : "0"});
+  if (filters.host_status) params.set("host_status", filters.host_status);
+  const result = await api(`/api/idle-gpus?${params}`);
+  if (state.page !== "compute") return;
+  const items = result.items || [];
+  $("#page-content").innerHTML = `<section class="compute-hero"><div><span class="panel-kicker">资源发现</span><h2>找到可以立即使用的 GPU</h2><p>只展示来自在线或指标降级主机的可信缓存，默认排除有进程或显存占用超过阈值的设备。</p></div><div class="compute-count"><strong>${items.length}</strong><span>张可用 GPU</span></div></section><section class="compute-filter-band"><label>最低可用显存（MiB）<input id="idle-min-memory" type="number" min="0" step="256" value="${esc(filters.min_memory_mib)}"></label><label>最大利用率（%）<input id="idle-max-util" type="number" min="0" max="100" step="1" value="${esc(filters.max_utilization)}"></label><label>最大显存占用（%）<input id="idle-max-memory" type="number" min="0" max="100" step="1" value="${esc(filters.max_memory_percent)}"></label><label>主机状态<select id="idle-host-status"><option value="">在线或指标降级</option><option value="online">在线</option><option value="degraded">指标降级</option></select></label><label class="check-label"><input id="idle-no-process" type="checkbox" ${filters.require_no_processes ? "checked" : ""}>必须没有归属进程</label><button id="idle-apply" class="primary" type="button">应用筛选</button></section>${items.length ? `<div class="idle-gpu-grid">${items.map(idleGpuCard).join("")}</div>` : '<div class="empty"><div><strong>没有符合条件的 GPU</strong>放宽显存或利用率阈值，或等待下一次可信采样。</div></div>'}`;
+  $("#idle-host-status").value = filters.host_status;
+  $("#idle-apply").onclick = () => { state.idleGpuFilters = {min_memory_mib:Number($("#idle-min-memory").value || 0), max_utilization:Number($("#idle-max-util").value || 10), max_memory_percent:Number($("#idle-max-memory").value || 10), host_status:$("#idle-host-status").value, require_no_processes:$("#idle-no-process").checked}; renderIdleCompute(); };
+  $$('[data-idle-detail]').forEach((button) => { button.onclick = () => renderHostDetail(Number(button.dataset.idleDetail)); });
+  $$('[data-idle-terminal]').forEach((button) => { button.onclick = async () => { const item = items.find((row) => row.host_id === Number(button.dataset.idleTerminal)); if (!item) return; openTerminal({id:item.host_id,name:item.host_name,address:item.host_address,port:item.host_port || 22,username:item.host_username || "",allow_terminal:true,enabled:true}, null, {modal:false}); }; });
+  setHeader(...pages.compute);
 }
 
 function bindHostLinks(root = document) {
@@ -669,7 +723,7 @@ async function toggleHost(hostId, enabled) {
   } catch (error) { toast(error.message, "error"); }
 }
 
-function createDialog(content, className = "") {
+function createDialog(content, className = "", modal = true) {
   const dialog = document.createElement("dialog");
   dialog.className = className;
   dialog.innerHTML = content;
@@ -677,7 +731,7 @@ function createDialog(content, className = "") {
   const remove = () => { if (dialog.isConnected) dialog.remove(); };
   dialog.addEventListener("close", remove, {once:true});
   dialog.addEventListener("cancel", (event) => { event.preventDefault(); dialog.close("cancel"); });
-  dialog.showModal();
+  if (modal) dialog.showModal(); else dialog.show();
   return dialog;
 }
 
@@ -1645,7 +1699,9 @@ async function renderProcesses(host, root, hideKernel = true) {
 
 async function renderTools(host, root) {
   const result = await api(`/api/hosts/${host.id}/tools`);
-  root.innerHTML = `<section class="section"><div class="toolbar"><h3>工具能力</h3><div class="toolbar-group"><button data-close-workbench>关闭</button><button data-reload-tools>重新检测</button></div></div><div class="table-wrap"><table><thead><tr><th>工具</th><th>状态</th><th>说明</th><th>操作</th></tr></thead><tbody>${Object.entries(result.tools).map(([name,status]) => `<tr><td class="mono">${esc(name)}</td><td><span class="status ${status === "available" ? "online" : "disabled"}">${status === "available" ? "可用" : "未安装"}</span></td><td>${toolDescription(name)}</td><td>${can("tools.install") && host.allow_install && status !== "available" && name !== "nvidia-smi" ? `<button data-install-tool="${esc(name)}">安装</button>` : "-"}</td></tr>`).join("")}</tbody></table></div></section>`;
+  const versions = result.versions || {};
+  const names = [...new Set([...Object.keys(result.tools || {}), ...Object.keys(versions)])];
+  root.innerHTML = `<section class="section"><div class="toolbar"><h3>工具能力与版本</h3><div class="toolbar-group"><button data-close-workbench>关闭</button><button data-reload-tools>重新检测</button></div></div><div class="table-wrap"><table><thead><tr><th>工具</th><th>状态</th><th>当前版本</th><th>目标版本</th><th>说明</th><th>操作</th></tr></thead><tbody>${names.map((name) => { const status = result.tools[name] || versions[name]?.status || "missing"; const current = versions[name]?.version || "未知"; const remoteDesktop = ["rustdesk", "rustdesktop", "todesk"].includes(name); const installable = !remoteDesktop && name !== "nvidia-smi"; const target = remoteDesktop ? "不支持网页一键安装" : (versions[name]?.target_version || "系统软件源最新版本（未锁定）"); return `<tr><td class="mono">${esc(name)}</td><td><span class="status ${status === "available" ? "online" : "disabled"}">${status === "available" ? "可用" : "未安装"}</span></td><td class="mono">${esc(current)}</td><td>${esc(target)}</td><td>${toolDescription(name)}</td><td>${can("tools.install") && host.allow_install && status !== "available" && installable ? `<button data-install-tool="${esc(name)}">安装</button>` : remoteDesktop ? '<span class="hint">人工部署</span>' : "-"}</td></tr>`; }).join("")}</tbody></table></div></section>`;
   $('[data-close-workbench]', root).onclick = () => { root.hidden = true; root.innerHTML = ""; };
   $('[data-reload-tools]', root).onclick = () => renderTools(host, root).catch((error) => { root.innerHTML = `<div class="error-panel">${esc(error.message)}</div>`; });
   $$('[data-install-tool]', root).forEach((button) => { button.onclick = async () => {
@@ -1667,7 +1723,7 @@ async function renderTools(host, root) {
 }
 
 function toolDescription(name) {
-  return esc(({tmux:"会话管理与后台任务",htop:"交互式进程查看",ncdu:"交互式磁盘分析",nvtop:"交互式 GPU 查看",sysstat:"iostat/mpstat/sar 统计",iotop:"交互式进程 IO",smartmontools:"smartctl 磁盘健康",ethtool:"网卡协商和错误",iproute2:"ip/ss 网络信息",lsof:"文件和端口句柄",jq:"JSON 解析",git:"代码版本管理",rsync:"数据同步",unzip:"解压工具","build-essential":"编译工具链",cmake:"构建工具",btop:"交互式系统查看",iperf3:"网络吞吐测试",tree:"目录树查看",vim:"文本编辑器",smartctl:"物理磁盘健康",sensors:"CPU 温度",stress_ng:"压力测试","stress-ng":"压力测试","nvidia-smi":"NVIDIA GPU 指标",docker:"容器指标"})[name] || "远端可选能力");
+  return esc(({tmux:"会话管理与后台任务",htop:"交互式进程查看",ncdu:"交互式磁盘分析",nvtop:"交互式 GPU 查看",sysstat:"iostat/mpstat/sar 统计",iotop:"交互式进程 IO",smartmontools:"smartctl 磁盘健康",ethtool:"网卡协商和错误",iproute2:"ip/ss 网络信息",lsof:"文件和端口句柄",jq:"JSON 解析",git:"代码版本管理",rsync:"数据同步",unzip:"解压工具","build-essential":"编译工具链",cmake:"构建工具",btop:"交互式系统查看",iperf3:"网络吞吐测试",tree:"目录树查看",vim:"文本编辑器",smartctl:"物理磁盘健康",sensors:"CPU 温度",stress_ng:"压力测试","stress-ng":"压力测试","nvidia-smi":"NVIDIA GPU 指标",docker:"容器指标",rustdesk:"第三方远程桌面代理，仅人工部署",rustdesktop:"RustDesk Desktop 远程桌面代理，仅人工部署",todesk:"第三方远程桌面代理，仅人工部署"})[name] || "远端可选能力");
 }
 
 function showStressDialog(host) {
@@ -1771,18 +1827,26 @@ function ensureElevated() {
   });
 }
 
-async function openTerminal(host, tmuxName = null) {
+async function openTerminal(host, tmuxName = null, {modal = true} = {}) {
   try {
     await ensureElevated();
   } catch (error) {
     return toast(error.message, "warning");
   }
-  const dialog = createDialog(`<div class="terminal-toolbar"><div><h2>${tmuxName ? `Tmux: ${esc(tmuxName)}` : `Web 终端 · ${esc(host.name)}`}</h2><span class="terminal-status" data-terminal-status>正在连接 ${esc(host.username)}@${esc(host.address)}</span></div><div class="toolbar-group"><select data-terminal-favorites aria-label="快捷命令"><option value="">快捷命令</option></select><button type="button" data-terminal-send-favorite>发送</button><button type="button" data-terminal-save-selection>收藏选中文本</button><button data-terminal-close>断开</button></div></div><div class="terminal-screen" role="application" aria-label="远程终端输出和输入区域"></div>`, "terminal-dialog");
+  const dialog = createDialog(`<div class="terminal-toolbar"><div><h2>${tmuxName ? `Tmux: ${esc(tmuxName)}` : `Web 终端 · ${esc(host.name)}`}</h2><span class="terminal-status" data-terminal-status>正在连接 ${esc(host.username)}@${esc(host.address)}</span></div><div class="toolbar-group"><select data-terminal-favorites aria-label="快捷命令"><option value="">快捷命令</option></select><button type="button" data-terminal-send-favorite>发送</button><button type="button" data-terminal-save-selection>收藏选中文本</button><button data-terminal-close>断开</button></div></div><div class="terminal-screen" role="application" aria-label="远程终端输出和输入区域"></div>`, "terminal-dialog", modal);
+  const sessionRecord = {id: crypto.randomUUID(), host, dialog};
+  state.terminalSessions.push(sessionRecord);
+  if (state.page === "terminal") renderTerminalWorkbench();
   const terminalHost = $(".terminal-screen", dialog);
   const status = $('[data-terminal-status]', dialog);
   if (!window.Terminal || !window.FitAddon?.FitAddon) {
     status.textContent = "终端组件加载失败，请刷新页面后重试";
     terminalHost.textContent = "[终端组件不可用]";
+    sessionRecord.close = () => {
+      state.terminalSessions = state.terminalSessions.filter((session) => session !== sessionRecord);
+      if (dialog.open) dialog.close("done");
+    };
+    $('[data-terminal-close]', dialog).onclick = () => sessionRecord.close();
     return;
   }
   const styleNonce = document.querySelector('meta[name="csp-style-nonce"]')?.content;
@@ -1826,12 +1890,18 @@ async function openTerminal(host, tmuxName = null) {
     if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({type:"resize", cols:terminal.cols, rows:terminal.rows}));
   };
   const observer = new ResizeObserver(resize);
-  const cleanup = () => {
+  const cleanup = (render = true) => {
     if (cleaned) return;
     cleaned = true;
     observer.disconnect();
     terminal.dispose();
     if ([WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState)) socket.close();
+    state.terminalSessions = state.terminalSessions.filter((session) => session !== sessionRecord);
+    if (render && state.page === "terminal") renderTerminalWorkbench();
+  };
+  sessionRecord.close = () => {
+    cleanup(false);
+    if (dialog.open) dialog.close("done");
   };
   socket.onopen = () => { status.textContent = "已连接 · 输入会直接发送到远端 Shell"; resize(); terminal.focus(); };
   socket.onmessage = (event) => {
@@ -2118,7 +2188,7 @@ function fileRows(items) {
     const download = item.type === "symlink" ? "" : fileActionButton("下载", "download", "files.download").replace("data-file-action=\"download\"", `data-file-download=\"${esc(item.path)}\"`);
     const copy = item.type === "symlink" ? "" : fileActionButton("复制", "copy", "files.manage", "text-button").replace("data-file-action=\"copy\"", `data-file-copy=\"${esc(item.path)}\"`);
     const preview = item.type === "file" && can("files.download") ? `<button type="button" class="text-button" data-file-preview="${esc(item.path)}">预览</button>` : "";
-    return `<tr data-file-path="${esc(item.path)}" data-file-type="${esc(item.type)}"><td>${isDirectory ? "目录" : item.type === "symlink" ? "链接" : "文件"}</td><td>${name}</td><td>${isDirectory ? "-" : fmtBytes(item.size)}</td><td>${item.modified_at ? fmtTime(new Date(item.modified_at * 1000).toISOString()) : "未知"}</td><td class="mono">${esc(item.mode)}</td><td class="mono">${item.uid ?? "-"}:${item.gid ?? "-"}</td><td class="nowrap">${preview}${download}${copy}${fileActionButton("重命名", "rename", "files.manage", "text-button").replace("data-file-action=\"rename\"", `data-file-rename=\"${esc(item.path)}\"`)}${fileActionButton("删除", "delete", "files.delete", "text-button danger-quiet").replace("data-file-action=\"delete\"", `data-file-delete=\"${esc(item.path)}\"`)}</td></tr>`;
+    return `<tr data-file-path="${esc(item.path)}" data-file-type="${esc(item.type)}"><td class="table-checkbox">${item.type === "symlink" ? "-" : `<input type="checkbox" data-file-select="${esc(item.path)}" aria-label="选择 ${esc(item.name)}">`}</td><td>${isDirectory ? "目录" : item.type === "symlink" ? "链接" : "文件"}</td><td>${name}</td><td>${isDirectory ? "-" : fmtBytes(item.size)}</td><td>${item.modified_at ? fmtTime(new Date(item.modified_at * 1000).toISOString()) : "未知"}</td><td class="mono">${esc(item.mode)}</td><td class="mono">${item.uid ?? "-"}:${item.gid ?? "-"}</td><td class="nowrap">${preview}${download}${copy}${fileActionButton("重命名", "rename", "files.manage", "text-button").replace("data-file-action=\"rename\"", `data-file-rename=\"${esc(item.path)}\"`)}${fileActionButton("删除", "delete", "files.delete", "text-button danger-quiet").replace("data-file-action=\"delete\"", `data-file-delete=\"${esc(item.path)}\"`)}</td></tr>`;
   }).join("");
 }
 
@@ -2143,12 +2213,19 @@ async function renderFiles() {
   const activeListing = currentHost ? (listing || await api(`/api/hosts/${currentHost.id}/files?path=${encodeURIComponent(state.filePath)}`)) : {path:"/", parent:null, items:[]};
   let directoryFavorites = [];
   if (currentHost) { try { directoryFavorites = (await api(`/api/hosts/${currentHost.id}/directory-favorites`)).items || []; } catch (_) {} }
-  $("#page-content").innerHTML = `<div class="toolbar"><div class="toolbar-group file-manager-toolbar"><select id="file-host-select">${hostsResult.items.map((host) => `<option value="${host.id}" ${host.id === currentHost?.id ? "selected" : ""}>${esc(host.name)} · ${esc(host.address)}</option>`).join("")}</select><select id="file-favorite-select"><option value="">目录收藏</option>${directoryFavorites.map((item) => `<option value="${esc(item.path)}">${esc(item.name)}</option>`).join("")}</select><input id="file-path" value="${esc(activeListing.path)}" aria-label="当前路径"><button id="file-go">前往</button><button id="file-favorite-add" type="button">收藏当前目录</button>${activeListing.parent ? '<button id="file-up">上一级</button>' : ""}</div><div class="toolbar-group">${can("storage.scan") ? '<button id="file-directory-usage" type="button">目录容量</button><button id="file-large-scan" type="button">扫描大文件</button>' : ""}${can("files.upload") ? '<button id="file-upload-button" type="button" class="primary">上传文件</button><button id="file-folder-upload-button" type="button">上传文件夹</button>' : ""}${fileActionButton("新建目录", "mkdir", "files.manage")}${fileActionButton("刷新", "refresh", "files.browse")}</div></div>${currentHost ? `<div class="notice-panel">当前主机：${esc(currentHost.username)}@${esc(currentHost.address)}。目录下载会自动打包成 ZIP；大文件不会在网页中加载。</div><div id="file-scan-output" class="scan-result-host" hidden></div><div class="table-wrap"><table><thead><tr><th>类型</th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th>属主:属组</th><th>操作</th></tr></thead><tbody>${fileRows(activeListing.items)}</tbody></table></div>` : '<div class="empty"><div><strong>没有可用主机</strong>先添加并授权至少一台主机。</div></div>'}<input id="file-upload-input" type="file" multiple hidden><input id="file-folder-upload-input" type="file" webkitdirectory multiple hidden>`;
+  $("#page-content").innerHTML = `<div class="toolbar"><div class="toolbar-group file-manager-toolbar"><select id="file-host-select">${hostsResult.items.map((host) => `<option value="${host.id}" ${host.id === currentHost?.id ? "selected" : ""}>${esc(host.name)} · ${esc(host.address)}</option>`).join("")}</select><select id="file-favorite-select"><option value="">目录收藏</option>${directoryFavorites.map((item) => `<option value="${esc(item.path)}">${esc(item.name)}</option>`).join("")}</select><input id="file-path" value="${esc(activeListing.path)}" aria-label="当前路径"><button id="file-go">前往</button><button id="file-favorite-add" type="button">收藏当前目录</button>${activeListing.parent ? '<button id="file-up">上一级</button>' : ""}</div><div class="toolbar-group">${can("storage.scan") ? '<button id="file-directory-usage" type="button">目录容量</button><button id="file-large-scan" type="button">扫描大文件</button>' : ""}${can("files.upload") ? '<button id="file-upload-button" type="button" class="primary">上传文件</button><button id="file-folder-upload-button" type="button">上传文件夹</button>' : ""}${fileActionButton("新建目录", "mkdir", "files.manage")}${can("files.download") ? '<button id="file-batch-download" type="button">批量下载脚本</button><button id="file-diff" type="button">对比两个文件</button>' : ""}${can("files.browse") ? '<button id="file-search" type="button">远程搜索</button>' : ""}${can("files.delete") ? '<button id="file-batch-delete" type="button" class="danger-quiet">批量删除</button>' : ""}${fileActionButton("刷新", "refresh", "files.browse")}</div></div>${currentHost ? `<div class="notice-panel">当前主机：${esc(currentHost.username)}@${esc(currentHost.address)}。目录下载会自动打包成 ZIP；大文件不会在网页中加载。</div><div id="file-scan-output" class="scan-result-host" hidden></div><div class="table-wrap"><table><thead><tr><th class="table-checkbox"><input id="file-select-all" type="checkbox" aria-label="全选当前目录"></th><th>类型</th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th>属主:属组</th><th>操作</th></tr></thead><tbody>${fileRows(activeListing.items)}</tbody></table></div>` : '<div class="empty"><div><strong>没有可用主机</strong>先添加并授权至少一台主机。</div></div>'}<input id="file-upload-input" type="file" multiple hidden><input id="file-folder-upload-input" type="file" webkitdirectory multiple hidden>`;
   $("#file-host-select")?.addEventListener("change", (event) => { state.fileHostId = Number(event.target.value); state.filePath = "/"; renderFiles(); });
   $("#file-go")?.addEventListener("click", () => { state.filePath = $("#file-path").value || "/"; renderFiles(); });
   $("#file-favorite-select")?.addEventListener("change", (event) => { if (event.target.value) { state.filePath = event.target.value; renderFiles(); } });
   $("#file-favorite-add")?.addEventListener("click", async () => { const name = window.prompt("收藏名称", activeListing.path); if (!name) return; try { await api(`/api/hosts/${state.fileHostId}/directory-favorites`, {method:"POST", body:{name, path:activeListing.path}}); toast("目录已收藏"); renderFiles(); } catch (error) { toast(error.message, "error"); } });
   $("#file-up")?.addEventListener("click", () => { state.filePath = activeListing.parent || "/"; renderFiles(); });
+  const selectedFilePaths = () => $$('[data-file-select]:checked').map((input) => input.dataset.fileSelect).filter(Boolean);
+  const showFileScript = (title, result) => { const dialog = createDialog(`<div class="dialog-heading"><div><h2>${esc(title)}</h2><p>脚本只在页面展示，不会由平台远程执行。</p></div></div><pre class="snapshot">${esc(result.script || "")}</pre><div class="dialog-actions"><button type="button" data-cancel>关闭</button></div>`, "wide-dialog"); $('[data-cancel]', dialog).onclick = () => dialog.close("done"); };
+  $("#file-select-all")?.addEventListener("change", (event) => { $$('[data-file-select]').forEach((input) => { input.checked = event.target.checked; }); });
+  $("#file-batch-download")?.addEventListener("click", async () => { try { const paths = selectedFilePaths(); if (!paths.length) throw new Error("请先选择文件或文件夹"); const result = await api(`/api/hosts/${state.fileHostId}/files/batch-download-script`, {method:"POST", body:{paths, local_path:"./selected-files.tar.gz"}}); showFileScript("批量下载 tar.gz 脚本", result); } catch (error) { toast(error.message, "warning"); } });
+  $("#file-batch-delete")?.addEventListener("click", async () => { try { const paths = selectedFilePaths(); if (!paths.length) throw new Error("请先选择文件或文件夹"); if (!confirm(`确认批量删除 ${paths.length} 个远端路径？该操作不可恢复。`)) return; await ensureElevated(); await api(`/api/hosts/${state.fileHostId}/files/batch-delete`, {method:"POST", body:{paths}}); toast(`已删除 ${paths.length} 个远端路径`); renderFiles(); } catch (error) { toast(error.message, "error"); } });
+  $("#file-diff")?.addEventListener("click", async () => { try { const paths = selectedFilePaths(); if (paths.length !== 2) throw new Error("请选择恰好两个文本文件"); const result = await api(`/api/hosts/${state.fileHostId}/files/diff`, {method:"POST", body:{left:paths[0], right:paths[1]}}); const dialog = createDialog(`<div class="dialog-heading"><div><h2>文件对比</h2><p>${esc(result.left)} ↔ ${esc(result.right)}${result.truncated ? " · 输出已截断" : ""}</p></div></div><pre class="file-preview-content">${esc(result.diff || "两个文件内容相同")}</pre><div class="dialog-actions"><button type="button" data-cancel>关闭</button></div>`, "wide-dialog"); $('[data-cancel]', dialog).onclick = () => dialog.close("done"); } catch (error) { toast(error.message, "warning"); } });
+  $("#file-search")?.addEventListener("click", async () => { const pattern = window.prompt("文件名过滤（支持 * 和 ?）", "*.log"); if (!pattern) return; try { const result = await api(`/api/hosts/${state.fileHostId}/files/search`, {method:"POST", body:{path:activeListing.path, pattern, limit:100}}); const output = $("#file-scan-output"); output.innerHTML = `<section class="scan-result"><strong>文件名搜索：${esc(result.pattern)}</strong><div class="table-wrap"><table><thead><tr><th>路径</th></tr></thead><tbody>${result.items.map((path) => `<tr><td class="mono">${esc(path)}</td></tr>`).join("") || '<tr><td>没有匹配文件</td></tr>'}</tbody></table></div>${result.truncated ? '<div class="hint">结果已达到输出限制</div>' : ""}</section>`; output.hidden = false; } catch (error) { toast(error.message, "warning"); } });
   const runFileScan = async (button, label, mode) => {
     const output = $("#file-scan-output");
     if (!output) return;

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 from urllib.parse import quote
 
 from flask import Response, jsonify, request, stream_with_context
@@ -17,6 +18,7 @@ def register_file_routes(context: WebContext) -> None:
     file_host = context.file_host
     files = context.files
     hosts = context.hosts
+    operations = context.operations
     login_required = context.login_required
 
     @app.get("/api/hosts/<int:host_id>/files/usage")
@@ -68,6 +70,68 @@ def register_file_routes(context: WebContext) -> None:
     def preview_file(host_id: int):
         result = files.preview(file_host(host_id), request.args.get("path", ""))
         return jsonify(result)
+
+    @app.post("/api/hosts/<int:host_id>/files/batch-download-script")
+    @login_required(permission="files.download", write=True)
+    def batch_download_script(host_id: int):
+        payload = body()
+        result = files.batch_archive_script(
+            file_host(host_id),
+            payload.get("paths"),
+            str(payload.get("local_path", "./selected-files.tar.gz")),
+        )
+        audit_action("files_batch_download_script", target_type="host", target_id=host_id, summary=f"生成批量文件打包脚本（{len(result['paths'])} 项）")
+        return jsonify(result)
+
+    @app.post("/api/hosts/<int:host_id>/files/batch-delete")
+    @login_required(permission="files.delete", write=True, elevated=True)
+    def batch_delete_files(host_id: int):
+        payload = body()
+        deleted = files.delete_many(file_host(host_id), payload.get("paths"))
+        audit_action("files_batch_deleted", target_type="host", target_id=host_id, summary=f"批量删除远端路径（{len(deleted)} 项）")
+        return jsonify(deleted=deleted)
+
+    @app.post("/api/hosts/<int:host_id>/files/diff")
+    @login_required(permission="files.download", write=True)
+    def diff_files(host_id: int):
+        payload = body()
+        first, second = str(payload.get("left", "")), str(payload.get("right", ""))
+        left = files.normalize_path(first, allow_root=False)
+        right = files.normalize_path(second, allow_root=False)
+        if left == right:
+            raise FileManagerError("请选择两个不同的文件")
+        allowed = {".txt", ".log", ".py", ".json", ".yaml", ".yml", ".sh", ".md", ".csv", ".ini", ".conf"}
+        from pathlib import PurePosixPath
+        if PurePosixPath(left).suffix.lower() not in allowed or PurePosixPath(right).suffix.lower() not in allowed:
+            raise FileManagerError("文件对比仅支持常见文本文件")
+        host = file_host(host_id)
+        command = (
+            "set -eu; for file in %s %s; do test -f -- \"$file\" || { echo '文件不存在: '$file >&2; exit 2; }; "
+            "size=$(wc -c < \"$file\"); [ \"$size\" -le 1048576 ] || { echo '文件过大，禁止在线对比: '$file >&2; exit 3; }; done; "
+            "LC_ALL=C diff -u -- %s %s | head -c 262144"
+        ) % (shlex.quote(left), shlex.quote(right), shlex.quote(left), shlex.quote(right))
+        result = operations.run(host, command, config.all()["collection_timeout"], 262144)
+        if result.exit_code not in {0, 1}:
+            raise FileManagerError((result.stderr or "文件对比失败").strip())
+        return jsonify(left=left, right=right, diff=result.stdout, truncated=result.stdout_truncated)
+
+    @app.post("/api/hosts/<int:host_id>/files/search")
+    @login_required(permission="files.browse", write=True)
+    def search_files(host_id: int):
+        payload = body()
+        root = files.normalize_path(str(payload.get("path", "/")))
+        pattern = str(payload.get("pattern", "")).strip()
+        if not pattern or len(pattern) > 255 or any(char in pattern for char in "\x00\r\n/"):
+            raise FileManagerError("文件名过滤条件无效")
+        try:
+            limit = max(1, min(500, int(payload.get("limit", 100))))
+        except (TypeError, ValueError) as exc:
+            raise FileManagerError("搜索结果数量无效") from exc
+        command = f"find {shlex.quote(root)} -maxdepth 12 -type f -name {shlex.quote(pattern)} -print 2>/dev/null | head -n {limit}"
+        result = operations.run(file_host(host_id), command, config.all()["scan_timeout_seconds"], 128 * 1024)
+        if result.exit_code != 0:
+            raise FileManagerError((result.stderr or "远程搜索失败").strip())
+        return jsonify(path=root, pattern=pattern, items=[line for line in result.stdout.splitlines() if line], truncated=result.stdout_truncated)
 
     @app.post("/api/hosts/<int:host_id>/files/permission-script")
     @login_required(permission="files.manage", write=True)

@@ -204,6 +204,34 @@ def test_tool_install_requires_verification(app):
     service = FakeOperations(app.extensions["monitor_config"], app.extensions["database"])
     assert service.installation_command({}, "tmux") == "LC_ALL=C sudo -n apt-get install -y tmux"
     assert service.install_tool({}, "tmux") == "LC_ALL=C sudo -n apt-get install -y tmux"
+    assert "系统软件源" in service.tool_target_version("tmux")
+    assert "人工部署" in service.tool_target_version("rustdesk")
+    assert "人工部署" in service.tool_target_version("rustdesktop")
+
+
+def test_tools_route_includes_current_versions_and_rejects_remote_desktop_install(client, app, admin, monkeypatch):
+    host = app.extensions["hosts"].create(host_payload(), fingerprint="SHA256:tool-versions", machine_id="tool-versions")
+    operations = app.extensions["operations"]
+    monkeypatch.setattr(operations, "detect_tools", lambda _host: {"tmux": "available"})
+    monkeypatch.setattr(operations, "detect_tool_versions", lambda _host: {"tmux": {"status": "available", "version": "tmux 3.4", "installable": True}, "rustdesk": {"status": "missing", "version": None, "installable": False}})
+    result = client.get(f"/api/hosts/{host['id']}/tools")
+    assert result.status_code == 200
+    assert result.get_json()["versions"]["tmux"]["version"] == "tmux 3.4"
+    plan = client.get(f"/api/hosts/{host['id']}/tools/rustdesk/install-plan")
+    assert plan.status_code == 400
+
+
+def test_tool_version_detector_parses_current_and_candidate_versions(app):
+    service = FakeOperations(app.extensions["monitor_config"], app.extensions["database"])
+    service.run = lambda *_args, **_kwargs: SimpleNamespace(
+        exit_code=0,
+        stderr="",
+        stdout="tmux\tavailable\ttmux 3.4\t3.4.0-1ubuntu\nrustdesk\tmissing\t\t\n",
+        stdout_truncated=False,
+    )
+    result = service.detect_tool_versions({})
+    assert result["tmux"] == {"status": "available", "version": "tmux 3.4", "target_version": "3.4.0-1ubuntu", "installable": True}
+    assert result["rustdesk"]["status"] == "missing" and result["rustdesk"]["installable"] is False
 
 
 def test_tool_install_uses_saved_sudo_password_only_after_noninteractive_failure(app):

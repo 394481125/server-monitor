@@ -230,6 +230,56 @@ def test_sftp_file_api_supports_files_directories_and_zip(client, app, admin, mo
     assert "/tmp/copied/renamed.txt" not in fake_sftp.files
 
 
+def test_batch_file_actions_are_safe_and_script_only(client, app, admin, monkeypatch):
+    host = app.extensions["hosts"].create(host_payload(), fingerprint="SHA256:batch-files", machine_id="batch-files")
+    fake_sftp = FakeSFTP()
+    fake_sftp.files["/tmp/one.txt"] = b"one"
+    fake_sftp.files["/tmp/two.txt"] = b"two"
+    monkeypatch.setattr(app.extensions["files"], "_open", lambda _host: (FakeSSH(), fake_sftp))
+    plan = client.post(
+        f"/api/hosts/{host['id']}/files/batch-download-script",
+        json={"paths": ["/tmp/one.txt", "/tmp/two.txt"]},
+        headers=csrf(admin),
+    )
+    assert plan.status_code == 200
+    assert "tar -czf -" in plan.get_json()["script"] and plan.get_json()["remote_execution"] is False
+    elevated = client.post("/api/auth/elevate", json={"password": "TemporaryPass456"}, headers=csrf(admin))
+    assert elevated.status_code == 200
+    deleted = client.post(
+        f"/api/hosts/{host['id']}/files/batch-delete",
+        json={"paths": ["/tmp/one.txt", "/tmp/two.txt"]},
+        headers=csrf(admin),
+    )
+    assert deleted.status_code == 200 and set(deleted.get_json()["deleted"]) == {"/tmp/one.txt", "/tmp/two.txt"}
+    assert "/tmp/one.txt" not in fake_sftp.files and "/tmp/two.txt" not in fake_sftp.files
+    overlap = client.post(
+        f"/api/hosts/{host['id']}/files/batch-delete",
+        json={"paths": ["/tmp", "/tmp/one.txt"]},
+        headers=csrf(admin),
+    )
+    assert overlap.status_code == 400
+
+
+def test_remote_file_diff_and_name_search_are_bounded(client, app, admin, monkeypatch):
+    host = app.extensions["hosts"].create(host_payload(), fingerprint="SHA256:diff-search", machine_id="diff-search")
+    calls = []
+
+    def run(_host, command, *_args, **_kwargs):
+        calls.append(command)
+        if "diff -u" in command:
+            return type("Result", (), {"exit_code": 1, "stdout": "@@ -1 +1 @@\n-a\n+b\n", "stderr": "", "stdout_truncated": False})()
+        return type("Result", (), {"exit_code": 0, "stdout": "/tmp/a.log\n/tmp/b.log\n", "stderr": "", "stdout_truncated": False})()
+
+    monkeypatch.setattr(app.extensions["operations"], "run", run)
+    diff = client.post(f"/api/hosts/{host['id']}/files/diff", json={"left": "/tmp/a.txt", "right": "/tmp/b.txt"}, headers=csrf(admin))
+    assert diff.status_code == 200 and "@@" in diff.get_json()["diff"]
+    search = client.post(f"/api/hosts/{host['id']}/files/search", json={"path": "/tmp", "pattern": "*.log"}, headers=csrf(admin))
+    assert search.status_code == 200 and search.get_json()["items"] == ["/tmp/a.log", "/tmp/b.log"]
+    assert all("-name '*.log'" in command or "diff -u" in command for command in calls)
+    invalid = client.post(f"/api/hosts/{host['id']}/files/search", json={"path": "/tmp", "pattern": "../*"}, headers=csrf(admin))
+    assert invalid.status_code == 400
+
+
 def test_sftp_path_and_overwrite_guards(app):
     service = app.extensions["files"]
     assert service.normalize_path("/tmp/../var") == "/var"

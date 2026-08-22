@@ -42,6 +42,34 @@ ssh-keygen -t rsa -b 3072 -f ~/.ssh/server-monitor-rsa
 - 上传和下载受 `FILE_TRANSFER_LIMIT`（默认 512 MiB）限制。GB 级文件使用页面生成的 `scp` 或 `rsync` 脚本，在受控网络环境执行。
 - 重命名、新建目录可直接执行；删除文件/目录要求 elevated 会话和前端二次确认。
 - 权限/属主页面只生成 `chmod`/`chown` 脚本，运维人员检查后在目标环境自行执行。
+- 在文件管理中勾选多个文件或目录后，可以生成批量 `tar.gz` 下载脚本；脚本在运维终端执行，网页不传输打包内容。
+- 批量删除先确认路径，再要求 elevated 验证；服务端逐项检查符号链接和路径，根目录、符号链接和失败项不会被静默跟随或忽略。
+- “文件名搜索”只使用远端 `find -name`，不做全文检索；“文件对比”只允许常见文本后缀且每个文件不超过 1 MiB，diff 输出最多 256 KiB。
+
+## 终端工作台
+
+一级导航“终端工作台”可以选择任意已授权主机，重复打开多个独立会话。会话继续使用后端 SSH WebSocket、服务端跳板机、终端并发上限、空闲超时、审计和 elevated 验证；关闭会话才释放远端连接。
+
+浏览器终端不支持 X11 图形转发。命令行 `ssh -X` 依赖本地 X Server，适用于本地 SSH 客户端；平台后端不会把 GUI 程序的 X11 数据伪装成浏览器可渲染内容。
+
+## 空闲算力
+
+“空闲算力”页面默认展示在线、指标降级或 GPU 采集成功主机中，利用率和显存占用低于系统阈值、且没有归属进程的 GPU。可以提高最低可用显存、收紧利用率或显存占用上限，也可以选择只看在线主机。页面使用最新可信缓存，不会为了刷新列表临时登录远端；等待下一次采集即可更新。
+
+卡片可直接打开已有 Web 终端或进入主机详情。打开终端仍受 `terminal.open` 权限、主机终端开关、服务端跳板机和会话并发限制控制。空闲 GPU 页面只读，不会自动提交调度任务。
+
+接口排查示例：
+
+```bash
+curl -b session.cookie \
+  'http://127.0.0.1:8000/api/idle-gpus?min_memory_mib=20000&max_utilization=10&max_memory_percent=10&require_no_processes=1&host_status=online'
+```
+
+返回的 `items` 包含主机、GPU 型号/编号、总显存、已用显存、可用显存、利用率、显存占用百分比、进程数和采样时间。`/api/dashboard` 的 `resource_summary.idle_gpu_count` 与该规则保持一致。
+
+## 工具版本与安装
+
+“工具”面板显示检测到的当前版本和安装目标；APT/DNF 可用时会显示软件源候选版本，无法锁定时标记“未锁定”。安装仍需要主机允许工具安装、CSRF、elevated 和远端 sudo 策略。RustDesk（兼容 RustDesktop 别名）、ToDesk 等第三方远控代理只显示当前状态和“人工部署”，平台不执行未经审核的下载、注册或常驻服务安装。
 
 ## 告警与通知
 
@@ -60,4 +88,10 @@ ssh-keygen -t rsa -b 3072 -f ~/.ssh/server-monitor-rsa
 
 ```bash
 .venv/bin/python -m pytest -q
+```
+
+浏览器模拟验收（需要 Chrome 和正在运行的测试服务）：
+
+```bash
+node tests/acceptance/browser.js http://127.0.0.1:8000/ <初始密码> <修改后密码>
 ```

@@ -120,7 +120,8 @@ def register_operation_routes(context: WebContext) -> None:
     @app.get("/api/hosts/<int:host_id>/tools")
     @login_required(permission="tools.view")
     def detect_tools(host_id: int):
-        return jsonify(tools=operations.detect_tools(hosts.get(host_id, include_secrets=True)))
+        host = hosts.get(host_id, include_secrets=True)
+        return jsonify(tools=operations.detect_tools(host), versions=operations.detect_tool_versions(host))
 
     @app.post("/api/hosts/<int:host_id>/health-inspection")
     @login_required(permission="diagnostics.view", write=True)
@@ -140,7 +141,7 @@ def register_operation_routes(context: WebContext) -> None:
     @login_required(permission="tools.install")
     def install_tool_plan(host_id: int, tool: str):
         host = operation_host(host_id, "allow_install", "工具安装")
-        return jsonify(command=operations.installation_command(host, tool), tool=tool, sudo_password_configured=bool(host.get("sudo_password")))
+        return jsonify(command=operations.installation_command(host, tool), tool=tool, target_version=operations.tool_target_version(tool), sudo_password_configured=bool(host.get("sudo_password")))
 
     @app.post("/api/hosts/<int:host_id>/stress")
     @login_required(permission="stress.manage", write=True, elevated=True)

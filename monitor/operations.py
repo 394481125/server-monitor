@@ -359,6 +359,61 @@ class OperationService:
         result = self.run(host, command, self.config.all()["collection_timeout"])
         return dict(line.split(":", 1) for line in result.stdout.splitlines() if ":" in line)
 
+    def detect_tool_versions(self, host: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Return bounded executable/version information for the tools page."""
+        specs = {
+            "tmux": ("tmux", "tmux"), "htop": ("htop", "htop"), "ncdu": ("ncdu", "ncdu"),
+            "nvtop": ("nvtop", "nvtop"), "sysstat": ("iostat", "sysstat"), "iotop": ("iotop", "iotop"),
+            "smartmontools": ("smartctl", "smartmontools"), "ethtool": ("ethtool", "ethtool"),
+            "iproute2": ("ss", "iproute2"), "lsof": ("lsof", "lsof"), "jq": ("jq", "jq"),
+            "git": ("git", "git"), "rsync": ("rsync", "rsync"), "unzip": ("unzip", "unzip"),
+            "build-essential": ("gcc", "build-essential"), "cmake": ("cmake", "cmake"),
+            "btop": ("btop", "btop"), "iperf3": ("iperf3", "iperf3"), "tree": ("tree", "tree"),
+            "vim": ("vim", "vim"), "sensors": ("sensors", "lm-sensors"),
+            "stress-ng": ("stress-ng", "stress-ng"), "nvidia-smi": ("nvidia-smi", None),
+            "docker": ("docker", "docker.io"), "rustdesk": ("rustdesk", None),
+            "rustdesktop": ("rustdesk", None), "todesk": ("todesk", None),
+        }
+        lines = []
+        for name, (executable, package) in specs.items():
+            command = shlex.quote(executable)
+            if package:
+                package_expr = shlex.quote(package)
+                candidate = (
+                    f"if command -v apt-cache >/dev/null 2>&1; then "
+                    f"target=$(apt-cache policy {package_expr} 2>/dev/null | awk '/Candidate:/ {{print $2; exit}}'); "
+                    f"elif command -v dnf >/dev/null 2>&1; then "
+                    f"target=$(dnf repoquery --qf '%{{evr}}' {package_expr} 2>/dev/null | head -n 1); else target=''; fi"
+                )
+            else:
+                candidate = "target=''"
+            lines.append(
+                f"if command -v {command} >/dev/null 2>&1; then status=available; version=$({command} --version 2>&1 | head -n 1); "
+                f"else status=missing; version=''; fi; {candidate}; "
+                f"printf '%s\\t%s\\t%s\\t%s\\n' {shlex.quote(name)} \"$status\" \"$version\" \"$target\""
+            )
+        result = self.run(host, "; ".join(lines), self.config.all()["collection_timeout"], 64 * 1024)
+        parsed: dict[str, dict[str, Any]] = {}
+        for line in result.stdout.splitlines():
+            name, separator, rest = line.partition("\t")
+            if not separator:
+                continue
+            status, _, rest = rest.partition("\t")
+            version, _, target = rest.partition("\t")
+            parsed[name] = {
+                "status": status,
+                "version": version[:200] or None,
+                "target_version": target[:120] or None,
+                "installable": name not in {"rustdesk", "rustdesktop", "todesk"},
+            }
+        return parsed
+
+    @staticmethod
+    def tool_target_version(tool: str) -> str:
+        if tool in {"rustdesk", "rustdesktop", "todesk"}:
+            return "不支持网页一键安装（请人工部署）"
+        return "系统软件源最新版本（未锁定）"
+
     def systemd_services(self, host: dict[str, Any]) -> list[dict[str, Any]]:
         units = " ".join(shlex.quote(unit) for unit in _SYSTEMD_UNITS)
         command = (

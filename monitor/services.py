@@ -1169,6 +1169,73 @@ def gpu_user_usage(host_items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]
     return sorted(result, key=lambda value: (-value["memory_mib"], value["username"].lower()))
 
 
+def idle_gpu_rows(
+    host_items: Iterable[dict[str, Any]],
+    *,
+    min_memory_mib: float = 0,
+    max_utilization: float = 10,
+    max_memory_percent: float | None = 10,
+    require_no_processes: bool = True,
+    statuses: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return GPUs that are actionable for a new workload.
+
+    The collector is the source of truth.  A GPU is considered idle only when
+    utilization and memory usage are known, both are below the supplied
+    threshold, and (by default) no process is attributed to it.  Unknown or
+    stale samples are intentionally omitted instead of being presented as
+    available capacity.
+    """
+    minimum = max(0.0, float(min_memory_mib or 0))
+    utilization_limit = max(0.0, min(100.0, float(max_utilization)))
+    memory_limit = None if max_memory_percent is None else max(0.0, min(100.0, float(max_memory_percent)))
+    allowed_statuses = set(statuses or ())
+    rows: list[dict[str, Any]] = []
+    for item in host_items:
+        host = item.get("host", item) if isinstance(item, dict) else {}
+        latest = item.get("latest") if isinstance(item, dict) else None
+        data = (latest or {}).get("data", {}) if isinstance(latest, dict) else {}
+        host_status = str(host.get("status") or "unknown")
+        if allowed_statuses and host_status not in allowed_statuses:
+            continue
+        for gpu in data.get("gpus", []) or []:
+            try:
+                utilization = float(gpu.get("utilization_percent"))
+                total = float(gpu.get("memory_total_mib"))
+                used = float(gpu.get("memory_used_mib"))
+            except (TypeError, ValueError):
+                continue
+            if total < 0 or used < 0:
+                continue
+            available = max(0.0, total - used)
+            memory_percent = (used / total * 100) if total else 100.0
+            processes = gpu.get("processes") if isinstance(gpu.get("processes"), list) else []
+            if utilization > utilization_limit or (memory_limit is not None and memory_percent > memory_limit) or available < minimum or (require_no_processes and processes):
+                continue
+            rows.append({
+                "host_id": host.get("id"),
+                "host_name": host.get("name") or str(host.get("id") or "未知主机"),
+                "host_address": host.get("address"),
+                "host_port": host.get("port", 22),
+                "host_username": host.get("username"),
+                "host_status": host_status,
+                "host_enabled": bool(host.get("enabled", True)),
+                "allow_terminal": bool(host.get("allow_terminal", False)),
+                "host_tags": host.get("tags") or [],
+                "gpu_uuid": gpu.get("uuid"),
+                "gpu_index": gpu.get("index"),
+                "gpu_name": gpu.get("name") or "未知型号",
+                "utilization_percent": round(utilization, 2),
+                "memory_total_mib": round(total, 2),
+                "memory_used_mib": round(used, 2),
+                "memory_available_mib": round(available, 2),
+                "memory_percent": round(memory_percent, 2),
+                "process_count": len(processes),
+                "collected_at": latest.get("collected_at") if isinstance(latest, dict) else None,
+            })
+    return sorted(rows, key=lambda row: (-row["memory_available_mib"], str(row["host_name"]).lower(), str(row["gpu_index"])))
+
+
 def hardware_asset_rows(host_items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for item in host_items:

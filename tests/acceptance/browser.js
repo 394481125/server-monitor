@@ -133,6 +133,10 @@ async function run() {
   await waitFor(protocol, `!document.querySelector("#app-view")?.hidden && document.querySelector("#page-title")?.textContent === "集群概览"`, "dashboard");
 
   await protocol.send("Emulation.setDeviceMetricsOverride", {width:1440, height:1000, deviceScaleFactor:1, mobile:false});
+  await evaluate(protocol, `document.querySelector('button[data-page="compute"]').click()`);
+  await waitFor(protocol, `document.querySelector("#page-title")?.textContent === "空闲算力" && document.querySelector("#idle-min-memory") && document.querySelector("#idle-apply")`, "idle compute page");
+  const computePage = await evaluate(protocol, `({filterCount:document.querySelectorAll(".compute-filter-band input, .compute-filter-band select").length, hasEmptyState:Boolean(document.querySelector(".empty")), viewportOverflow:document.documentElement.scrollWidth > window.innerWidth + 1})`);
+  if (computePage.filterCount < 4 || computePage.viewportOverflow) throw new Error(`Idle compute page assertion failed: ${JSON.stringify(computePage)}`);
   await evaluate(protocol, `window.confirm=() => true; document.querySelector('button[data-page="environments"]').click()`);
   await waitFor(protocol, `document.querySelector("#page-title")?.textContent === "开发环境" && document.querySelector("[data-gpu-benchmark-form]")`, "GPU benchmark form");
   await evaluate(protocol, `(() => {
@@ -180,6 +184,17 @@ async function run() {
   if (!vaultPage.generateButton || !vaultPage.filePicker || !vaultPage.privateKeyForm) {
     throw new Error(`SSH vault controls missing: ${JSON.stringify(vaultPage)}`);
   }
+  const notificationPage = await evaluate(protocol, `(() => {
+    const section = document.querySelector("#setting-notifications");
+    return {
+      separateWebAndApprise: Boolean(section?.textContent.includes("网页告警") && section?.textContent.includes("发送这些告警")),
+      hostSelectorCount: section?.querySelectorAll("[data-host-notification-enabled]").length || 0,
+      hostEventButtonCount: section?.querySelectorAll("[data-host-notification-events]").length || 0,
+    };
+  })()`);
+  if (!notificationPage.separateWebAndApprise || notificationPage.hostSelectorCount !== notificationPage.hostEventButtonCount) {
+    throw new Error(`Notification controls missing: ${JSON.stringify(notificationPage)}`);
+  }
   await evaluate(protocol, `(() => { const input = document.querySelector("[data-vault-file]"); const transfer = new DataTransfer(); transfer.items.add(new File(["loaded-from-file"], "existing-key.pem", {type:"text/plain"})); input.files = transfer.files; input.dispatchEvent(new Event("change", {bubbles:true})); return true; })()`);
   await waitFor(protocol, `document.querySelector("#vault-key-form textarea[name=private_key]")?.value === "loaded-from-file"`, "private-key file loaded");
   await evaluate(protocol, `document.querySelector("#generate-vault-key").click()`);
@@ -192,13 +207,17 @@ async function run() {
   await waitFor(protocol, `document.querySelector("#setting-credentials")?.textContent.includes("browser-generated-key")`, "generated SSH key listed");
   await evaluate(protocol, `document.querySelector('[data-delete-vault-key-name="browser-generated-key"]').click()`);
   await waitFor(protocol, `!document.querySelector("#setting-credentials")?.textContent.includes("browser-generated-key")`, "generated SSH key deleted");
+  await evaluate(protocol, `document.querySelector('button[data-page="terminal"]').click()`);
+  await waitFor(protocol, `document.querySelector("#page-title")?.textContent === "终端工作台" && document.querySelector("#workbench-open")`, "terminal workbench");
+  const workbench = await evaluate(protocol, `({hasHostSelector:Boolean(document.querySelector("#workbench-host-select")), x11Notice:document.querySelector("#page-content")?.textContent.includes("X11")})`);
+  if (!workbench.hasHostSelector || !workbench.x11Notice) throw new Error(`Terminal workbench assertion failed: ${JSON.stringify(workbench)}`);
   await evaluate(protocol, `document.querySelector("#logout-button").click()`);
   await waitFor(protocol, `!document.querySelector("#login-view")?.hidden && document.querySelector("#app-view")?.hidden`, "logout");
 
   const exceptions = protocol.events.filter((event) => event.method === "Runtime.exceptionThrown");
   protocol.close();
   if (exceptions.length) throw new Error(`Browser reported ${exceptions.length} uncaught exception(s)`);
-  return {login:"passed", password_rotation:"passed", dashboard:"passed", gpu_benchmark:"passed", settings:"passed", ssh_vault:"passed", logout:"passed"};
+  return {login:"passed", password_rotation:"passed", dashboard:"passed", idle_compute:"passed", gpu_benchmark:"passed", settings:"passed", ssh_vault:"passed", terminal_workbench:"passed", logout:"passed"};
 }
 
 run().then((result) => {

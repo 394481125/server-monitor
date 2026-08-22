@@ -52,6 +52,7 @@ from .services import (
     gpu_user_usage,
     hardware_asset_rows,
     host_transfer_rows,
+    idle_gpu_rows,
     parse_host_import,
 )
 from .ssh_client import SSHClient, SSHConnectionPool, SSHError, SSHFingerprintError
@@ -1063,14 +1064,56 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         show_local = bool(g.user.get("show_local_overview"))
         local_item = next((item for item in all_items if item["host"].get("is_local")), None)
         items = all_items if show_local else [item for item in all_items if not item["host"].get("is_local")]
+        settings = config.all()
+        idle_rows = idle_gpu_rows(
+            items,
+            min_memory_mib=0,
+            max_utilization=settings.get("gpu_util_threshold", 10),
+            max_memory_percent=settings.get("gpu_memory_threshold", 10),
+            require_no_processes=bool(settings.get("gpu_process_guard", True)),
+        )
+        gpu_count = sum(len((item.get("latest") or {}).get("data", {}).get("gpus", []) or []) for item in items)
+        active_alerts = alerts.list(1, 1, {"state": "active"})["total"]
         return jsonify(
             items=items,
             gpu_users=gpu_user_usage(items),
+            idle_gpus=idle_rows,
+            resource_summary={
+                "host_count": len(items),
+                "online_hosts": sum(1 for item in items if item["host"].get("status") == "online"),
+                "gpu_count": gpu_count,
+                "idle_gpu_count": len(idle_rows),
+                "active_alert_count": active_alerts,
+            },
             local_configured=local_item is not None,
             local_host_id=local_item["host"]["id"] if local_item else None,
             show_local_overview=show_local,
-            settings={key: value for key, value in config.all().items() if key in {"frontend_refresh_interval", "green_threshold", "yellow_threshold", "gpu_util_threshold", "gpu_memory_threshold", "filesystem_usage_threshold", "filesystem_inode_threshold", "swap_usage_threshold", "metric_retention_days", "timezone"}},
+            settings={key: value for key, value in settings.items() if key in {"frontend_refresh_interval", "green_threshold", "yellow_threshold", "gpu_util_threshold", "gpu_memory_threshold", "gpu_process_guard", "filesystem_usage_threshold", "filesystem_inode_threshold", "swap_usage_threshold", "metric_retention_days", "timezone"}},
         )
+
+    @app.get("/api/idle-gpus")
+    @login_required(permission="page.dashboard")
+    def idle_gpus():
+        values = config.all()
+        def number(name: str, default: float, minimum: float, maximum: float) -> float:
+            raw = request.args.get(name, default)
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} 必须是数字") from exc
+            if not minimum <= value <= maximum:
+                raise ValueError(f"{name} 超出范围")
+            return value
+
+        min_memory_mib = number("min_memory_mib", 0, 0, 10_000_000)
+        max_utilization = number("max_utilization", values.get("gpu_util_threshold", 10), 0, 100)
+        max_memory_percent = number("max_memory_percent", values.get("gpu_memory_threshold", 10), 0, 100)
+        require_no_processes = str(request.args.get("require_no_processes", "1")).lower() not in {"0", "false", "no"}
+        host_status = request.args.get("host_status", "").strip()
+        allowed_statuses = {host_status} if host_status else {"online", "degraded"}
+        items = [{"host": host, "latest": hosts.latest(host["id"])} for host in hosts.list()]
+        rows = idle_gpu_rows(items, min_memory_mib=min_memory_mib, max_utilization=max_utilization, max_memory_percent=max_memory_percent, require_no_processes=require_no_processes, statuses=allowed_statuses)
+        return jsonify(items=rows, filters={"min_memory_mib": min_memory_mib, "max_utilization": max_utilization, "max_memory_percent": max_memory_percent, "require_no_processes": require_no_processes, "host_status": host_status})
 
     @app.get("/api/gpu-usage/users")
     @login_required(permission="page.dashboard")
@@ -1296,13 +1339,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         enabled = body().get("enabled")
         if not isinstance(enabled, bool):
             raise ValueError("enabled 必须是布尔值")
-        before = config.all()["toast_enabled"]
-        config.update({"toast_enabled": enabled})
+        before_settings = config.all()
+        # Backwards-compatible endpoint used by older clients: its single
+        # switch is intentionally a global master switch for both channels.
+        # The current 通知 settings form uses /api/settings and keeps the
+        # webpage and Apprise switches independent.
+        config.update({"toast_enabled": enabled, "apprise_enabled": enabled})
         audit_action(
             "alert_notification_setting_updated",
             target_type="settings",
             summary="开启告警提醒" if enabled else "关闭告警提醒",
-            changes={"toast_enabled": {"before": before, "after": enabled}},
+            changes={
+                "toast_enabled": {"before": before_settings["toast_enabled"], "after": enabled},
+                "apprise_enabled": {"before": before_settings["apprise_enabled"], "after": enabled},
+            },
         )
         return jsonify(enabled=enabled)
 

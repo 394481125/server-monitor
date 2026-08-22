@@ -53,8 +53,6 @@ class NotificationService:
         preference = self._host_preference(row["host_id"])
         if not preference["enabled"] or not preference["apprise_enabled"]:
             return
-        if not settings.get("toast_enabled", True):
-            return
         if not settings.get("apprise_enabled") or row["alert_type"] not in settings.get("apprise_events", []):
             return
         events = preference.get("apprise_events")

@@ -67,6 +67,28 @@ def test_host_notification_disable_suppresses_both_channels_and_requires_csrf(cl
     assert item["id"] == alert_id and item["notification_allowed"] is False
 
 
+def test_apprise_channel_remains_independent_when_web_toast_is_disabled(client, app, admin, monkeypatch):
+    host = app.extensions["hosts"].create(host_payload(), fingerprint="SHA256:notify-independent", machine_id="notify-independent")
+    app.extensions["monitor_config"].update({
+        "toast_enabled": False,
+        "apprise_enabled": True,
+        "apprise_urls": ["ntfy://test-topic"],
+        "apprise_events": ["host_offline"],
+    })
+    response = client.put(
+        f"/api/hosts/{host['id']}/notification-settings",
+        json={"enabled": True, "toast_enabled": True, "apprise_enabled": True, "toast_events": [], "apprise_events": ["host_offline"]},
+        headers=csrf(admin),
+    )
+    assert response.status_code == 200
+    sent = []
+    notifications = app.extensions["notifications"]
+    monkeypatch.setattr(notifications, "_send", lambda alert, urls: sent.append((alert["alert_type"], urls)))
+    app.extensions["alerts"].emit("independent-channel", host["id"], "host_offline", "critical", "offline")
+    _wait_for(sent, 1)
+    assert sent == [("host_offline", ["ntfy://test-topic"])]
+
+
 def test_host_notification_invalid_event_is_rejected(client, app, admin):
     host = app.extensions["hosts"].create(host_payload(), fingerprint="SHA256:notify-d", machine_id="notify-d")
     response = client.put(

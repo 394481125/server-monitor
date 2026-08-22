@@ -477,3 +477,59 @@ class SFTPFileService:
         finally:
             sftp.close()
             client.close()
+
+    def delete_many(self, host: dict[str, Any], paths: list[str]) -> list[str]:
+        """Delete selected paths through one SFTP session, never following symlinks."""
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 100:
+            raise FileManagerError("批量删除最多支持 100 个路径")
+        normalized = []
+        for path in paths:
+            value = self.normalize_path(path, allow_root=False)
+            if value not in normalized:
+                normalized.append(value)
+        if any(
+            parent != child and child.startswith(parent.rstrip("/") + "/")
+            for parent in normalized
+            for child in normalized
+        ):
+            raise FileManagerError("批量删除不能同时选择目录及其子路径")
+        client, sftp = self._open(host)
+        deleted: list[str] = []
+        try:
+            for path in normalized:
+                attrs = self._stat(sftp, path)
+                if stat.S_ISLNK(attrs.st_mode):
+                    raise FileManagerError(f"符号链接不能删除: {path}")
+                targets = list(self._walk(sftp, path)) if stat.S_ISDIR(attrs.st_mode) else [(path, "", attrs)]
+                for child, _relative, child_attrs in reversed(targets):
+                    try:
+                        (sftp.rmdir if stat.S_ISDIR(child_attrs.st_mode) else sftp.remove)(child)
+                    except OSError as exc:
+                        raise FileManagerError(f"删除失败: {child}") from exc
+                if stat.S_ISDIR(attrs.st_mode):
+                    sftp.rmdir(path)
+                deleted.append(path)
+            return deleted
+        finally:
+            sftp.close()
+            client.close()
+
+    @staticmethod
+    def batch_archive_script(host: dict[str, Any], paths: list[str], local_path: str = "./selected-files.tar.gz") -> dict[str, Any]:
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 100:
+            raise FileManagerError("批量下载最多支持 100 个路径")
+        normalized = []
+        for path in paths:
+            value = SFTPFileService.normalize_path(path, allow_root=False)
+            if value not in normalized:
+                normalized.append(value)
+        local_path = str(local_path or "./selected-files.tar.gz").strip()
+        if not local_path or "\x00" in local_path or any(char in local_path for char in "\r\n"):
+            raise FileManagerError("本地保存路径无效")
+        target = f"{host.get('username')}@{host.get('address')}"
+        jump = ""
+        if host.get("jump_enabled"):
+            jump = f" -J {shlex.quote(str(host.get('jump_username')))}@{shlex.quote(str(host.get('jump_address')))}:{int(host.get('jump_port') or 22)}"
+        remote = "tar -czf - -- " + " ".join(shlex.quote(value) for value in normalized)
+        script = "#!/bin/sh\nset -eu\n" + f"ssh{jump} {shlex.quote(target)} {shlex.quote(remote)} > {shlex.quote(local_path)}\n"
+        return {"paths": normalized, "script": script, "remote_execution": False, "archive_format": "tar.gz"}
